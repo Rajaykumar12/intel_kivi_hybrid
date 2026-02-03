@@ -1,7 +1,0 @@
-README.md
-setup.py
-kivi_sycl.egg-info/PKG-INFO
-kivi_sycl.egg-info/SOURCES.txt
-kivi_sycl.egg-info/dependency_links.txt
-kivi_sycl.egg-info/top_level.txt
-src/kivi_optimized.cpp
