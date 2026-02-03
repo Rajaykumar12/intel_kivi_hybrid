@@ -1,0 +1,9 @@
+# IDE
+.vscode/
+
+# Build artifacts
+build/
+
+# Python egg-info
+kivi_sycl.egg-info/
+kivi_test.egg-info/
