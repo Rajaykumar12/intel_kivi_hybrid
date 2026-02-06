@@ -1,154 +1,400 @@
+// ==========================================================================
+// KIVI: Tuning-Free Asymmetric 2-bit KV Cache Quantization for Intel GPUs
+// ==========================================================================
+// Implements the KIVI algorithm (arXiv:2402.02750) using SYCL for Intel XPU.
+//
+// Key insight from paper:
+//   - Keys exhibit per-channel outliers  → quantize per-channel (along token dim)
+//   - Values exhibit per-token outliers  → quantize per-token (along channel dim)
+//   - A residual window of R recent tokens is kept in FP16/FP32 for accuracy.
+//
+// Quantization: Asymmetric 2-bit
+//   q = clamp(round((x - min) / scale), 0, 3)
+//   scale = (max - min) / 3
+//   Dequantize: x ≈ q * scale + min
+//
+// Packing: 4 × 2-bit values per uint8
+//   byte = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6)
+// ==========================================================================
+
 #include <sycl/sycl.hpp>
 #include <torch/extension.h>
 #include <vector>
-#include <stdexcept>
 #include <iostream>
+#include <stdexcept>
 
-// Helper to get the correct device (Intel GPU) with error handling
+// --------------------------------------------------------------------------
+// SYCL Queue Management
+// --------------------------------------------------------------------------
+// Uses in_order queue for deterministic execution. When called from Python
+// with XPU tensors allocated via IPEX, USM pointers are valid because IPEX
+// uses Level Zero USM allocations on the same device.
+// --------------------------------------------------------------------------
 sycl::queue& get_queue() {
     static sycl::queue* q_ptr = nullptr;
-    
     if (!q_ptr) {
         try {
-            q_ptr = new sycl::queue(sycl::gpu_selector_v, 
-                [](sycl::exception_list exceptions) {
-                    for (std::exception_ptr const& e : exceptions) {
-                        try {
-                            std::rethrow_exception(e);
-                        } catch (sycl::exception const& ex) {
-                            std::cerr << "SYCL exception: " << ex.what() << std::endl;
-                        }
-                    }
-                });
-        } catch (sycl::exception const& e) {
-            std::cerr << "Failed to create SYCL queue: " << e.what() << std::endl;
-            throw;
+            q_ptr = new sycl::queue(sycl::gpu_selector_v,
+                                    sycl::property::queue::in_order{});
+            std::cout << "[KIVI] SYCL device: "
+                      << q_ptr->get_device().get_info<sycl::info::device::name>()
+                      << std::endl;
+        } catch (const sycl::exception& e) {
+            throw std::runtime_error(
+                std::string("[KIVI] Failed to create SYCL queue: ") + e.what());
         }
     }
     return *q_ptr;
 }
 
-// ------------------------------------------------------------------
-// KERNEL 1: Optimized Quantize (FP16 -> Packed INT2)
-// ------------------------------------------------------------------
-void quantize_kivi_kernel(const float* __restrict__ input, uint8_t* __restrict__ output, float* __restrict__ scales, int num_groups, int total_elements) {
+// --------------------------------------------------------------------------
+// 1. KEY QUANTIZATION — Per-Channel Asymmetric 2-bit
+// --------------------------------------------------------------------------
+// Input layout:  [B, H, D, Seq]  (transposed keys, contiguous)
+// Each "channel" = one (batch, head, dim) slice across Seq tokens.
+// group_size = number of tokens per quantization group (= Seq for single group).
+//
+// Output packed: [B, H, D, Seq/4]   dtype=uint8
+// Output scales: [B, H, D]          dtype=float32
+// Output zeros:  [B, H, D]          dtype=float32
+// --------------------------------------------------------------------------
+void quantize_keys_per_channel(
+    const float* __restrict__ input,
+    uint8_t*     __restrict__ output,
+    float*       __restrict__ scales,
+    float*       __restrict__ zeros,
+    int num_channels,
+    int group_size)
+{
     sycl::queue& q = get_queue();
-    const int local_size = 256;
-    const int num_work_groups = (num_groups + local_size - 1) / local_size;
-    
-    auto event = q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(num_work_groups * local_size), sycl::range<1>(local_size)), [=](sycl::nd_item<1> item) {
-            int g = item.get_global_id(0);
-            if (g >= num_groups) return;
-            
-            int base_idx = g * 4;
-            float v0 = input[base_idx + 0];
-            float v1 = input[base_idx + 1];
-            float v2 = input[base_idx + 2];
-            float v3 = input[base_idx + 3];
+    const int local_size  = 256;
+    const int global_size = ((num_channels + local_size - 1) / local_size) * local_size;
 
-            float max_val = sycl::fmax(sycl::fmax(sycl::fabs(v0), sycl::fabs(v1)), sycl::fmax(sycl::fabs(v2), sycl::fabs(v3)));
-            float scale = sycl::fmax(max_val / 3.0f, 1e-8f);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(global_size, local_size),
+            [=](sycl::nd_item<1> item) {
+                int ch = item.get_global_id(0);
+                if (ch >= num_channels) return;
 
-            auto quantize_value = [scale](float val) -> uint8_t {
-                return static_cast<uint8_t>(sycl::clamp(static_cast<int>(val / scale + 1.5f), 0, 3));
-            };
-            
-            output[g] = (quantize_value(v3) << 6) | (quantize_value(v2) << 4) | (quantize_value(v1) << 2) | quantize_value(v0);
-            scales[g] = scale;
-        });
-    });
-    event.wait_and_throw();
+                // --- Find min/max across the group ---
+                float max_val = -1e30f;
+                float min_val =  1e30f;
+                int base = ch * group_size;
+
+                for (int i = 0; i < group_size; ++i) {
+                    float val = input[base + i];
+                    max_val = sycl::fmax(max_val, val);
+                    min_val = sycl::fmin(min_val, val);
+                }
+
+                // --- Asymmetric scale & zero ---
+                float scale = (max_val - min_val) / 3.0f + 1e-10f;
+                scales[ch] = scale;
+                zeros[ch]  = min_val;
+
+                // --- Pack 4 × 2-bit values per byte ---
+                int out_base = ch * (group_size / 4);
+                for (int i = 0; i < group_size / 4; ++i) {
+                    uint8_t packed = 0;
+                    for (int j = 0; j < 4; ++j) {
+                        float val = input[base + i * 4 + j];
+                        float qf  = (val - min_val) / scale;
+                        int   qi  = static_cast<int>(sycl::round(qf));
+                        qi = sycl::clamp(qi, 0, 3);
+                        packed |= (static_cast<uint8_t>(qi) << (j * 2));
+                    }
+                    output[out_base + i] = packed;
+                }
+            });
+    }).wait();
 }
 
-// ------------------------------------------------------------------
-// KERNEL 2: Batched Attention (Optimized Multi-Head)
-// ------------------------------------------------------------------
-void batched_dequant_attention_kernel(const uint8_t* __restrict__ packed_cache, const float* __restrict__ scales, const float* __restrict__ query, float* __restrict__ output_scores, int batch_size, int num_heads, int seq_len, int cache_len, int head_dim) {
+// --------------------------------------------------------------------------
+// 2. VALUE QUANTIZATION — Per-Token Asymmetric 2-bit
+// --------------------------------------------------------------------------
+// Input layout:  [B, H, Seq, D]  (values, contiguous)
+// Each "group" = group_size consecutive elements within one token's D dim.
+//
+// Output packed: [B, H, Seq, D/4]                dtype=uint8
+// Output scales: [B, H, Seq, D/group_size]       dtype=float32
+// Output zeros:  [B, H, Seq, D/group_size]       dtype=float32
+// --------------------------------------------------------------------------
+void quantize_values_per_token(
+    const float* __restrict__ input,
+    uint8_t*     __restrict__ output,
+    float*       __restrict__ scales,
+    float*       __restrict__ zeros,
+    int num_tokens,
+    int head_dim,
+    int group_size)
+{
     sycl::queue& q = get_queue();
-    
-    // Input validation
-    if (head_dim % 4 != 0) {
-        throw std::runtime_error("head_dim must be divisible by 4 for group quantization");
-    }
-    if (batch_size <= 0 || num_heads <= 0 || seq_len <= 0 || cache_len <= 0) {
-        throw std::runtime_error("Invalid dimensions: all must be positive");
-    }
-    
-    // We need to compute attention for: batch × num_heads × seq_len × cache_len
-    const int total_computations = batch_size * num_heads * seq_len * cache_len;
-    const int local_size = 256;
-    const int num_work_groups = (total_computations + local_size - 1) / local_size;
-    const int groups_per_token = head_dim / 4;
-    
-    auto event = q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(num_work_groups * local_size), sycl::range<1>(local_size)), [=](sycl::nd_item<1> item) {
-            int global_idx = item.get_global_id(0);
-            if (global_idx >= total_computations) return;
-            
-            // Decode indices: we're computing attention between query token q_t and cache token c_t
-            int b = global_idx / (num_heads * seq_len * cache_len);
-            int remainder = global_idx % (num_heads * seq_len * cache_len);
-            int h = remainder / (seq_len * cache_len);
-            remainder = remainder % (seq_len * cache_len);
-            int q_t = remainder / cache_len;  // Which query token (0 to seq_len-1)
-            int c_t = remainder % cache_len;  // Which cache token (0 to cache_len-1)
-            
-            // Query offset: [batch][head][query_token][head_dim]
-            int query_offset = ((b * num_heads + h) * seq_len + q_t) * head_dim;
-            
-            // Cache offset: [batch][head][cache_token][groups]
-            int cache_offset = ((b * num_heads + h) * cache_len + c_t) * groups_per_token;
+    int groups_per_token = head_dim / group_size;
+    int total_groups     = num_tokens * groups_per_token;
+    const int local_size  = 256;
+    const int global_size = ((total_groups + local_size - 1) / local_size) * local_size;
 
-            // Compute dot product between query and dequantized cache
-            float dot_product = 0.0f;
-            for (int i = 0; i < groups_per_token; ++i) {
-                uint8_t packed = packed_cache[cache_offset + i];
-                float scale = scales[cache_offset + i];
-                int q_idx = query_offset + i * 4;
-                
-                dot_product = sycl::fma(static_cast<float>((packed >> 0) & 0x3) * scale, query[q_idx + 0], dot_product);
-                dot_product = sycl::fma(static_cast<float>((packed >> 2) & 0x3) * scale, query[q_idx + 1], dot_product);
-                dot_product = sycl::fma(static_cast<float>((packed >> 4) & 0x3) * scale, query[q_idx + 2], dot_product);
-                dot_product = sycl::fma(static_cast<float>((packed >> 6) & 0x3) * scale, query[q_idx + 3], dot_product);
-            }
-            
-            output_scores[global_idx] = dot_product;
-        });
-    });
-    event.wait_and_throw();
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(global_size, local_size),
+            [=](sycl::nd_item<1> item) {
+                int gid = item.get_global_id(0);
+                if (gid >= total_groups) return;
+
+                int token_idx    = gid / groups_per_token;
+                int group_in_tok = gid % groups_per_token;
+                int start_feat   = group_in_tok * group_size;
+                int base_input   = token_idx * head_dim + start_feat;
+
+                // --- Find min/max within the group ---
+                float max_val = -1e30f;
+                float min_val =  1e30f;
+                for (int i = 0; i < group_size; ++i) {
+                    float val = input[base_input + i];
+                    max_val = sycl::fmax(max_val, val);
+                    min_val = sycl::fmin(min_val, val);
+                }
+
+                float scale = (max_val - min_val) / 3.0f + 1e-10f;
+                scales[gid] = scale;
+                zeros[gid]  = min_val;
+
+                // --- Pack ---
+                // Output packed index: each token has head_dim/4 packed bytes
+                int packed_per_token = head_dim / 4;
+                int out_base = token_idx * packed_per_token + group_in_tok * (group_size / 4);
+
+                for (int i = 0; i < group_size / 4; ++i) {
+                    uint8_t packed = 0;
+                    for (int j = 0; j < 4; ++j) {
+                        float val = input[base_input + i * 4 + j];
+                        float qf  = (val - min_val) / scale;
+                        int   qi  = static_cast<int>(sycl::round(qf));
+                        qi = sycl::clamp(qi, 0, 3);
+                        packed |= (static_cast<uint8_t>(qi) << (j * 2));
+                    }
+                    output[out_base + i] = packed;
+                }
+            });
+    }).wait();
 }
 
-// ------------------------------------------------------------------
-// KERNEL 3: Single Head Attention (Legacy Stub)
-// ------------------------------------------------------------------
-void dequant_attention_kernel(const uint8_t* packed_cache, const float* scales, const float* query, float* output_scores, int seq_len, int cache_len, int head_dim) {
-    // Re-use the batched kernel logic for simplicity or keep basic stub
-    batched_dequant_attention_kernel(packed_cache, scales, query, output_scores, 1, 1, seq_len, cache_len, head_dim);
+// --------------------------------------------------------------------------
+// 3. KEY DEQUANTIZATION — Per-Channel Asymmetric
+// --------------------------------------------------------------------------
+void dequantize_keys_per_channel(
+    const uint8_t* __restrict__ input,
+    const float*   __restrict__ scales,
+    const float*   __restrict__ zeros,
+    float*         __restrict__ output,
+    int num_channels,
+    int group_size)
+{
+    sycl::queue& q = get_queue();
+    int bytes_per_channel = group_size / 4;
+    int total_bytes       = num_channels * bytes_per_channel;
+    const int local_size  = 256;
+    const int global_size = ((total_bytes + local_size - 1) / local_size) * local_size;
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(global_size, local_size),
+            [=](sycl::nd_item<1> item) {
+                int idx = item.get_global_id(0);
+                if (idx >= total_bytes) return;
+
+                int ch         = idx / bytes_per_channel;
+                int byte_in_ch = idx % bytes_per_channel;
+
+                float scale    = scales[ch];
+                float zero     = zeros[ch];
+                uint8_t packed = input[idx];
+
+                int out_base = ch * group_size + byte_in_ch * 4;
+                for (int j = 0; j < 4; ++j) {
+                    uint8_t qi = (packed >> (j * 2)) & 0x3;
+                    output[out_base + j] = static_cast<float>(qi) * scale + zero;
+                }
+            });
+    }).wait();
 }
 
-// ------------------------------------------------------------------
-// Python Bindings
-// ------------------------------------------------------------------
-void kivi_quantize_cuda(torch::Tensor input, torch::Tensor output, torch::Tensor scales) {
-    quantize_kivi_kernel(input.data_ptr<float>(), output.data_ptr<uint8_t>(), scales.data_ptr<float>(), output.numel(), input.numel());
-}
-void kivi_attention_cuda(torch::Tensor cache, torch::Tensor scales, torch::Tensor query, torch::Tensor out, int cache_len) {
-    int seq_len = out.size(0);
-    int head_dim = query.size(0);
-    dequant_attention_kernel(cache.data_ptr<uint8_t>(), scales.data_ptr<float>(), query.data_ptr<float>(), out.data_ptr<float>(), seq_len, cache_len, head_dim);
-}
-void kivi_batched_attention_cuda(torch::Tensor cache, torch::Tensor scales, torch::Tensor query, torch::Tensor out, int batch_size, int num_heads, int seq_len, int cache_len) {
-    // query shape: [batch * num_heads * seq_len * head_dim] (flattened)
-    // out shape: [batch * num_heads * seq_len * cache_len] (flattened)
-    int total_query_elements = query.numel();
-    int head_dim = total_query_elements / (batch_size * num_heads * seq_len);
-    
-    batched_dequant_attention_kernel(cache.data_ptr<uint8_t>(), scales.data_ptr<float>(), query.data_ptr<float>(), out.data_ptr<float>(), batch_size, num_heads, seq_len, cache_len, head_dim);
+// --------------------------------------------------------------------------
+// 4. VALUE DEQUANTIZATION — Per-Token Asymmetric
+// --------------------------------------------------------------------------
+void dequantize_values_per_token(
+    const uint8_t* __restrict__ input,
+    const float*   __restrict__ scales,
+    const float*   __restrict__ zeros,
+    float*         __restrict__ output,
+    int num_groups,
+    int group_size)
+{
+    sycl::queue& q = get_queue();
+    int bytes_per_group   = group_size / 4;
+    int total_bytes       = num_groups * bytes_per_group;
+    const int local_size  = 256;
+    const int global_size = ((total_bytes + local_size - 1) / local_size) * local_size;
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(global_size, local_size),
+            [=](sycl::nd_item<1> item) {
+                int byte_idx = item.get_global_id(0);
+                if (byte_idx >= total_bytes) return;
+
+                int group_idx   = byte_idx / bytes_per_group;
+                int byte_in_grp = byte_idx % bytes_per_group;
+
+                float scale    = scales[group_idx];
+                float zero     = zeros[group_idx];
+                uint8_t packed = input[byte_idx];
+
+                // Output: group_idx * group_size + byte_in_grp * 4
+                int out_base = group_idx * group_size + byte_in_grp * 4;
+                for (int j = 0; j < 4; ++j) {
+                    uint8_t qi = (packed >> (j * 2)) & 0x3;
+                    output[out_base + j] = static_cast<float>(qi) * scale + zero;
+                }
+            });
+    }).wait();
 }
 
+
+// ==========================================================================
+// Python Bindings — Torch Tensor Wrappers with Validation
+// ==========================================================================
+
+static void check_tensor(const torch::Tensor& t, const char* name,
+                          torch::ScalarType expected_dtype) {
+    TORCH_CHECK(t.is_contiguous(),
+                name, " must be contiguous");
+    TORCH_CHECK(t.scalar_type() == expected_dtype,
+                name, " must be ", torch::toString(expected_dtype),
+                " but got ", torch::toString(t.scalar_type()));
+}
+
+void kivi_quant_keys(
+    torch::Tensor input,
+    torch::Tensor output,
+    torch::Tensor scales,
+    torch::Tensor zeros,
+    int group_size)
+{
+    check_tensor(input,  "input",  torch::kFloat32);
+    check_tensor(output, "output", torch::kUInt8);
+    check_tensor(scales, "scales", torch::kFloat32);
+    check_tensor(zeros,  "zeros",  torch::kFloat32);
+    TORCH_CHECK(group_size > 0 && group_size % 4 == 0,
+                "group_size must be positive and divisible by 4, got ", group_size);
+
+    int num_channels = scales.numel();
+    quantize_keys_per_channel(
+        input.data_ptr<float>(),
+        output.data_ptr<uint8_t>(),
+        scales.data_ptr<float>(),
+        zeros.data_ptr<float>(),
+        num_channels,
+        group_size);
+}
+
+void kivi_quant_values(
+    torch::Tensor input,
+    torch::Tensor output,
+    torch::Tensor scales,
+    torch::Tensor zeros,
+    int head_dim,
+    int group_size)
+{
+    check_tensor(input,  "input",  torch::kFloat32);
+    check_tensor(output, "output", torch::kUInt8);
+    check_tensor(scales, "scales", torch::kFloat32);
+    check_tensor(zeros,  "zeros",  torch::kFloat32);
+    TORCH_CHECK(group_size > 0 && group_size % 4 == 0,
+                "group_size must be positive and divisible by 4");
+    TORCH_CHECK(head_dim > 0 && head_dim % group_size == 0,
+                "head_dim must be positive and divisible by group_size");
+
+    int num_tokens = input.numel() / head_dim;
+    quantize_values_per_token(
+        input.data_ptr<float>(),
+        output.data_ptr<uint8_t>(),
+        scales.data_ptr<float>(),
+        zeros.data_ptr<float>(),
+        num_tokens,
+        head_dim,
+        group_size);
+}
+
+void kivi_dequant_keys(
+    torch::Tensor input,
+    torch::Tensor scales,
+    torch::Tensor zeros,
+    torch::Tensor output,
+    int group_size)
+{
+    check_tensor(input,  "input",  torch::kUInt8);
+    check_tensor(scales, "scales", torch::kFloat32);
+    check_tensor(zeros,  "zeros",  torch::kFloat32);
+    check_tensor(output, "output", torch::kFloat32);
+
+    int num_channels = scales.numel();
+    dequantize_keys_per_channel(
+        input.data_ptr<uint8_t>(),
+        scales.data_ptr<float>(),
+        zeros.data_ptr<float>(),
+        output.data_ptr<float>(),
+        num_channels,
+        group_size);
+}
+
+void kivi_dequant_values(
+    torch::Tensor input,
+    torch::Tensor scales,
+    torch::Tensor zeros,
+    torch::Tensor output,
+    int head_dim,
+    int group_size)
+{
+    check_tensor(input,  "input",  torch::kUInt8);
+    check_tensor(scales, "scales", torch::kFloat32);
+    check_tensor(zeros,  "zeros",  torch::kFloat32);
+    check_tensor(output, "output", torch::kFloat32);
+
+    int num_groups = scales.numel();
+    dequantize_values_per_token(
+        input.data_ptr<uint8_t>(),
+        scales.data_ptr<float>(),
+        zeros.data_ptr<float>(),
+        output.data_ptr<float>(),
+        num_groups,
+        group_size);
+}
+
+// ==========================================================================
+// Module Registration
+// ==========================================================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("quantize", &kivi_quantize_cuda, "KIVI 2-bit Quantize");
-    m.def("attention", &kivi_attention_cuda, "KIVI 2-bit Single Attention");
-    m.def("batched_attention", &kivi_batched_attention_cuda, "KIVI 2-bit Batched Attention");
+    m.doc() = "KIVI: Asymmetric 2-bit KV Cache Quantization for Intel XPU (SYCL)";
+
+    m.def("quantize_keys",     &kivi_quant_keys,
+          "Asymmetric 2-bit key quantization (per-channel)",
+          py::arg("input"), py::arg("output"), py::arg("scales"),
+          py::arg("zeros"), py::arg("group_size"));
+
+    m.def("quantize_values",   &kivi_quant_values,
+          "Asymmetric 2-bit value quantization (per-token)",
+          py::arg("input"), py::arg("output"), py::arg("scales"),
+          py::arg("zeros"), py::arg("head_dim"), py::arg("group_size"));
+
+    m.def("dequantize_keys",   &kivi_dequant_keys,
+          "Asymmetric 2-bit key dequantization (per-channel)",
+          py::arg("input"), py::arg("scales"), py::arg("zeros"),
+          py::arg("output"), py::arg("group_size"));
+
+    m.def("dequantize_values", &kivi_dequant_values,
+          "Asymmetric 2-bit value dequantization (per-token)",
+          py::arg("input"), py::arg("scales"), py::arg("zeros"),
+          py::arg("output"), py::arg("head_dim"), py::arg("group_size"));
 }
