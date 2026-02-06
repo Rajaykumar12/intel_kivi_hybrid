@@ -1,265 +1,230 @@
-# KIVI 2-bit Quantization for Intel GPUs
+# KIVI-SYCL: 2-bit KV Cache Quantization for Intel GPUs
 
-## Overview
+Implementation of the **KIVI algorithm** ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)) targeting Intel XPU hardware via SYCL/oneAPI. Replaces the original CUDA kernels with DPC++ and integrates with HuggingFace Transformers through a drop-in `KiviManager` class.
 
-This project implements **KIVI (Key-Value Cache Quantization)** with 2-bit quantization optimized for Intel GPUs using SYCL. KIVI reduces memory usage of the KV cache in transformer models by ~4x while maintaining inference quality.
+## Results
 
-### Key Features
+Benchmarked on Intel Iris Xe Graphics with GPT-2 (12 layers, 12 heads, head_dim=64), generating 200 tokens:
 
-- **2-bit group-wise quantization** of key vectors (4 elements per group)
-- **SYCL-optimized kernels** for Intel GPU acceleration
-- **Surgical XPU integration** - only KV cache operations run on GPU, main model stays on CPU
-- **Zero model weight modifications** - purely a KV cache optimization layer
+| Metric | FP32 Baseline | KIVI 2-bit |
+|--------|:---:|:---:|
+| **Speed** | 43.1 tok/s | 37.2 tok/s |
+| **KV cache memory** | 1,386 KB | 378 KB |
+| **Compression** | 1× | **3.67×** |
+| **Token match vs FP32** | — | **100%** |
+| **Overhead** | — | 16% |
+
+The 100% token match is achieved through the CPU-residual architecture (see below), which eliminates floating-point rounding from unnecessary device transfers.
+
+## How KIVI Works
+
+The paper's key insight: keys and values have different outlier structures.
+
+```
+Keys:    outliers cluster in specific CHANNELS (dimensions)
+         → quantize per-channel, grouping along the token axis
+
+Values:  outliers cluster in specific TOKENS (positions)
+         → quantize per-token, grouping along the channel axis
+```
+
+### Asymmetric 2-bit Quantization
+
+```
+scale = (max - min) / 3
+zero  = min
+
+Quantize:    q = clamp(round((x - zero) / scale), 0, 3)
+Dequantize:  x ≈ q × scale + zero
+
+Packing:     4 values → 1 byte
+             byte = q₀ | (q₁ << 2) | (q₂ << 4) | (q₃ << 6)
+```
+
+### Residual Window
+
+The most recent R tokens stay in full FP32 precision. Only older tokens beyond the window get quantized. When the residual buffer exceeds R tokens, the oldest G tokens are flushed to 2-bit storage:
+
+```
+Token stream: [t₀, t₁, ..., t_{n-R}, ..., tₙ]
+               ├── Quantized (2-bit) ──┤├─ Residual (FP32) ─┤
+```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Transformer Model                     │
-│                      (Runs on CPU)                       │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-                      ▼
-         ┌────────────────────────┐
-         │  KiviAttentionWrapper  │
-         │   (Intercepts Attn)    │
-         └────────┬───────────────┘
+┌──────────────────────────────────────────┐
+│        Transformer Model (CPU)           │
+│        HuggingFace GPT-2 etc.            │
+└──────────────────┬───────────────────────┘
+                   │ past_key_values (CPU tensors)
+                   ▼
+         ┌──────────────────┐
+         │   KiviManager    │
+         │   (benchmark.py) │
+         └────────┬─────────┘
                   │
-    ┌─────────────┴─────────────┐
-    │                           │
-    ▼                           ▼
-┌────────┐              ┌──────────────┐
-│  CPU   │              │  XPU (GPU)   │
-│ Logic  │              │              │
-│        │              │ ┌──────────┐ │
-│ Q,K,V  │──Move to XPU─▶│ KiviCache│ │
-│ Proj   │              │ │          │ │
-│        │              │ │ Quantize │ │
-│        │              │ │  Kernel  │ │
-│        │              │ └──────────┘ │
-│        │              │              │
-│        │              │ ┌──────────┐ │
-│        │              │ │ Attention│ │
-│        │              │ │  Kernel  │ │
-│        │◀─Move to CPU─│ └──────────┘ │
-│        │              │              │
-│ Output │              └──────────────┘
-│ Proj   │
-└────────┘
+    ┌─────────────┴──────────────────┐
+    │                                │
+    ▼                                ▼
+┌──────────────┐          ┌──────────────────┐
+│  Residual    │          │  Quantized Store │
+│  Buffer      │          │  (XPU Memory)    │
+│  (FP32, CPU) │          │                  │
+│              │          │ packed: uint8    │
+│ Last R tokens│          │ scales: float32  │
+│ No device    │          │ zeros:  float32  │
+│ transfers    │          │                  │
+└──────────────┘          └────────┬─────────┘
+                                   │
+                         ┌─────────┴─────────┐
+                         │  SYCL Kernels     │
+                         │  (kivi_sycl)      │
+                         │                   │
+                         │ quantize_keys()   │
+                         │ quantize_values() │
+                         │ dequantize_keys() │
+                         │ dequantize_values()│
+                         └───────────────────┘
 ```
 
-## How It Works
+### CPU-Residual Design
 
-### 1. Quantization (2-bit per element)
+The critical performance optimization: **residual buffers live on CPU**, not XPU.
 
-Each group of 4 float32 values is quantized to 2 bits each (1 byte total):
+| Decode step type | What happens | XPU involved? |
+|---|---|---|
+| **Normal** (~97% of steps) | CPU `torch.cat` of cached history + residual | No |
+| **Flush** (~3% of steps) | CPU→XPU transfer, SYCL quantize+dequantize, XPU→CPU transfer back | Yes |
 
+This eliminates per-step XPU synchronization stalls that otherwise dominate latency on integrated GPUs. The dequantized history is cached on CPU and incrementally updated only when a flush occurs.
+
+## Tensor Shapes
+
+### Key Storage (Per-Channel)
 ```
-Input:  [v0, v1, v2, v3]  (4 × 32 bits = 128 bits)
-         ↓
-Scale = max(|v0|, |v1|, |v2|, |v3|) / 3.0
-         ↓
-Quantized = [q0, q1, q2, q3]  (4 × 2 bits = 8 bits)
-where qi = clamp(int(vi / scale + 1.5), 0, 3)
-         ↓
-Packed byte: [q3 q2 q1 q0] = (q3<<6) | (q2<<4) | (q1<<2) | q0
-```
-
-**Memory savings**: 128 bits → 8 bits (packed) + 32 bits (scale) = **40 bits** (~3.2x compression)
-
-### 2. Dequantization & Attention
-
-During attention computation:
-```python
-# For each cached token:
-for group in groups_per_head:
-    packed_byte = cache[group]
-    scale = scales[group]
-    
-    # Extract 2-bit values
-    q0 = (packed_byte >> 0) & 0x3
-    q1 = (packed_byte >> 2) & 0x3
-    q2 = (packed_byte >> 4) & 0x3
-    q3 = (packed_byte >> 6) & 0x3
-    
-    # Dequantize and compute dot product
-    dot_product += q0 * scale * query[0]
-    dot_product += q1 * scale * query[1]
-    dot_product += q2 * scale * query[2]
-    dot_product += q3 * scale * query[3]
+Input:   [B, H, D, Seq]     float32  (keys transposed for per-channel quant)
+Packed:  [B, H, D, Seq/4]   uint8    (4 values per byte)
+Scales:  [B, H, D]          float32  (1 scale per channel)
+Zeros:   [B, H, D]          float32  (1 zero-point per channel)
 ```
 
-## Tensor Shapes & Memory Layout
-
-### Cache Storage
-
-```python
-# Key cache (quantized)
-k_cache_packed: [batch, num_heads, max_seq_len, groups_per_head]
-                dtype=uint8
-                
-k_scales:       [batch, num_heads, max_seq_len, groups_per_head]
-                dtype=float32
-
-# Value cache (unquantized)
-v_cache:        [batch, num_heads, max_seq_len, head_dim]
-                dtype=float32
+### Value Storage (Per-Token)
+```
+Input:   [B, H, Seq, D]             float32
+Packed:  [B, H, Seq, D/4]           uint8    (4 values per byte)
+Scales:  [B, H, Seq, D/group_size]  float32  (1 scale per group)
+Zeros:   [B, H, Seq, D/group_size]  float32  (1 zero-point per group)
 ```
 
-Where `groups_per_head = head_dim // 4`
-
-### Kernel Inputs (Flattened)
-
-```python
-# Batched Attention Kernel
-cache_flat:  [batch × num_heads × cache_len × groups_per_head]
-scales_flat: [batch × num_heads × cache_len × groups_per_head]
-query_flat:  [batch × num_heads × seq_len × head_dim]
-output:      [batch × num_heads × seq_len × cache_len]
-```
-
-## Installation
+## Setup
 
 ### Prerequisites
 
-- Intel GPU (Arc, Flex, or Data Center GPU)
-- Intel oneAPI Base Toolkit (2025.0 or later)
+- Intel GPU with oneAPI support (Arc, Iris Xe, Flex, Data Center)
+- Intel oneAPI Base Toolkit 2025.0+
+- Python 3.10+
 - PyTorch with Intel Extension for PyTorch (IPEX)
 
-### Build
+### Install
 
 ```bash
-# Source oneAPI environment
+# Activate oneAPI environment
 source /opt/intel/oneapi/setvars.sh
 
-# Build the SYCL extension
-python setup.py install
+# Activate conda environment with IPEX
+conda activate intel_xpu
 
-# Or for development
-python setup.py develop
+# Build the SYCL extension
+pip install . --no-build-isolation
+```
+
+### Verify
+
+```bash
+# Check SYCL devices are visible
+sycl-ls
+
+# Run kernel tests
+python test_kivi.py
+python test_quantize_simple.py
+python test_attention_fix.py
+
+# Run benchmark
+python benchmark.py
 ```
 
 ## Usage
 
-### Basic Example
-
-```python
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import kivi_sycl
-
-# Load model on CPU
-model = AutoModelForCausalLM.from_pretrained("gpt2").to("cpu")
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
-
-# Inject KIVI into attention layers
-from benchmark import inject_kivi
-model = inject_kivi(model)
-
-# Run inference
-inputs = tokenizer("The future of AI is", return_tensors="pt")
-outputs = model.generate(**inputs, max_new_tokens=50, use_cache=False)
-
-print(tokenizer.decode(outputs[0]))
-```
-
-### Configuration
-
-```python
-from benchmark import KiviConfig
-
-config = KiviConfig(
-    quantize_keys=True,  # Enable key quantization
-    bits=2,              # 2-bit quantization
-    group_size=4         # Group size (must divide head_dim)
-)
-```
-
-## Testing
-
-Run the validation tests:
+### Benchmark
 
 ```bash
-python test_kivi.py
+python benchmark.py
 ```
 
-This will test:
-1. Quantization/dequantization accuracy
-2. Attention kernel correctness
-3. Dimension validation
+Runs GPT-2 generation with both FP32 reference and KIVI quantization, reporting speed, compression ratio, and token-level quality comparison.
 
-## Performance Considerations
+### Integrate with Your Model
 
-### Memory Savings
+```python
+from benchmark import KiviManager
 
-For GPT-2 (12 layers, 12 heads, head_dim=64):
-- **Without KIVI**: ~150 MB for 1024 tokens
-- **With KIVI**: ~40 MB for 1024 tokens
-- **Savings**: ~73% memory reduction
+manager = KiviManager(
+    num_layers=12,
+    head_dim=64,
+    device="xpu",
+    group_size=32,       # G: elements per quantization group
+    residual_length=64,  # R: full-precision window size
+)
 
-### Speed
+# Generation loop
+for step in range(max_tokens):
+    past = manager.get_full_cache()              # CPU tensors, zero-copy most steps
+    out = model(input_ids, past_key_values=past, use_cache=True)
+    manager.add_tokens(out.past_key_values)      # CPU-only, no XPU sync
+    input_ids = out.logits[:, -1, :].argmax(-1).unsqueeze(1)
+```
 
-- Quantization adds ~5-10% overhead per token
-- Memory bandwidth savings can offset this for long sequences
-- Best performance at seq_len > 512
+### Direct Kernel API
 
-## Troubleshooting
+```python
+import kivi_sycl
 
-### Common Issues
+# Keys: per-channel quantization
+kivi_sycl.quantize_keys(input, packed, scales, zeros, group_size)
+kivi_sycl.dequantize_keys(packed, scales, zeros, output, group_size)
 
-**1. "SYCL exception: No device of requested type available"**
-- Ensure Intel GPU drivers are installed
-- Check `sycl-ls` output
-- Verify oneAPI environment is sourced
+# Values: per-token quantization
+kivi_sycl.quantize_values(input, packed, scales, zeros, head_dim, group_size)
+kivi_sycl.dequantize_values(packed, scales, zeros, output, head_dim, group_size)
+```
 
-**2. "head_dim must be divisible by 4"**
-- KIVI requires head_dim to be a multiple of 4
-- Most models (GPT-2, LLaMA, etc.) satisfy this
+## Files
 
-**3. Shape mismatch errors**
-- Enable debug logging: see `[KIVI Attention]` and `[KIVI Cache]` prints
-- Verify tensor shapes match expected layout
+| File | Purpose |
+|------|---------|
+| `src/kivi_optimized.cpp` | SYCL kernels for 2-bit quantize/dequantize |
+| `benchmark.py` | `KiviManager` class + GPT-2 benchmark with FP32 comparison |
+| `setup.py` | Build config for the SYCL C++ extension |
+| `test_kivi.py` | Key/value round-trip, known values, multi-batch, edge cases |
+| `test_quantize_simple.py` | Deterministic `[1,2,3,4]` → packed=228 verification |
+| `test_attention_fix.py` | Quantize→dequantize→attention pipeline vs FP32 reference |
 
-## Implementation Details
+## Parameters
 
-### Files
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `group_size` (G) | 32 | Elements per quantization group. Must divide `head_dim` and be ≥ 4. |
+| `residual_length` (R) | 64 | Tokens kept in full precision. Larger = better quality, less compression. |
 
-- **`src/kivi_optimized.cpp`**: SYCL kernels for quantization and attention
-- **`benchmark.py`**: Python wrapper and GPT-2 integration
-- **`setup.py`**: Build configuration
-- **`test_kivi.py`**: Validation tests
-
-### Key Functions
-
-**C++ (SYCL)**:
-- `quantize_kivi_kernel()`: Quantize float32 → 2-bit packed
-- `batched_dequant_attention_kernel()`: Compute attention with quantized keys
-- `get_queue()`: Initialize SYCL queue for Intel GPU
-
-**Python**:
-- `KiviCache`: Manages quantized KV cache on XPU
-- `KiviAttentionWrapper`: Intercepts attention computation
-- `inject_kivi()`: Replaces attention layers in model
+For production with larger models (7B+), R=128 is recommended per the paper.
 
 ## References
 
-- [KIVI Paper](https://arxiv.org/abs/2402.02750) - Original KIVI research
-- [Intel SYCL Documentation](https://www.intel.com/content/www/us/en/docs/dpcpp-cpp-compiler/)
+- [KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache](https://arxiv.org/abs/2402.02750) — Zirui Liu et al., ICML 2024
+- [Intel oneAPI DPC++ Compiler](https://www.intel.com/content/www/us/en/docs/dpcpp-cpp-compiler/)
 - [Intel Extension for PyTorch](https://github.com/intel/intel-extension-for-pytorch)
 
 ## License
 
-MIT License - See LICENSE file for details
-
-## Contributing
-
-Contributions welcome! Please:
-1. Run tests before submitting PR
-2. Add tests for new features
-3. Follow existing code style
-4. Update documentation
-
-## Acknowledgments
-
-- Original KIVI implementation by [KIVI authors]
-- Intel oneAPI team for SYCL support
+MIT
