@@ -146,9 +146,9 @@ pip install . --no-build-isolation
 sycl-ls
 
 # Run kernel tests
-python test_kivi.py
-python test_quantize_simple.py
-python test_attention_fix.py
+python test/test_kivi.py
+python test/test_quantize_simple.py
+python test/test_attention_fix.py
 
 # Run benchmark
 python benchmark.py
@@ -206,16 +206,43 @@ kivi_sycl.dequantize_values(packed, scales, zeros, output, head_dim, group_size)
 | `src/kivi_optimized.cpp` | SYCL kernels for 2-bit quantize/dequantize |
 | `benchmark.py` | `KiviManager` class + GPT-2 benchmark with FP32 comparison |
 | `setup.py` | Build config for the SYCL C++ extension |
-| `test_kivi.py` | Key/value round-trip, known values, multi-batch, edge cases |
-| `test_quantize_simple.py` | Deterministic `[1,2,3,4]` → packed=228 verification |
-| `test_attention_fix.py` | Quantize→dequantize→attention pipeline vs FP32 reference |
+| `test/test_kivi.py` | Comprehensive validation suite (15 checks) |
+| `test/test_quantize_simple.py` | Deterministic known-value verification |
+| `test/test_attention_fix.py` | End-to-end attention pipeline vs FP32 reference |
 
-## Parameters
+## Testing
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `group_size` (G) | 32 | Elements per quantization group. Must divide `head_dim` and be ≥ 4. |
-| `residual_length` (R) | 64 | Tokens kept in full precision. Larger = better quality, less compression. |
+Run the full test suite:
+
+```bash
+python test/test_kivi.py
+python test/test_quantize_simple.py
+python test/test_attention_fix.py
+```
+
+### test_kivi.py — 15 checks
+
+| Test | What it verifies |
+|------|------------------|
+| Key round-trip | Per-channel quantize→dequantize error ≤ 0.5× scale |
+| Value round-trip | Per-token quantize→dequantize error within tolerance |
+| Known values | `[1,2,3,4]` → scale=1.0, zero=1.0, packed=228, lossless round-trip |
+| Multi-batch/head | Correct behavior with B=2, H=4 |
+| Constant input | No NaN/Inf for constant values, reconstructs exactly |
+
+### test_quantize_simple.py
+
+Deterministic bit-level verification with `[1,2,3,4]` across 4 channels:
+- Confirms `packed = 0|(1<<2)|(2<<4)|(3<<6) = 228 = 11100100₂`
+- Verifies scale=1.0, zero=1.0 across all channels
+- Full round-trip: `[1,2,3,4] → quantize → dequantize → [1,2,3,4]` with 0.0 error
+
+### test_attention_fix.py
+
+End-to-end pipeline: quantize KV → dequantize → compute attention → compare with FP32:
+- Key/value dequantization error ~1.0 (expected for 2-bit with random data)
+- Cosine similarity between KIVI and FP32 attention output: **0.898** (> 0.85 threshold)
+- No NaN/Inf in output
 
 For production with larger models (7B+), R=128 is recommended per the paper.
 
