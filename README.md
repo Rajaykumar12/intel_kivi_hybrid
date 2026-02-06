@@ -253,5 +253,4 @@ For production with larger models (7B+), R=128 is recommended per the paper.
 - [Intel Extension for PyTorch](https://github.com/intel/intel-extension-for-pytorch)
 
 ## License
-
-MIT
+BSD 3-Clause License
