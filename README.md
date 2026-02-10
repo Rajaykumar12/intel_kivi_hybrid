@@ -359,5 +359,4 @@ End-to-end pipeline: quantize KV → dequantize → compute attention → compar
 - [Intel Extension for PyTorch](https://github.com/intel/intel-extension-for-pytorch)
 
 ## License
-
-MIT
+BSD 3-Clause License
