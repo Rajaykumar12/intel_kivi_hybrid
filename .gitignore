@@ -3,7 +3,21 @@
 
 # Build artifacts
 build/
+dist/
+*.so
+*.o
 
-# Python egg-info
+# Python packaging
 kivi_sycl.egg-info/
 kivi_test.egg-info/
+*.egg-info/
+*.egg
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Backups
+*_old.py
+benchmark_old.py
