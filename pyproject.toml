@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kivi-sycl"
+version = "0.1.0"
+description = "KIVI: Tuning-Free Asymmetric 2-bit KV Cache Quantization for Intel GPUs"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Rajay"},
+]
+keywords = ["kv-cache", "quantization", "2-bit", "sycl", "intel", "xpu", "llm", "inference"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "torch",
+    "intel-extension-for-pytorch",
+    "transformers",
+]
+
+[project.urls]
+Homepage = "https://github.com/rajay/kivi-sycl"
+Repository = "https://github.com/rajay/kivi-sycl"
+Issues = "https://github.com/rajay/kivi-sycl/issues"
+Paper = "https://arxiv.org/abs/2402.02750"
