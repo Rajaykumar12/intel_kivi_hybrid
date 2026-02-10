@@ -1,6 +1,11 @@
 # KIVI-SYCL: 2-bit KV Cache Quantization for Intel GPUs
 
-Implementation of the **KIVI algorithm** ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)) targeting Intel XPU hardware via SYCL/oneAPI. Replaces the original CUDA kernels with DPC++ and integrates with HuggingFace Transformers through a drop-in `KiviManager` class.
+Implementation of the **KIVI algorithm** ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)) targeting Intel XPU hardware via SYCL/oneAPI. Replaces the original CUDA kernels with DPC++ and provides a **plug-and-play** `kivi_cache` module that works with **any** HuggingFace causal LM (GPT-2, LLaMA, Mistral, Phi, Qwen, Falcon, etc.).
+
+```python
+from kivi_cache import generate
+text = generate(model, tokenizer, "Once upon a time", max_new_tokens=200)
+```
 
 ## Results
 
@@ -8,11 +13,11 @@ Benchmarked on Intel Iris Xe Graphics with GPT-2 (12 layers, 12 heads, head_dim=
 
 | Metric | FP32 Baseline | KIVI 2-bit |
 |--------|:---:|:---:|
-| **Speed** | 43.1 tok/s | 37.2 tok/s |
+| **Speed** | 16.3 tok/s | 14.4 tok/s |
 | **KV cache memory** | 1,386 KB | 378 KB |
 | **Compression** | 1× | **3.67×** |
 | **Token match vs FP32** | — | **100%** |
-| **Overhead** | — | 16% |
+| **Overhead** | — | 13% |
 
 The 100% token match is achieved through the CPU-residual architecture (see below), which eliminates floating-point rounding from unnecessary device transfers.
 
@@ -55,13 +60,14 @@ Token stream: [t₀, t₁, ..., t_{n-R}, ..., tₙ]
 ```
 ┌──────────────────────────────────────────┐
 │        Transformer Model (CPU)           │
-│        HuggingFace GPT-2 etc.            │
+│   Any HuggingFace CausalLM (GPT-2,      │
+│   LLaMA, Mistral, Phi, Qwen, etc.)      │
 └──────────────────┬───────────────────────┘
                    │ past_key_values (CPU tensors)
                    ▼
          ┌──────────────────┐
-         │   KiviManager    │
-         │   (benchmark.py) │
+         │    KiviCache     │
+         │  (kivi_cache.py) │
          └────────┬─────────┘
                   │
     ┌─────────────┴──────────────────┐
@@ -87,6 +93,18 @@ Token stream: [t₀, t₁, ..., t_{n-R}, ..., tₙ]
                          │ dequantize_values()│
                          └───────────────────┘
 ```
+
+### Supported Models
+
+`KiviCache.from_model()` auto-detects config from any HuggingFace `CausalLM`:
+
+- **GPT-2** family (gpt2, gpt2-medium, gpt2-large, gpt2-xl)
+- **LLaMA** family (Llama-2, Llama-3, Code Llama)
+- **Mistral** / **Mixtral**
+- **Phi** (Phi-2, Phi-3)
+- **Qwen** / **Qwen2**
+- **Falcon**, **Gemma**, **GPT-J**, **GPT-NeoX**, **OPT**, **BLOOM**, **MPT**, **StableLM**
+- Any model returning `past_key_values` as `tuple[tuple[Tensor, Tensor]]`
 
 ### CPU-Residual Design
 
@@ -119,24 +137,46 @@ Zeros:   [B, H, Seq, D/group_size]  float32  (1 zero-point per group)
 
 ## Setup
 
-### Prerequisites
+### Option 1: Install pre-built wheel (recommended for users)
 
-- Intel GPU with oneAPI support (Arc, Iris Xe, Flex, Data Center)
-- Intel oneAPI Base Toolkit 2025.0+
-- Python 3.10+
-- PyTorch with Intel Extension for PyTorch (IPEX)
-
-### Install
+No compiler needed — just an Intel GPU with drivers.
 
 ```bash
-# Activate oneAPI environment
-source /opt/intel/oneapi/setvars.sh
+pip install kivi-sycl
+```
 
-# Activate conda environment with IPEX
+Or install from a `.whl` file (e.g. from GitHub Releases):
+
+```bash
+pip install kivi_sycl-0.1.0-cp310-cp310-linux_x86_64.whl
+```
+
+**Requirements:**
+- Intel GPU (Iris Xe, Arc, Flex, or Data Center)
+- Intel GPU drivers installed ([install guide](https://dgpu-docs.intel.com/driver/installation.html))
+- Python 3.10+
+
+### Option 2: Build from source (for developers)
+
+Needed only if you want to modify the SYCL kernels.
+
+```bash
+# Prerequisites: Intel oneAPI DPC++ compiler
+source /opt/intel/oneapi/setvars.sh
 conda activate intel_xpu
 
-# Build the SYCL extension
+# Clone and install
+git clone https://github.com/Rajaykumar12/intel_kivi_hybrid.git
+cd intel_kivi_hybrid
 pip install . --no-build-isolation
+```
+
+### Building a wheel (for maintainers)
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+bash build_wheel.sh
+# Output: dist/kivi_sycl-0.1.0-cp310-cp310-linux_x86_64.whl
 ```
 
 ### Verify
@@ -156,33 +196,89 @@ python benchmark.py
 
 ## Usage
 
+### Quick Start — One-liner Generation
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from kivi_cache import generate
+
+model = AutoModelForCausalLM.from_pretrained("gpt2")
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+
+# One line — works with any HuggingFace CausalLM
+text = generate(model, tokenizer, "Once upon a time", max_new_tokens=200)
+print(text)
+```
+
+### With Sampling Options
+
+```python
+text = generate(
+    model, tokenizer,
+    "The meaning of life is",
+    max_new_tokens=300,
+    do_sample=True,       # enable sampling
+    temperature=0.8,      # creativity control
+    top_k=50,             # top-k filtering
+    verbose=True,         # print progress dots
+)
+```
+
+### Custom Generation Loop (Full Control)
+
+```python
+from kivi_cache import KiviCache
+import torch
+
+# Auto-configure from any HuggingFace model
+cache = KiviCache.from_model(model, group_size=32, residual_length=128)
+
+input_ids = tokenizer("Hello world", return_tensors="pt").input_ids
+
+# Prefill
+with torch.no_grad():
+    out = model(input_ids, use_cache=True)
+cache.add_tokens(out.past_key_values)
+next_id = out.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+
+# Decode loop
+for step in range(200):
+    past = cache.get_full_cache()
+    with torch.no_grad():
+        out = model(next_id, past_key_values=past, use_cache=True)
+    cache.add_tokens(out.past_key_values)
+    next_id = out.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+
+# Reuse for another prompt
+cache.reset()
+```
+
+### Check Memory Savings
+
+```python
+stats = cache.get_stats(layer=0)
+print(f"Compression: {stats['compression']:.1f}x")
+print(f"KIVI: {stats['kivi_bytes']/1024:.0f} KB vs FP32: {stats['fp32_bytes']/1024:.0f} KB")
+```
+
+### Use with Any Model
+
+```python
+# LLaMA
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+text = generate(model, tokenizer, "Explain quantum computing:", max_new_tokens=500)
+
+# Mistral, Phi, Qwen, Falcon — same API, model config auto-detected
+```
+
 ### Benchmark
 
 ```bash
-python benchmark.py
-```
-
-Runs GPT-2 generation with both FP32 reference and KIVI quantization, reporting speed, compression ratio, and token-level quality comparison.
-
-### Integrate with Your Model
-
-```python
-from benchmark import KiviManager
-
-manager = KiviManager(
-    num_layers=12,
-    head_dim=64,
-    device="xpu",
-    group_size=32,       # G: elements per quantization group
-    residual_length=64,  # R: full-precision window size
-)
-
-# Generation loop
-for step in range(max_tokens):
-    past = manager.get_full_cache()              # CPU tensors, zero-copy most steps
-    out = model(input_ids, past_key_values=past, use_cache=True)
-    manager.add_tokens(out.past_key_values)      # CPU-only, no XPU sync
-    input_ids = out.logits[:, -1, :].argmax(-1).unsqueeze(1)
+python benchmark.py                              # GPT-2 (default)
+python benchmark.py gpt2-medium                   # GPT-2 Medium
+python benchmark.py meta-llama/Llama-2-7b-hf      # LLaMA-2
+python benchmark.py --tokens 100 --G 32 --R 128   # custom params
 ```
 
 ### Direct Kernel API
@@ -199,13 +295,25 @@ kivi_sycl.quantize_values(input, packed, scales, zeros, head_dim, group_size)
 kivi_sycl.dequantize_values(packed, scales, zeros, output, head_dim, group_size)
 ```
 
+### Parameters
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `group_size` (G) | 32 | Quantization granularity. Smaller = better quality, more metadata |
+| `residual_length` (R) | 128 | Recent FP32 tokens. Larger = better quality, less compression |
+
+For GPT-2 (short sequences), `R=64` is sufficient. For 7B+ models with long contexts, `R=128` is recommended per the paper.
+
 ## Files
 
 | File | Purpose |
 |------|---------|
+| `kivi_cache.py` | **Plug-and-play module**: `KiviCache` class + `generate()` one-liner |
 | `src/kivi_optimized.cpp` | SYCL kernels for 2-bit quantize/dequantize |
-| `benchmark.py` | `KiviManager` class + GPT-2 benchmark with FP32 comparison |
-| `setup.py` | Build config for the SYCL C++ extension |
+| `benchmark.py` | Benchmark script with FP32 comparison (uses `kivi_cache`) |
+| `build_wheel.sh` | Build pre-built wheel for distribution |
+| `setup.py` | Package config with auto-detected SYCL paths |
+| `pyproject.toml` | Modern Python packaging metadata |
 | `test/test_kivi.py` | Comprehensive validation suite (15 checks) |
 | `test/test_quantize_simple.py` | Deterministic known-value verification |
 | `test/test_attention_fix.py` | End-to-end attention pipeline vs FP32 reference |
@@ -243,8 +351,6 @@ End-to-end pipeline: quantize KV → dequantize → compute attention → compar
 - Key/value dequantization error ~1.0 (expected for 2-bit with random data)
 - Cosine similarity between KIVI and FP32 attention output: **0.898** (> 0.85 threshold)
 - No NaN/Inf in output
-
-For production with larger models (7B+), R=128 is recommended per the paper.
 
 ## References
 
