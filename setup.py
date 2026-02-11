@@ -65,12 +65,11 @@ setup(
     description="KIVI: Tuning-Free Asymmetric 2-bit KV Cache Quantization for Intel GPUs",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/rajay/kivi-sycl",  # TODO: update with your repo URL
+    url="https://github.com/Rajaykumar12/intel_kivi_hybrid",  # TODO: update with your repo URL
     license="MIT",
     python_requires=">=3.10",
     install_requires=[
         "torch",
-        "intel-extension-for-pytorch",
         "transformers",
     ],
     py_modules=["kivi_cache"],
