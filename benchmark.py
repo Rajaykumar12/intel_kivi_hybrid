@@ -143,16 +143,6 @@ def benchmark(model_id, num_gen_tokens, G, R, prompt):
     print(f"  Token match rate:     {match*100:.1f}%")
     print(f"  First divergence at:  token {diverge_at} / {min_len}")
 
-    # -----------------------------------------------------------
-    # 4. Show plug-and-play one-liner API
-    # -----------------------------------------------------------
-    print(f"\n{'='*60}")
-    print("Plug-and-play one-liner API demo:")
-    print("  from kivi_cache import generate")
-    print(f'  text = generate(model, tokenizer, "{prompt[:40]}...", '
-          f'max_new_tokens={num_gen_tokens})')
-    print(f"{'='*60}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
