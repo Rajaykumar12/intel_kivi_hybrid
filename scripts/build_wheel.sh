@@ -9,13 +9,17 @@
 # Usage:
 #   source /opt/intel/oneapi/setvars.sh
 #   conda activate intel_xpu
-#   bash build_wheel.sh
+#   bash scripts/build_wheel.sh
 #
 # Output:
 #   dist/kivi_sycl-0.1.0-cp310-cp310-linux_x86_64.whl
 # ==========================================================================
 
 set -e
+
+# Run from the repo root regardless of where this script is invoked from.
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
 
 echo "=== Building kivi-sycl wheel ==="
 
