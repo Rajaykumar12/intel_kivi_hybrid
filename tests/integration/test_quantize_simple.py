@@ -19,7 +19,7 @@ get visible to the host readback path.
 
 import torch
 import intel_extension_for_pytorch as ipex
-import kivi_sycl
+from kivi_sycl import _C as kivi_sycl
 
 device = "xpu"
 NUM_CHANNELS = 4  # D=4 avoids single-element scale/zero tensor edge case

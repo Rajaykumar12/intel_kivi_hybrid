@@ -21,7 +21,7 @@ except ImportError:
     print("WARNING: Intel Extension for PyTorch not found. XPU support disabled.")
     HAS_IPEX = False
 
-import kivi_sycl
+from kivi_sycl import _C as kivi_sycl
 
 DEVICE = "xpu"
 PASS_COUNT = 0
