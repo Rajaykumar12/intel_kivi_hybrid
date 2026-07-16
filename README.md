@@ -1,9 +1,9 @@
 # KIVI-SYCL: 2-bit KV Cache Quantization for Intel GPUs
 
-Implementation of the **KIVI algorithm** ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)) targeting Intel XPU hardware via SYCL/oneAPI. Replaces the original CUDA kernels with DPC++ and provides a **plug-and-play** `kivi_cache` module that works with **any** HuggingFace causal LM (GPT-2, LLaMA, Mistral, Phi, Qwen, Falcon, etc.).
+Implementation of the **KIVI algorithm** ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)) targeting Intel XPU hardware via SYCL/oneAPI. Replaces the original CUDA kernels with DPC++ and provides a **plug-and-play** `kivi_sycl` module that works with **any** HuggingFace causal LM (GPT-2, LLaMA, Mistral, Phi, Qwen, Falcon, etc.).
 
 ```python
-from kivi_cache import generate
+from kivi_sycl import generate
 text = generate(model, tokenizer, "Once upon a time", max_new_tokens=200)
 ```
 
@@ -67,7 +67,7 @@ Token stream: [t₀, t₁, ..., t_{n-R}, ..., tₙ]
                    ▼
          ┌──────────────────┐
          │    KiviCache     │
-         │  (kivi_cache.py) │
+         │  (kivi_sycl)     │
          └────────┬─────────┘
                   │
     ┌─────────────┴──────────────────┐
@@ -85,7 +85,7 @@ Token stream: [t₀, t₁, ..., t_{n-R}, ..., tₙ]
                                    │
                          ┌─────────┴─────────┐
                          │  SYCL Kernels     │
-                         │  (kivi_sycl)      │
+                         │  (kivi_sycl._C)   │
                          │                   │
                          │ quantize_keys()   │
                          │ quantize_values() │
@@ -175,7 +175,7 @@ pip install . --no-build-isolation
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
-bash build_wheel.sh
+bash scripts/build_wheel.sh
 # Output: dist/kivi_sycl-0.1.0-cp310-cp310-linux_x86_64.whl
 ```
 
@@ -186,12 +186,12 @@ bash build_wheel.sh
 sycl-ls
 
 # Run kernel tests
-python test/test_kivi.py
-python test/test_quantize_simple.py
-python test/test_attention_fix.py
+python tests/integration/test_kivi.py
+python tests/integration/test_quantize_simple.py
+python tests/integration/test_attention_fix.py
 
 # Run benchmark
-python benchmark.py
+python examples/benchmark.py
 ```
 
 ## Usage
@@ -200,7 +200,7 @@ python benchmark.py
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from kivi_cache import generate
+from kivi_sycl import generate
 
 model = AutoModelForCausalLM.from_pretrained("gpt2")
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -227,7 +227,7 @@ text = generate(
 ### Custom Generation Loop (Full Control)
 
 ```python
-from kivi_cache import KiviCache
+from kivi_sycl import KiviCache
 import torch
 
 # Auto-configure from any HuggingFace model
@@ -275,24 +275,26 @@ text = generate(model, tokenizer, "Explain quantum computing:", max_new_tokens=5
 ### Benchmark
 
 ```bash
-python benchmark.py                              # GPT-2 (default)
-python benchmark.py gpt2-medium                   # GPT-2 Medium
-python benchmark.py meta-llama/Llama-2-7b-hf      # LLaMA-2
-python benchmark.py --tokens 100 --G 32 --R 128   # custom params
+python examples/benchmark.py                              # GPT-2 (default)
+python examples/benchmark.py gpt2-medium                   # GPT-2 Medium
+python examples/benchmark.py meta-llama/Llama-2-7b-hf      # LLaMA-2
+python examples/benchmark.py --tokens 100 --G 32 --R 128   # custom params
 ```
 
 ### Direct Kernel API
 
+The compiled SYCL extension is installed as the `kivi_sycl._C` submodule (not the top-level package, which is pure Python):
+
 ```python
-import kivi_sycl
+from kivi_sycl import _C as kivi_sycl_native
 
 # Keys: per-channel quantization
-kivi_sycl.quantize_keys(input, packed, scales, zeros, group_size)
-kivi_sycl.dequantize_keys(packed, scales, zeros, output, group_size)
+kivi_sycl_native.quantize_keys(input, packed, scales, zeros, group_size)
+kivi_sycl_native.dequantize_keys(packed, scales, zeros, output, group_size)
 
 # Values: per-token quantization
-kivi_sycl.quantize_values(input, packed, scales, zeros, head_dim, group_size)
-kivi_sycl.dequantize_values(packed, scales, zeros, output, head_dim, group_size)
+kivi_sycl_native.quantize_values(input, packed, scales, zeros, head_dim, group_size)
+kivi_sycl_native.dequantize_values(packed, scales, zeros, output, head_dim, group_size)
 ```
 
 ### Parameters
@@ -304,28 +306,50 @@ kivi_sycl.dequantize_values(packed, scales, zeros, output, head_dim, group_size)
 
 For GPT-2 (short sequences), `R=64` is sufficient. For 7B+ models with long contexts, `R=128` is recommended per the paper.
 
+## Project Layout
+
+The project uses a modular `src/`-layout: a pure-Python package (`src/kivi_sycl/`) and its native SYCL sources (`src/csrc/`) are kept fully separate, each broken down by single responsibility. See [`docs/architecture.md`](docs/architecture.md) for the full design rationale.
+
+```
+src/
+├── kivi_sycl/            # Python package (src-layout)
+│   ├── __init__.py       # public API: KiviCache, generate
+│   ├── backend/ipex.py   # IPEX/XPU detection
+│   ├── config/           # HuggingFace model config auto-detection
+│   ├── cache/manager.py  # KiviCache — the KV cache state manager
+│   ├── generation/       # generate() loop + sampling strategies
+│   └── extension/        # single import seam for the compiled kivi_sycl._C
+└── csrc/                 # native C++/SYCL sources (not a Python package)
+    ├── include/kivi/     # shared headers
+    ├── kernels/           # SYCL quantize/dequantize kernels
+    ├── ops/               # Torch tensor validation + kernel dispatch
+    └── bindings/          # pybind11 module (kivi_sycl._C)
+```
+
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `kivi_cache.py` | **Plug-and-play module**: `KiviCache` class + `generate()` one-liner |
-| `src/kivi_optimized.cpp` | SYCL kernels for 2-bit quantize/dequantize |
-| `benchmark.py` | Benchmark script with FP32 comparison (uses `kivi_cache`) |
-| `build_wheel.sh` | Build pre-built wheel for distribution |
+| `src/kivi_sycl/` | **Plug-and-play package**: `KiviCache` class + `generate()` one-liner (src-layout) |
+| `src/csrc/` | SYCL kernels, ops, and pybind11 bindings for 2-bit quantize/dequantize |
+| `examples/benchmark.py` | Benchmark script with FP32 comparison (uses `kivi_sycl`) |
+| `examples/app.py` | Minimal one-liner demo |
+| `scripts/build_wheel.sh` | Build pre-built wheel for distribution |
 | `setup.py` | Package config with auto-detected SYCL paths |
 | `pyproject.toml` | Modern Python packaging metadata |
-| `test/test_kivi.py` | Comprehensive validation suite (15 checks) |
-| `test/test_quantize_simple.py` | Deterministic known-value verification |
-| `test/test_attention_fix.py` | End-to-end attention pipeline vs FP32 reference |
+| `docs/architecture.md` | Project layout / module design notes |
+| `tests/integration/test_kivi.py` | Comprehensive validation suite (15 checks) |
+| `tests/integration/test_quantize_simple.py` | Deterministic known-value verification |
+| `tests/integration/test_attention_fix.py` | End-to-end attention pipeline vs FP32 reference |
 
 ## Testing
 
 Run the full test suite:
 
 ```bash
-python test/test_kivi.py
-python test/test_quantize_simple.py
-python test/test_attention_fix.py
+python tests/integration/test_kivi.py
+python tests/integration/test_quantize_simple.py
+python tests/integration/test_attention_fix.py
 ```
 
 ### test_kivi.py — 15 checks
