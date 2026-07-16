@@ -1,4 +1,4 @@
-from kivi_cache import generate
+from kivi_sycl import generate
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Try different models — just change the name, same API

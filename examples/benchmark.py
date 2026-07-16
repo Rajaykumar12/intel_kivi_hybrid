@@ -1,12 +1,12 @@
 """
-KIVI Benchmark — demonstrates plug-and-play usage of kivi_cache
+KIVI Benchmark — demonstrates plug-and-play usage of kivi_sycl
 ================================================================
-Run: python benchmark.py [model_name] [--tokens N] [--R N] [--G N]
+Run: python examples/benchmark.py [model_name] [--tokens N] [--R N] [--G N]
 
 Examples:
-    python benchmark.py                          # GPT-2 (default)
-    python benchmark.py gpt2-medium              # GPT-2 Medium
-    python benchmark.py meta-llama/Llama-2-7b-hf --tokens 100
+    python examples/benchmark.py                          # GPT-2 (default)
+    python examples/benchmark.py gpt2-medium              # GPT-2 Medium
+    python examples/benchmark.py meta-llama/Llama-2-7b-hf --tokens 100
 """
 
 import torch
@@ -16,7 +16,7 @@ import time
 import sys
 import argparse
 
-from kivi_cache import KiviCache, generate
+from kivi_sycl import KiviCache, generate
 
 
 def benchmark(model_id, num_gen_tokens, G, R, prompt):
