@@ -1,111 +1,14 @@
-"""
-kivi_cache — Plug-and-play KIVI 2-bit KV Cache for HuggingFace Models
-======================================================================
-Drop-in replacement for the standard KV cache in any HuggingFace
-CausalLM. Works with GPT-2, LLaMA, Mistral, Phi, Qwen, Falcon, etc.
+"""KiviCache: the KIVI 2-bit asymmetric KV cache state manager."""
 
-Usage:
-    from kivi_cache import KiviCache, generate
-
-    model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-
-    # Option 1: One-liner generation
-    text = generate(model, tokenizer, "Once upon a time", max_new_tokens=200)
-
-    # Option 2: Manual control
-    cache = KiviCache.from_model(model)
-    # ... use cache.add_tokens() / cache.get_full_cache() in your own loop
-
-Paper: "KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache"
-       (arXiv:2402.02750)
-"""
+from typing import List, Optional, Tuple
 
 import torch
 
-# IPEX is needed to register the XPU backend with PyTorch.
-# It's a soft dependency — not on standard PyPI, so we check at runtime
-# and give users a clear install command instead of a cryptic ImportError.
-try:
-    import intel_extension_for_pytorch as ipex  # noqa: F401
-except ImportError:
-    _ipex_available = False
-else:
-    _ipex_available = True
+from ..backend.ipex import ensure_ipex
+from ..config.model_config import detect_model_config
+from ..extension.loader import kivi_native
 
-import kivi_sycl
-from typing import Optional, Tuple, List, Union
-
-__all__ = ["KiviCache", "generate"]
-
-
-def _ensure_ipex():
-    """Raise a helpful error if IPEX is not installed."""
-    if not _ipex_available:
-        raise RuntimeError(
-            "Intel Extension for PyTorch (IPEX) is required but not installed.\n"
-            "IPEX is not on standard PyPI — install it with:\n\n"
-            "  pip install intel-extension-for-pytorch "
-            "--extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/\n\n"
-            "Or via conda:\n\n"
-            "  conda install intel-extension-for-pytorch -c intel\n"
-        )
-
-
-def _detect_model_config(model) -> dict:
-    """
-    Auto-detect num_layers, num_heads, and head_dim from any HuggingFace model.
-    Supports GPT-2, GPT-J, GPT-NeoX, LLaMA, Mistral, Phi, Qwen, Falcon,
-    Gemma, StableLM, MPT, BLOOM, OPT, and more.
-    """
-    config = model.config
-
-    # --- num_layers ---
-    for attr in ("n_layer", "num_hidden_layers", "num_layers", "n_layers"):
-        if hasattr(config, attr):
-            num_layers = getattr(config, attr)
-            break
-    else:
-        raise ValueError(
-            f"Cannot detect num_layers from {type(config).__name__}. "
-            f"Pass num_layers= explicitly.")
-
-    # --- num_heads (for KV — may differ from query heads in GQA models) ---
-    num_kv_heads = None
-    for attr in ("num_key_value_heads", "num_kv_heads"):
-        if hasattr(config, attr):
-            num_kv_heads = getattr(config, attr)
-            break
-    if num_kv_heads is None:
-        for attr in ("n_head", "num_attention_heads", "num_heads"):
-            if hasattr(config, attr):
-                num_kv_heads = getattr(config, attr)
-                break
-    if num_kv_heads is None:
-        raise ValueError(
-            f"Cannot detect num_heads from {type(config).__name__}. "
-            f"Pass num_kv_heads= explicitly.")
-
-    # --- head_dim ---
-    if hasattr(config, "head_dim"):
-        head_dim = config.head_dim
-    else:
-        hidden_size = getattr(config, "hidden_size",
-                              getattr(config, "n_embd", None))
-        num_q_heads = getattr(config, "num_attention_heads",
-                              getattr(config, "n_head", None))
-        if hidden_size and num_q_heads:
-            head_dim = hidden_size // num_q_heads
-        else:
-            raise ValueError(
-                f"Cannot detect head_dim from {type(config).__name__}. "
-                f"Pass head_dim= explicitly.")
-
-    return {
-        "num_layers": num_layers,
-        "num_kv_heads": num_kv_heads,
-        "head_dim": head_dim,
-    }
+__all__ = ["KiviCache"]
 
 
 class KiviCache:
@@ -138,11 +41,16 @@ class KiviCache:
         group_size: int = 32,
         residual_length: int = 128,
     ):
-        _ensure_ipex()
+        ensure_ipex()
         assert head_dim % group_size == 0, \
             f"head_dim ({head_dim}) must be divisible by group_size ({group_size})"
         assert group_size >= 4 and group_size % 4 == 0, \
             f"group_size ({group_size}) must be >= 4 and divisible by 4"
+        assert group_size <= residual_length, (
+            f"group_size ({group_size}) must not exceed residual_length "
+            f"({residual_length}) — flushing requires a full group of tokens "
+            f"to be available in the residual buffer, or tokens are silently dropped."
+        )
 
         self.device = device
         self.G = group_size
@@ -152,9 +60,16 @@ class KiviCache:
         self.num_kv_heads = num_kv_heads
         self.batch_size: Optional[int] = None
 
-        # Quantized storage on XPU: list of (packed, scales, zeros) per layer
-        self.quant_keys: List[list] = [[] for _ in range(num_layers)]
-        self.quant_values: List[list] = [[] for _ in range(num_layers)]
+        # NOTE: the 2-bit packed (packed, scales, zeros) tensors produced by
+        # each flush are dequantized to `_deq_history_cpu` immediately and
+        # then discarded — get_full_cache() serves exclusively from the CPU
+        # FP32 history + residual, never from XPU-resident quantized storage.
+        # We therefore keep only byte/token counters here (for get_stats())
+        # instead of retaining the XPU tensors themselves, which would sit
+        # unused for the lifetime of the cache while duplicating the FP32
+        # history already cached on CPU.
+        self._quant_token_count: List[int] = [0] * num_layers
+        self._quant_bytes: List[int] = [0] * num_layers
 
         # FP32 residual buffers on CPU
         self.res_keys: List[Optional[torch.Tensor]] = [None] * num_layers
@@ -182,7 +97,7 @@ class KiviCache:
 
         >>> cache = KiviCache.from_model(model)
         """
-        cfg = _detect_model_config(model)
+        cfg = detect_model_config(model)
         return cls(
             num_layers=cfg["num_layers"],
             head_dim=cfg["head_dim"],
@@ -211,12 +126,24 @@ class KiviCache:
             if self.batch_size is None:
                 self.batch_size = k.shape[0]
                 self.num_kv_heads = k.shape[1]
+            else:
+                assert k.shape[0] == self.batch_size, (
+                    f"KiviCache batch size changed mid-session "
+                    f"({self.batch_size} -> {k.shape[0]}) at layer {i}. "
+                    f"Call reset() before starting a new request/batch."
+                )
 
             # Extract only NEW tokens (model returns full cache)
             if self.res_keys[i] is not None:
                 existing_len = self.res_keys[i].shape[2]
-                quant_len = sum(p.shape[3] * 4 for p, _, _ in self.quant_keys[i])
+                quant_len = self._quant_token_count[i]
                 new_start = quant_len + existing_len
+                assert k.shape[2] >= new_start, (
+                    f"KiviCache desync at layer {i}: expected past length "
+                    f"{new_start} but got {k.shape[2]}. add_tokens() must be "
+                    f"called exactly once per forward pass, seeded by "
+                    f"get_full_cache()."
+                )
                 new_k = k[:, :, new_start:, :].float()
                 new_v = v[:, :, new_start:, :].float()
             else:
@@ -270,8 +197,8 @@ class KiviCache:
     def reset(self):
         """Clear all cached data. Reuse the same KiviCache for a new sequence."""
         for i in range(self.num_layers):
-            self.quant_keys[i].clear()
-            self.quant_values[i].clear()
+            self._quant_token_count[i] = 0
+            self._quant_bytes[i] = 0
             self.res_keys[i] = None
             self.res_values[i] = None
             self._deq_history_cpu[i] = None
@@ -287,6 +214,15 @@ class KiviCache:
         i = layer_idx
         G = self.G
 
+        # Defense in depth: __init__ already asserts group_size <=
+        # residual_length, but re-check here too so a future desync between
+        # R and G fails loudly instead of silently under-slicing the residual
+        # (PyTorch slicing past the end of a dim clips instead of raising).
+        assert self.res_keys[i].shape[2] >= G, (
+            f"Cannot flush {G} tokens: residual only has "
+            f"{self.res_keys[i].shape[2]} at layer {i}."
+        )
+
         # --- Keys: per-channel quantization ---
         k_chunk = self.res_keys[i][:, :, :G, :]
         # Transpose to [B, H, D, G] for per-channel quant
@@ -300,8 +236,7 @@ class KiviCache:
         zeros_k = torch.empty(
             (batch, heads, dim), dtype=torch.float32, device=self.device)
 
-        kivi_sycl.quantize_keys(k_trans, packed_k, scales_k, zeros_k, G)
-        self.quant_keys[i].append((packed_k, scales_k, zeros_k))
+        kivi_native.quantize_keys(k_trans, packed_k, scales_k, zeros_k, G)
 
         # --- Values: per-token quantization ---
         v_chunk = self.res_values[i][:, :, :G, :].contiguous().to(self.device)
@@ -317,9 +252,19 @@ class KiviCache:
             (batch, heads, G, groups_per_token),
             dtype=torch.float32, device=self.device)
 
-        kivi_sycl.quantize_values(v_chunk, packed_v, scales_v, zeros_v,
-                                  self.head_dim, G)
-        self.quant_values[i].append((packed_v, scales_v, zeros_v))
+        kivi_native.quantize_values(v_chunk, packed_v, scales_v, zeros_v,
+                                     self.head_dim, G)
+
+        # Track quantized-token accounting without retaining the packed XPU
+        # tensors themselves: get_full_cache() serves exclusively from
+        # _deq_history_cpu (populated below), so packed_k/packed_v are never
+        # read again after dequantization — keeping them alive here would
+        # duplicate the FP32 CPU history in XPU memory for no benefit.
+        self._quant_token_count[i] += G
+        self._quant_bytes[i] += (
+            packed_k.numel() + scales_k.numel() * 4 + zeros_k.numel() * 4
+            + packed_v.numel() + scales_v.numel() * 4 + zeros_v.numel() * 4
+        )
 
         # Remove flushed tokens from residual
         self.res_keys[i] = self.res_keys[i][:, :, G:, :].contiguous()
@@ -328,14 +273,13 @@ class KiviCache:
         # Dequantize and cache on CPU (one XPU→CPU transfer per flush)
         deq_k = torch.empty(
             (batch, heads, dim, seq), dtype=torch.float32, device=self.device)
-        kivi_sycl.dequantize_keys(packed_k, scales_k, zeros_k, deq_k, G)
+        kivi_native.dequantize_keys(packed_k, scales_k, zeros_k, deq_k, G)
         new_k = deq_k.transpose(2, 3).to("cpu")
 
         deq_v = torch.empty(
-            (batch, heads, G, self.head_dim),
-            dtype=torch.float32, device=self.device)
-        kivi_sycl.dequantize_values(packed_v, scales_v, zeros_v, deq_v,
-                                    self.head_dim, G)
+            (batch, heads, G, self.head_dim), dtype=torch.float32, device=self.device)
+        kivi_native.dequantize_values(packed_v, scales_v, zeros_v, deq_v,
+                                       self.head_dim, G)
         new_v = deq_v.to("cpu")
 
         # Append to CPU history
@@ -358,22 +302,26 @@ class KiviCache:
         return sum(self._flush_count)
 
     def get_stats(self, layer: int = 0) -> dict:
-        """Get memory/token statistics for a given layer."""
+        """
+        Get memory/token statistics for a given layer.
+
+        NOTE: `kivi_bytes` reports the logical 2-bit-quantized footprint
+        (what a byte-for-byte 2-bit store would cost) plus the FP32 residual
+        window. It does NOT include `_deq_history_cpu`, which holds a full
+        FP32 CPU copy of the entire dequantized history for serving — actual
+        process memory for long sequences is therefore higher than this
+        figure suggests. See the "Logical & Accuracy" section of
+        CODE_REVIEW.md for the full explanation of this tradeoff.
+        """
         B = self.batch_size or 1
         H = self.num_kv_heads or 1
         i = layer
 
-        quant_tokens = sum(p.shape[3] * 4 for p, _, _ in self.quant_keys[i])
+        quant_tokens = self._quant_token_count[i]
         res_tokens = self.res_keys[i].shape[2] if self.res_keys[i] is not None else 0
         total = quant_tokens + res_tokens
 
-        quant_bytes = sum(
-            p.numel() + s.numel() * 4 + z.numel() * 4
-            for p, s, z in self.quant_keys[i]
-        ) + sum(
-            p.numel() + s.numel() * 4 + z.numel() * 4
-            for p, s, z in self.quant_values[i]
-        )
+        quant_bytes = self._quant_bytes[i]
         res_bytes = 0
         if self.res_keys[i] is not None:
             res_bytes = (self.res_keys[i].numel() + self.res_values[i].numel()) * 4
@@ -393,101 +341,3 @@ class KiviCache:
     def __repr__(self):
         return (f"KiviCache(layers={self.num_layers}, head_dim={self.head_dim}, "
                 f"G={self.G}, R={self.R}, device='{self.device}')")
-
-
-# ====================================================================== #
-#  High-level generate() — one-liner plug-and-play                        #
-# ====================================================================== #
-
-@torch.no_grad()
-def generate(
-    model,
-    tokenizer,
-    prompt: str,
-    max_new_tokens: int = 200,
-    group_size: int = 32,
-    residual_length: int = 128,
-    device: str = "xpu",
-    temperature: float = 1.0,
-    top_k: Optional[int] = None,
-    do_sample: bool = False,
-    verbose: bool = False,
-) -> str:
-    """
-    Generate text with KIVI 2-bit KV cache quantization.
-
-    Works with any HuggingFace CausalLM model. The model stays on CPU;
-    quantization kernels run on Intel XPU via SYCL.
-
-    Args:
-        model:            HuggingFace CausalLM (on CPU).
-        tokenizer:        Matching tokenizer.
-        prompt:           Input text.
-        max_new_tokens:   Number of tokens to generate.
-        group_size:       Quantization group size G (default 32).
-        residual_length:  FP32 residual window R (default 128).
-        device:           XPU device for quantization (default "xpu").
-        temperature:      Sampling temperature (1.0 = greedy with do_sample=False).
-        top_k:            Top-k filtering (None = disabled).
-        do_sample:        Whether to sample (False = greedy argmax).
-        verbose:          Print progress dots.
-
-    Returns:
-        Generated text (prompt + completion).
-
-    Example:
-        >>> from kivi_cache import generate
-        >>> text = generate(model, tokenizer, "Hello world", max_new_tokens=100)
-    """
-    cache = KiviCache.from_model(
-        model, device=device, group_size=group_size,
-        residual_length=residual_length,
-    )
-
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-
-    # Prefill
-    out = model(input_ids, use_cache=True)
-    cache.add_tokens(out.past_key_values)
-    next_id = _sample(out.logits[:, -1, :], temperature, top_k, do_sample)
-    all_ids = [next_id]
-
-    # Decode
-    for step in range(max_new_tokens):
-        past = cache.get_full_cache()
-        out = model(next_id, past_key_values=past, use_cache=True)
-        cache.add_tokens(out.past_key_values)
-        next_id = _sample(out.logits[:, -1, :], temperature, top_k, do_sample)
-        all_ids.append(next_id)
-
-        if verbose and (step + 1) % 10 == 0:
-            print(".", end="", flush=True)
-
-        # Stop on EOS
-        if tokenizer.eos_token_id is not None and next_id.item() == tokenizer.eos_token_id:
-            break
-
-    if verbose:
-        print()
-
-    generated_ids = torch.cat(all_ids, dim=1)
-    full_ids = torch.cat([input_ids, generated_ids], dim=1)
-    return tokenizer.decode(full_ids[0], skip_special_tokens=True)
-
-
-def _sample(
-    logits: torch.Tensor,
-    temperature: float,
-    top_k: Optional[int],
-    do_sample: bool,
-) -> torch.Tensor:
-    """Sample or argmax from logits."""
-    if not do_sample:
-        return logits.argmax(dim=-1).unsqueeze(1)
-
-    logits = logits / max(temperature, 1e-8)
-    if top_k is not None:
-        topk_vals, _ = logits.topk(top_k, dim=-1)
-        logits[logits < topk_vals[:, -1:]] = float("-inf")
-    probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
