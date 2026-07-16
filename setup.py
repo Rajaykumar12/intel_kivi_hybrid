@@ -58,6 +58,8 @@ link_flags = compile_flags + ld_flags
 with open("README.md", encoding="utf-8") as f:
     long_description = f.read()
 
+CSRC = os.path.join("src", "csrc")
+
 setup(
     name="kivi-sycl",
     version="0.1.0",
@@ -72,11 +74,18 @@ setup(
         "torch",
         "transformers",
     ],
-    py_modules=["kivi_cache"],
+    package_dir={"": "src"},
+    packages=find_packages(where="src"),
     ext_modules=[
         CppExtension(
-            name="kivi_sycl",
-            sources=["src/kivi_optimized.cpp"],
+            name="kivi_sycl._C",
+            sources=[
+                os.path.join(CSRC, "bindings", "pybind_module.cpp"),
+                os.path.join(CSRC, "kernels", "quantize_kernels.cpp"),
+                os.path.join(CSRC, "kernels", "dequantize_kernels.cpp"),
+                os.path.join(CSRC, "ops", "kv_cache_ops.cpp"),
+            ],
+            include_dirs=[CSRC, os.path.join(CSRC, "include")],
             extra_compile_args=compile_flags,
             extra_link_args=link_flags,
         )

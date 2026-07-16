@@ -35,3 +35,13 @@ Homepage = "https://github.com/Rajaykumar12/intel_kivi_hybrid"
 Repository = "https://github.com/Rajaykumar12/intel_kivi_hybrid"
 Issues = "https://github.com/Rajaykumar12/intel_kivi_hybrid/issues"
 Paper = "https://arxiv.org/abs/2402.02750"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["kivi_sycl*"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
