@@ -295,6 +295,16 @@ kivi_sycl_native.dequantize_keys(packed, scales, zeros, output, group_size)
 # Values: per-token quantization
 kivi_sycl_native.quantize_values(input, packed, scales, zeros, head_dim, group_size)
 kivi_sycl_native.dequantize_values(packed, scales, zeros, output, head_dim, group_size)
+
+# Fused round-trip: quantize to 2-bit fidelity and dequantize back in one
+# kernel launch, without ever materializing packed/scales/zeros. Use this
+# instead of a quantize_*+dequantize_* pair when the packed representation
+# itself is discarded by the caller (this is what KiviCache's flush does).
+kivi_sycl_native.quant_dequant_roundtrip_keys(input, output, group_size)
+kivi_sycl_native.quant_dequant_roundtrip_values(input, output, head_dim, group_size)
+
+# Non-blocking variants of every op above (suffix _async) return a
+# KiviEvent instead of blocking; call .wait() on it before reading output.
 ```
 
 ### Parameters
