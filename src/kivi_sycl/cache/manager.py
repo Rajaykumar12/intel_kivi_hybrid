@@ -304,63 +304,46 @@ class KiviCache:
             f"{self.res_keys[i].shape[2]} at layer {i}."
         )
 
+        # get_full_cache() serves exclusively from _deq_history_cpu (populated
+        # below) — the packed/scale/zero-point representation is never read
+        # again after this call. quant_dequant_roundtrip_* rounds every value
+        # to 2-bit fidelity and writes the reconstructed float straight back
+        # out in a single fused kernel launch, without ever allocating or
+        # writing the packed byte / scale / zero-point buffers at all — see
+        # docs/sycl_kernel_interface.md.
+
         # --- Keys: per-channel quantization ---
         k_chunk = self.res_keys[i][:, :, :G, :]
         # Transpose to [B, H, D, G] for per-channel quant
         k_trans = k_chunk.transpose(2, 3).contiguous().to(self.device)
         batch, heads, dim, seq = k_trans.shape
 
-        packed_k = torch.empty(
-            (batch, heads, dim, seq // 4), dtype=torch.uint8, device=self.device)
-        scales_k = torch.empty(
-            (batch, heads, dim), dtype=torch.float32, device=self.device)
-        zeros_k = torch.empty(
-            (batch, heads, dim), dtype=torch.float32, device=self.device)
-
-        kivi_native.quantize_keys(k_trans, packed_k, scales_k, zeros_k, G)
+        deq_k = torch.empty_like(k_trans)
+        kivi_native.quant_dequant_roundtrip_keys(k_trans, deq_k, G)
 
         # --- Values: per-token quantization ---
         v_chunk = self.res_values[i][:, :, :G, :].contiguous().to(self.device)
         groups_per_token = self.head_dim // G
 
-        packed_v = torch.empty(
-            (batch, heads, G, self.head_dim // 4),
-            dtype=torch.uint8, device=self.device)
-        scales_v = torch.empty(
-            (batch, heads, G, groups_per_token),
-            dtype=torch.float32, device=self.device)
-        zeros_v = torch.empty(
-            (batch, heads, G, groups_per_token),
-            dtype=torch.float32, device=self.device)
+        deq_v = torch.empty_like(v_chunk)
+        kivi_native.quant_dequant_roundtrip_values(v_chunk, deq_v, self.head_dim, G)
 
-        kivi_native.quantize_values(v_chunk, packed_v, scales_v, zeros_v,
-                                     self.head_dim, G)
-
-        # Track quantized-token accounting without retaining the packed XPU
-        # tensors themselves: get_full_cache() serves exclusively from
-        # _deq_history_cpu (populated below), so packed_k/packed_v are never
-        # read again after dequantization — keeping them alive here would
-        # duplicate the FP32 CPU history in XPU memory for no benefit.
+        # Track quantized-token accounting analytically (bytes a real 2-bit
+        # store would cost) since no packed/scales/zeros tensors exist to
+        # read .numel() from in the fused round-trip path.
         self._quant_token_count[i] += G
         self._quant_bytes[i] += (
-            packed_k.numel() + scales_k.numel() * 4 + zeros_k.numel() * 4
-            + packed_v.numel() + scales_v.numel() * 4 + zeros_v.numel() * 4
+            batch * heads * dim * (seq // 4)       # packed_k
+            + batch * heads * dim * 4 * 2           # scales_k + zeros_k
+            + batch * heads * G * (self.head_dim // 4)     # packed_v
+            + batch * heads * G * groups_per_token * 4 * 2  # scales_v + zeros_v
         )
 
         # Remove flushed tokens from residual
         self.res_keys[i] = self.res_keys[i][:, :, G:, :].contiguous()
         self.res_values[i] = self.res_values[i][:, :, G:, :].contiguous()
 
-        # Dequantize and cache on CPU (one XPU→CPU transfer per flush)
-        deq_k = torch.empty(
-            (batch, heads, dim, seq), dtype=torch.float32, device=self.device)
-        kivi_native.dequantize_keys(packed_k, scales_k, zeros_k, deq_k, G)
         new_k = deq_k.transpose(2, 3).to("cpu")
-
-        deq_v = torch.empty(
-            (batch, heads, G, self.head_dim), dtype=torch.float32, device=self.device)
-        kivi_native.dequantize_values(packed_v, scales_v, zeros_v, deq_v,
-                                       self.head_dim, G)
         new_v = deq_v.to("cpu")
 
         # Append to CPU history
