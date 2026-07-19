@@ -2,12 +2,34 @@
 // KIVI: Asymmetric 2-bit dequantization SYCL kernels
 // ==========================================================================
 // Dequantize: x ~= q * scale + zero
+//
+// One work-item per packed byte (4 output values). No reduction is needed
+// here (scale/zero are already computed), so the only optimization that
+// applies is vectorizing the unpack+store as a single float4 write instead
+// of four scalar stores.
 // ==========================================================================
 
 #include "dequantize_kernels.hpp"
 #include "kivi/common.hpp"
 
-void dequantize_keys_per_channel(
+namespace {
+
+inline void unpack_and_store(
+    uint8_t packed, float scale, float zero,
+    float* __restrict__ output, int out_base)
+{
+    sycl::vec<float, 4> vals;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        uint8_t qi = (packed >> (j * 2)) & 0x3;
+        vals[j] = static_cast<float>(qi) * scale + zero;
+    }
+    vals.store(0, sycl::global_ptr<float>(output + out_base));
+}
+
+}  // namespace
+
+sycl::event dequantize_keys_per_channel_submit(
     const uint8_t* __restrict__ input,
     const float*   __restrict__ scales,
     const float*   __restrict__ zeros,
@@ -21,7 +43,7 @@ void dequantize_keys_per_channel(
     const int local_size  = 256;
     const int global_size = ((total_bytes + local_size - 1) / local_size) * local_size;
 
-    q.submit([&](sycl::handler& h) {
+    return q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>(global_size, local_size),
             [=](sycl::nd_item<1> item) {
@@ -36,15 +58,25 @@ void dequantize_keys_per_channel(
                 uint8_t packed = input[idx];
 
                 int out_base = ch * group_size + byte_in_ch * 4;
-                for (int j = 0; j < 4; ++j) {
-                    uint8_t qi = (packed >> (j * 2)) & 0x3;
-                    output[out_base + j] = static_cast<float>(qi) * scale + zero;
-                }
+                unpack_and_store(packed, scale, zero, output, out_base);
             });
-    }).wait_and_throw();
+    });
 }
 
-void dequantize_values_per_token(
+void dequantize_keys_per_channel(
+    const uint8_t* __restrict__ input,
+    const float*   __restrict__ scales,
+    const float*   __restrict__ zeros,
+    float*         __restrict__ output,
+    int num_channels,
+    int group_size)
+{
+    dequantize_keys_per_channel_submit(input, scales, zeros, output,
+                                        num_channels, group_size)
+        .wait_and_throw();
+}
+
+sycl::event dequantize_values_per_token_submit(
     const uint8_t* __restrict__ input,
     const float*   __restrict__ scales,
     const float*   __restrict__ zeros,
@@ -58,7 +90,7 @@ void dequantize_values_per_token(
     const int local_size  = 256;
     const int global_size = ((total_bytes + local_size - 1) / local_size) * local_size;
 
-    q.submit([&](sycl::handler& h) {
+    return q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>(global_size, local_size),
             [=](sycl::nd_item<1> item) {
@@ -72,12 +104,21 @@ void dequantize_values_per_token(
                 float zero     = zeros[group_idx];
                 uint8_t packed = input[byte_idx];
 
-                // Output: group_idx * group_size + byte_in_grp * 4
                 int out_base = group_idx * group_size + byte_in_grp * 4;
-                for (int j = 0; j < 4; ++j) {
-                    uint8_t qi = (packed >> (j * 2)) & 0x3;
-                    output[out_base + j] = static_cast<float>(qi) * scale + zero;
-                }
+                unpack_and_store(packed, scale, zero, output, out_base);
             });
-    }).wait_and_throw();
+    });
+}
+
+void dequantize_values_per_token(
+    const uint8_t* __restrict__ input,
+    const float*   __restrict__ scales,
+    const float*   __restrict__ zeros,
+    float*         __restrict__ output,
+    int num_groups,
+    int group_size)
+{
+    dequantize_values_per_token_submit(input, scales, zeros, output,
+                                        num_groups, group_size)
+        .wait_and_throw();
 }

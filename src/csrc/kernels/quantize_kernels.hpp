@@ -1,6 +1,34 @@
 #pragma once
 
 #include <cstdint>
+#include <sycl/sycl.hpp>
+
+// --------------------------------------------------------------------------
+// Non-blocking variants: submit the kernel and return immediately with a
+// sycl::event, instead of blocking on wait_and_throw() internally. Callers
+// that need the result must call `.wait_and_throw()` on the returned event
+// (or otherwise synchronize) before reading the output tensors. Used by the
+// async flush path (KiviCache) to overlap XPU kernel execution with CPU-side
+// decode work instead of stalling on every flush. The blocking
+// quantize_*_per_channel/per_token functions below are unchanged and simply
+// call the *_submit variant followed by an immediate wait.
+// --------------------------------------------------------------------------
+sycl::event quantize_keys_per_channel_submit(
+    const float* input,
+    uint8_t*     output,
+    float*       scales,
+    float*       zeros,
+    int num_channels,
+    int group_size);
+
+sycl::event quantize_values_per_token_submit(
+    const float* input,
+    uint8_t*     output,
+    float*       scales,
+    float*       zeros,
+    int num_tokens,
+    int head_dim,
+    int group_size);
 
 // --------------------------------------------------------------------------
 // 1. KEY QUANTIZATION — Per-Channel Asymmetric 2-bit

@@ -7,10 +7,51 @@
 //
 // Packing: 4 x 2-bit values per uint8
 //   byte = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6)
+//
+// One work-item per channel/group (see internal/quant_tile.hpp for why
+// sub-group-cooperative parallelization was tried and reverted — it
+// regressed on KIVI's actual small group_size workload). Each thread
+// vectorizes its own min/max reduction and packing pass as float4
+// loads/stores instead of scalar ones.
 // ==========================================================================
 
 #include "quantize_kernels.hpp"
 #include "kivi/common.hpp"
+#include "internal/quant_tile.hpp"
+
+using namespace kivi::detail;
+
+sycl::event quantize_keys_per_channel_submit(
+    const float* __restrict__ input,
+    uint8_t*     __restrict__ output,
+    float*       __restrict__ scales,
+    float*       __restrict__ zeros,
+    int num_channels,
+    int group_size)
+{
+    sycl::queue& q = kivi::get_queue();
+    const int global_size = ((num_channels + kLocalSize - 1) / kLocalSize) * kLocalSize;
+
+    return q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(global_size, kLocalSize),
+            [=](sycl::nd_item<1> item) {
+                int ch = item.get_global_id(0);
+                if (ch >= num_channels) return;
+
+                int base = ch * group_size;
+                float min_val, max_val;
+                reduce_min_max_vec(input, base, group_size, min_val, max_val);
+
+                float scale = (max_val - min_val) / 3.0f + 1e-10f;
+                scales[ch] = scale;
+                zeros[ch]  = min_val;
+
+                int out_base = ch * (group_size / 4);
+                pack_vec(input, base, group_size, min_val, scale, output, out_base);
+            });
+    });
+}
 
 void quantize_keys_per_channel(
     const float* __restrict__ input,
@@ -20,51 +61,12 @@ void quantize_keys_per_channel(
     int num_channels,
     int group_size)
 {
-    sycl::queue& q = kivi::get_queue();
-    const int local_size  = 256;
-    const int global_size = ((num_channels + local_size - 1) / local_size) * local_size;
-
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<1>(global_size, local_size),
-            [=](sycl::nd_item<1> item) {
-                int ch = item.get_global_id(0);
-                if (ch >= num_channels) return;
-
-                // --- Find min/max across the group ---
-                float max_val = -1e30f;
-                float min_val =  1e30f;
-                int base = ch * group_size;
-
-                for (int i = 0; i < group_size; ++i) {
-                    float val = input[base + i];
-                    max_val = sycl::fmax(max_val, val);
-                    min_val = sycl::fmin(min_val, val);
-                }
-
-                // --- Asymmetric scale & zero ---
-                float scale = (max_val - min_val) / 3.0f + 1e-10f;
-                scales[ch] = scale;
-                zeros[ch]  = min_val;
-
-                // --- Pack 4 x 2-bit values per byte ---
-                int out_base = ch * (group_size / 4);
-                for (int i = 0; i < group_size / 4; ++i) {
-                    uint8_t packed = 0;
-                    for (int j = 0; j < 4; ++j) {
-                        float val = input[base + i * 4 + j];
-                        float qf  = (val - min_val) / scale;
-                        int   qi  = static_cast<int>(sycl::round(qf));
-                        qi = sycl::clamp(qi, 0, 3);
-                        packed |= (static_cast<uint8_t>(qi) << (j * 2));
-                    }
-                    output[out_base + i] = packed;
-                }
-            });
-    }).wait_and_throw();
+    quantize_keys_per_channel_submit(input, output, scales, zeros,
+                                      num_channels, group_size)
+        .wait_and_throw();
 }
 
-void quantize_values_per_token(
+sycl::event quantize_values_per_token_submit(
     const float* __restrict__ input,
     uint8_t*     __restrict__ output,
     float*       __restrict__ scales,
@@ -76,50 +78,43 @@ void quantize_values_per_token(
     sycl::queue& q = kivi::get_queue();
     int groups_per_token = head_dim / group_size;
     int total_groups     = num_tokens * groups_per_token;
-    const int local_size  = 256;
-    const int global_size = ((total_groups + local_size - 1) / local_size) * local_size;
+    const int global_size = ((total_groups + kLocalSize - 1) / kLocalSize) * kLocalSize;
+    int packed_per_token  = head_dim / 4;
 
-    q.submit([&](sycl::handler& h) {
+    return q.submit([&](sycl::handler& h) {
         h.parallel_for(
-            sycl::nd_range<1>(global_size, local_size),
+            sycl::nd_range<1>(global_size, kLocalSize),
             [=](sycl::nd_item<1> item) {
                 int gid = item.get_global_id(0);
                 if (gid >= total_groups) return;
 
                 int token_idx    = gid / groups_per_token;
                 int group_in_tok = gid % groups_per_token;
-                int start_feat   = group_in_tok * group_size;
-                int base_input   = token_idx * head_dim + start_feat;
+                int base = token_idx * head_dim + group_in_tok * group_size;
 
-                // --- Find min/max within the group ---
-                float max_val = -1e30f;
-                float min_val =  1e30f;
-                for (int i = 0; i < group_size; ++i) {
-                    float val = input[base_input + i];
-                    max_val = sycl::fmax(max_val, val);
-                    min_val = sycl::fmin(min_val, val);
-                }
+                float min_val, max_val;
+                reduce_min_max_vec(input, base, group_size, min_val, max_val);
 
                 float scale = (max_val - min_val) / 3.0f + 1e-10f;
                 scales[gid] = scale;
                 zeros[gid]  = min_val;
 
-                // --- Pack ---
-                // Output packed index: each token has head_dim/4 packed bytes
-                int packed_per_token = head_dim / 4;
                 int out_base = token_idx * packed_per_token + group_in_tok * (group_size / 4);
-
-                for (int i = 0; i < group_size / 4; ++i) {
-                    uint8_t packed = 0;
-                    for (int j = 0; j < 4; ++j) {
-                        float val = input[base_input + i * 4 + j];
-                        float qf  = (val - min_val) / scale;
-                        int   qi  = static_cast<int>(sycl::round(qf));
-                        qi = sycl::clamp(qi, 0, 3);
-                        packed |= (static_cast<uint8_t>(qi) << (j * 2));
-                    }
-                    output[out_base + i] = packed;
-                }
+                pack_vec(input, base, group_size, min_val, scale, output, out_base);
             });
-    }).wait_and_throw();
+    });
+}
+
+void quantize_values_per_token(
+    const float* __restrict__ input,
+    uint8_t*     __restrict__ output,
+    float*       __restrict__ scales,
+    float*       __restrict__ zeros,
+    int num_tokens,
+    int head_dim,
+    int group_size)
+{
+    quantize_values_per_token_submit(input, output, scales, zeros,
+                                      num_tokens, head_dim, group_size)
+        .wait_and_throw();
 }
