@@ -3,12 +3,51 @@
 from typing import List, Optional, Tuple
 
 import torch
+from transformers.cache_utils import DynamicCache
 
 from ..backend.ipex import ensure_ipex
 from ..config.model_config import detect_model_config
 from ..extension.loader import kivi_native
 
 __all__ = ["KiviCache"]
+
+
+def _iter_kv_layers(past_key_values):
+    """
+    Yield (key, value) tensors per layer from a model's `past_key_values`,
+    regardless of whether it's the legacy tuple-of-(k,v)-tuples format or a
+    `transformers.Cache`/`DynamicCache` object — the concrete Cache
+    implementation has changed shape across transformers versions (a
+    `key_cache`/`value_cache` pair of lists in some, a `.layers` list of
+    per-layer objects with `.keys`/`.values` in others), so this checks for
+    each known surface in turn instead of assuming tuple-of-tuples.
+    """
+    if hasattr(past_key_values, "layers"):
+        for layer in past_key_values.layers:
+            yield layer.keys, layer.values
+        return
+    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+        for k, v in zip(past_key_values.key_cache, past_key_values.value_cache):
+            yield k, v
+        return
+    for item in past_key_values:
+        yield item[0], item[1]
+
+
+def _build_cache(layers):
+    """
+    Wrap a list of (key, value) tensors per layer into a
+    `transformers.Cache` object. Recent transformers model forward passes
+    (see `modeling_gpt2.py`'s `past_key_values.get_seq_length()`) require
+    `past_key_values` to be a `Cache` instance, not the legacy tuple format
+    — `Cache.update()` is the stable, version-tolerant construction API
+    (unlike `DynamicCache.from_legacy_cache`, which has moved/disappeared
+    across transformers releases).
+    """
+    cache = DynamicCache()
+    for i, (k, v) in enumerate(layers):
+        cache.update(k, v, i)
+    return cache
 
 
 class KiviCache:
@@ -116,13 +155,15 @@ class KiviCache:
         Ingest new KV pairs from a model forward pass.
 
         Args:
-            past_key_values: tuple of (key, value) per layer from the model.
-                Each tensor: [B, H, Seq, D].
+            past_key_values: the model's past_key_values from a forward
+                pass — either the legacy tuple of (key, value) per layer, or
+                a transformers `Cache`/`DynamicCache` object (see
+                `_iter_kv_layers`). Each tensor: [B, H, Seq, D].
 
         Internally appends to the FP32 residual. When the residual reaches
         ``R`` tokens, flushes the oldest ``G`` tokens to 2-bit storage.
         """
-        for i, (k, v) in enumerate(past_key_values):
+        for i, (k, v) in enumerate(_iter_kv_layers(past_key_values)):
             if self.batch_size is None:
                 self.batch_size = k.shape[0]
                 self.num_kv_heads = k.shape[1]
