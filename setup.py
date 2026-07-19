@@ -10,46 +10,22 @@ Requires:
 """
 
 import os
-import glob
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 # --------------------------------------------------------------------------
-# Auto-detect oneAPI SYCL include path (portable across versions)
-# --------------------------------------------------------------------------
-oneapi_root = os.environ.get("ONEAPI_ROOT", "/opt/intel/oneapi")
-sycl_include = os.environ.get("SYCL_INCLUDE_DIR", "")
-
-if not sycl_include:
-    # Search common locations
-    candidates = sorted(
-        glob.glob(os.path.join(oneapi_root, "compiler", "*", "include", "sycl")),
-        reverse=True,  # newest version first
-    )
-    if candidates:
-        sycl_include = candidates[0]
-    else:
-        # Fallback: try the 'latest' symlink
-        fallback = os.path.join(oneapi_root, "compiler", "latest", "include", "sycl")
-        if os.path.isdir(fallback):
-            sycl_include = fallback
-
-if sycl_include:
-    print(f"[KIVI] SYCL include: {sycl_include}")
-else:
-    print("[KIVI] WARNING: Could not find SYCL include dir. "
-          "Set SYCL_INCLUDE_DIR or source setvars.sh.")
-
-# --------------------------------------------------------------------------
 # Build flags
 # --------------------------------------------------------------------------
+# Note: no explicit -I<oneapi>/include/sycl is added here. icpx already
+# injects its own SYCL headers (in the correct order) whenever -fsycl is
+# passed; adding that path again via -I causes stl_wrappers/cmath to be
+# picked up before the compiler's own macro setup, which breaks the build
+# on newer glibc (e.g. Fedora) with errors like "unknown type name
+# '__DPCPP_SYCL_EXTERNAL_LIBC'".
 cxx_flags = os.environ.get("CXXFLAGS", "").split()
 ld_flags = os.environ.get("LDFLAGS", "").split()
 
 compile_flags = ["-fsycl", "-fPIC", "-std=c++17", "-O3", "-w"] + cxx_flags
-if sycl_include:
-    compile_flags.append(f"-I{sycl_include}")
-
 link_flags = compile_flags + ld_flags
 
 # --------------------------------------------------------------------------
@@ -83,6 +59,7 @@ setup(
                 os.path.join(CSRC, "bindings", "pybind_module.cpp"),
                 os.path.join(CSRC, "kernels", "quantize_kernels.cpp"),
                 os.path.join(CSRC, "kernels", "dequantize_kernels.cpp"),
+                os.path.join(CSRC, "kernels", "roundtrip_kernels.cpp"),
                 os.path.join(CSRC, "ops", "kv_cache_ops.cpp"),
             ],
             include_dirs=[CSRC, os.path.join(CSRC, "include")],
