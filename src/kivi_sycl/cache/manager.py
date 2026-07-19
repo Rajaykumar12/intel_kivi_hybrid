@@ -119,6 +119,17 @@ class KiviCache:
             [None] * num_layers
         self._flush_count: List[int] = [0] * num_layers
 
+        # Persistent Cache object returned by get_full_cache(), reused
+        # across steps instead of rebuilt from scratch every time: a flush
+        # changes the composition of history (raw residual tokens replaced
+        # by their quantized-then-dequantized values), which forces a full
+        # rebuild, but on the ~97% of steps that don't flush, the newest
+        # token is just appended to this object in add_tokens() — matching
+        # the O(1)-per-step cost a plain HuggingFace Cache already pays
+        # internally, instead of re-wrapping the entire history every step.
+        self._cache_view: Optional[DynamicCache] = None
+        self._cache_view_valid: bool = False
+
     # ------------------------------------------------------------------ #
     #  Factory                                                             #
     # ------------------------------------------------------------------ #
@@ -202,18 +213,37 @@ class KiviCache:
                 self.res_keys[i] = torch.cat([self.res_keys[i], new_k], dim=2)
                 self.res_values[i] = torch.cat([self.res_values[i], new_v], dim=2)
 
+            # No manual append needed here: get_full_cache() hands callers
+            # `self._cache_view` directly, and the model's own forward pass
+            # mutates that same Cache object in place (its internal
+            # `past_key_values.update(...)` call appends the token it just
+            # computed) — `out.past_key_values` passed into this method IS
+            # `self._cache_view`, already correctly grown by the model
+            # itself. Calling `.update()` again here would append the same
+            # token a second time.
+
             # Flush oldest G tokens when residual >= R
             while self.res_keys[i].shape[2] >= self.R:
                 self._flush_group(i)
+                # Flushing replaces raw residual tokens with their
+                # quantized-then-dequantized values, which the persistent
+                # cache view doesn't reflect — force a full rebuild on the
+                # next get_full_cache() call rather than trying to patch it
+                # in place (Cache objects only expose append semantics).
+                self._cache_view_valid = False
 
-    def get_full_cache(self) -> Tuple:
+    def get_full_cache(self) -> DynamicCache:
         """
         Reconstruct the full KV cache for the next model forward pass.
 
         Returns:
-            tuple of (key, value) tensors per layer, on CPU.
-            Compatible with HuggingFace ``past_key_values``.
+            transformers.Cache (DynamicCache) wrapping (key, value) tensors
+            per layer, on CPU. Compatible with HuggingFace
+            ``past_key_values``.
         """
+        if self._cache_view is not None and self._cache_view_valid:
+            return self._cache_view
+
         full_past = []
         for i in range(self.num_layers):
             parts_k, parts_v = [], []
@@ -229,11 +259,19 @@ class KiviCache:
                 parts_k.append(self.res_keys[i])
                 parts_v.append(self.res_values[i])
 
-            full_k = torch.cat(parts_k, dim=2) if parts_k else torch.empty(0)
-            full_v = torch.cat(parts_v, dim=2) if parts_v else torch.empty(0)
+            # torch.cat still allocates and copies even for a single-element
+            # list; skip it in the (common, since a flush hasn't merged
+            # history+residual into one tensor here) case where there's
+            # nothing to actually concatenate.
+            full_k = parts_k[0] if len(parts_k) == 1 else (
+                torch.cat(parts_k, dim=2) if parts_k else torch.empty(0))
+            full_v = parts_v[0] if len(parts_v) == 1 else (
+                torch.cat(parts_v, dim=2) if parts_v else torch.empty(0))
             full_past.append((full_k, full_v))
 
-        return tuple(full_past)
+        self._cache_view = _build_cache(full_past)
+        self._cache_view_valid = True
+        return self._cache_view
 
     def reset(self):
         """Clear all cached data. Reuse the same KiviCache for a new sequence."""
@@ -245,13 +283,15 @@ class KiviCache:
             self._deq_history_cpu[i] = None
             self._flush_count[i] = 0
         self.batch_size = None
+        self._cache_view = None
+        self._cache_view_valid = False
 
     # ------------------------------------------------------------------ #
     #  Internals                                                           #
     # ------------------------------------------------------------------ #
 
     def _flush_group(self, layer_idx: int):
-        """Quantize the oldest G tokens from the residual to 2-bit on XPU."""
+        """Round the oldest G tokens from the residual to 2-bit fidelity on XPU."""
         i = layer_idx
         G = self.G
 
