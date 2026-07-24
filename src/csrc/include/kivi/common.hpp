@@ -6,11 +6,33 @@
 #include <sycl/sycl.hpp>
 #include <torch/extension.h>
 
+#ifdef KIVI_USE_TORCH_XPU_QUEUE
+#include <c10/xpu/XPUStream.h>
+#endif
+
 namespace kivi {
 
-// Function-local `static` initialization is thread-safe ("magic statics"
-// since C++11) — no manual double-checked locking needed, unlike the raw
-// `static sycl::queue*` pattern this replaces.
+#ifdef KIVI_USE_TORCH_XPU_QUEUE
+// Use the SYCL queue backing PyTorch's current XPU stream instead of a
+// private queue. A private queue has no ordering relationship with the
+// queue torch/IPEX uses for `.to("xpu")` copies, and no guarantee of
+// sharing their SYCL context — on stacks where the default context is not
+// shared, dereferencing torch-allocated USM pointers from a foreign-context
+// queue is undefined behavior (silent data corruption, not an error).
+// Submitting on torch's own in-order stream queue removes both hazards.
+// KIVI_USE_TORCH_XPU_QUEUE is defined by setup.py only when the installed
+// torch ships libc10_xpu (torch >= 2.4 XPU builds); older stacks keep the
+// private-queue fallback below.
+inline sycl::queue& get_queue() {
+    return c10::xpu::getCurrentXPUStream().queue();
+}
+#else
+// Fallback: private process-wide queue. Function-local `static`
+// initialization is thread-safe ("magic statics" since C++11) — no manual
+// double-checked locking needed, unlike the raw `static sycl::queue*`
+// pattern this replaces. Relies on torch/IPEX allocating USM in the DPC++
+// default context (true on current Linux driver stacks) and on `.to()`
+// copies being host-blocking (non_blocking=False, the only mode used here).
 inline sycl::queue& get_queue() {
     static sycl::queue q = [] {
         auto async_handler = [](sycl::exception_list exceptions) {
@@ -37,6 +59,7 @@ inline sycl::queue& get_queue() {
     }();
     return q;
 }
+#endif  // KIVI_USE_TORCH_XPU_QUEUE
 
 inline void check_tensor(const torch::Tensor& t, const char* name,
                           torch::ScalarType expected_dtype,

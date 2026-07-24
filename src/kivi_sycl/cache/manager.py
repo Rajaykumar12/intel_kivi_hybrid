@@ -174,6 +174,19 @@ class KiviCache:
         Internally appends to the FP32 residual. When the residual reaches
         ``R`` tokens, flushes the oldest ``G`` tokens to 2-bit storage.
         """
+        # get_full_cache() hands out `self._cache_view` and keeps it marked
+        # valid on the assumption that the model grew that exact object in
+        # place during the forward pass. That only holds when the model
+        # returns the identical Cache instance it was given. Models that
+        # rebuild their cache (legacy tuple returns, architectures not yet
+        # ported to the Cache API) hand back a different object — serving
+        # the untouched view again would silently drop every generated
+        # token, and the per-layer desync assert below cannot catch it (the
+        # new-token slice just comes out empty). Object identity is the
+        # exact test for "did the model grow our view in place".
+        if past_key_values is not self._cache_view:
+            self._cache_view_valid = False
+
         for i, (k, v) in enumerate(_iter_kv_layers(past_key_values)):
             if self.batch_size is None:
                 self.batch_size = k.shape[0]
@@ -202,8 +215,14 @@ class KiviCache:
                 new_k = k.float()
                 new_v = v.float()
 
-            if new_k.shape[2] == 0:
-                continue
+            assert new_k.shape[2] > 0, (
+                f"KiviCache desync at layer {i}: the forward pass produced "
+                f"no tokens beyond the {new_start} already tracked. "
+                f"add_tokens() was called twice on the same forward output, "
+                f"or the model was fed a past_key_values not obtained from "
+                f"get_full_cache(). Silently skipping here would drop this "
+                f"step's KV and corrupt all subsequent attention."
+            )
 
             # Append to CPU residual
             if self.res_keys[i] is None:
@@ -213,14 +232,13 @@ class KiviCache:
                 self.res_keys[i] = torch.cat([self.res_keys[i], new_k], dim=2)
                 self.res_values[i] = torch.cat([self.res_values[i], new_v], dim=2)
 
-            # No manual append needed here: get_full_cache() hands callers
-            # `self._cache_view` directly, and the model's own forward pass
-            # mutates that same Cache object in place (its internal
-            # `past_key_values.update(...)` call appends the token it just
-            # computed) — `out.past_key_values` passed into this method IS
-            # `self._cache_view`, already correctly grown by the model
-            # itself. Calling `.update()` again here would append the same
-            # token a second time.
+            # No manual append to the cache view here: when the model grew
+            # `self._cache_view` in place (the identity check at the top of
+            # this method), the view already contains this token — calling
+            # `.update()` again would append it a second time. When the
+            # model returned a different object, the view was invalidated
+            # above and the next get_full_cache() rebuilds it from the
+            # residual, which does include this token.
 
             # Flush oldest G tokens when residual >= R
             while self.res_keys[i].shape[2] >= self.R:

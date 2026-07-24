@@ -28,6 +28,19 @@ ld_flags = os.environ.get("LDFLAGS", "").split()
 compile_flags = ["-fsycl", "-fPIC", "-std=c++17", "-O3", "-w"] + cxx_flags
 link_flags = compile_flags + ld_flags
 
+# Submit kernels on the SYCL queue backing PyTorch's current XPU stream
+# (see src/csrc/include/kivi/common.hpp) when the installed torch ships
+# libc10_xpu (torch >= 2.4 XPU builds). Older torch/IPEX stacks fall back
+# to the private-queue path, so this stays a no-op there.
+import torch as _torch  # noqa: E402  (needed for lib path detection)
+
+_torch_lib_dir = os.path.join(os.path.dirname(_torch.__file__), "lib")
+_has_c10_xpu = os.path.exists(os.path.join(_torch_lib_dir, "libc10_xpu.so"))
+extra_libraries = []
+if _has_c10_xpu:
+    compile_flags.append("-DKIVI_USE_TORCH_XPU_QUEUE")
+    extra_libraries.append("c10_xpu")
+
 # --------------------------------------------------------------------------
 # Package metadata
 # --------------------------------------------------------------------------
@@ -63,6 +76,8 @@ setup(
                 os.path.join(CSRC, "ops", "kv_cache_ops.cpp"),
             ],
             include_dirs=[CSRC, os.path.join(CSRC, "include")],
+            libraries=extra_libraries,
+            library_dirs=[_torch_lib_dir] if extra_libraries else [],
             extra_compile_args=compile_flags,
             extra_link_args=link_flags,
         )
