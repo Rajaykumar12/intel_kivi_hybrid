@@ -10,7 +10,8 @@ divergence in the fused path can never again reach generation unseen.
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("intel_extension_for_pytorch")
+if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+    pytest.skip("XPU device not available", allow_module_level=True)
 
 from kivi_sycl import _C as kivi_native
 

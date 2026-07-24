@@ -10,7 +10,6 @@ Examples:
 """
 
 import torch
-import intel_extension_for_pytorch as ipex
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import time
 import sys
@@ -80,7 +79,9 @@ def benchmark(model_id, num_gen_tokens, G, R, prompt):
     all_tokens = [input_ids]
 
     start = time.time()
-    for step in range(num_gen_tokens):
+    # Prefill already produced new token #1 — loop num_gen_tokens - 1 more
+    # times so the total matches the FP32 reference loop above.
+    for step in range(1, num_gen_tokens):
         past_key_values = cache.get_full_cache()
 
         with torch.no_grad():

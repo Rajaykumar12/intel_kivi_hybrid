@@ -5,7 +5,6 @@ from typing import List, Optional, Tuple
 import torch
 from transformers.cache_utils import DynamicCache
 
-from ..backend.ipex import ensure_ipex
 from ..config.model_config import detect_model_config
 from ..extension.loader import kivi_native
 
@@ -80,7 +79,6 @@ class KiviCache:
         group_size: int = 32,
         residual_length: int = 128,
     ):
-        ensure_ipex()
         assert head_dim % group_size == 0, \
             f"head_dim ({head_dim}) must be divisible by group_size ({group_size})"
         assert group_size >= 4 and group_size % 4 == 0, \

@@ -12,7 +12,6 @@ don't support all matmul shapes via oneDNN).
 """
 
 import torch
-import intel_extension_for_pytorch as ipex
 from kivi_sycl import _C as kivi_sycl
 
 xpu = "xpu"

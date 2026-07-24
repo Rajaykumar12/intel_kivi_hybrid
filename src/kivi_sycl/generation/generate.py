@@ -62,9 +62,16 @@ def generate(
     cache.add_tokens(out.past_key_values)
     next_id = sample_token(out.logits[:, -1, :], temperature, top_k, do_sample)
     all_ids = [next_id]
+    eos_id = tokenizer.eos_token_id
 
-    # Decode
-    for step in range(max_new_tokens):
+    # Decode. The prefill above already produced new token #1, so this loop
+    # runs max_new_tokens - 1 times — total generated == max_new_tokens,
+    # matching model.generate() semantics.
+    for step in range(1, max_new_tokens):
+        # Stop on EOS (checked at loop top so a prefill-sampled EOS also stops)
+        if eos_id is not None and next_id.item() == eos_id:
+            break
+
         past = cache.get_full_cache()
         out = model(next_id, past_key_values=past, use_cache=True)
         cache.add_tokens(out.past_key_values)
@@ -73,10 +80,6 @@ def generate(
 
         if verbose and (step + 1) % 10 == 0:
             print(".", end="", flush=True)
-
-        # Stop on EOS
-        if tokenizer.eos_token_id is not None and next_id.item() == tokenizer.eos_token_id:
-            break
 
     if verbose:
         print()
