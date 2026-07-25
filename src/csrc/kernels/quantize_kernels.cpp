@@ -11,8 +11,12 @@
 // One work-item per channel/group (see internal/quant_tile.hpp for why
 // sub-group-cooperative parallelization was tried and reverted — it
 // regressed on KIVI's actual small group_size workload). Each thread
-// vectorizes its own min/max reduction and packing pass as float4
+// vectorizes its own min/max reduction and packing pass as 4-wide
 // loads/stores instead of scalar ones.
+//
+// Templated on element type T; explicit instantiations for float and
+// sycl::half are at the bottom of this file. Arithmetic accumulates in
+// float for both.
 // ==========================================================================
 
 #include "quantize_kernels.hpp"
@@ -21,11 +25,12 @@
 
 using namespace kivi::detail;
 
+template <typename T>
 sycl::event quantize_keys_per_channel_submit(
-    const float* __restrict__ input,
-    uint8_t*     __restrict__ output,
-    float*       __restrict__ scales,
-    float*       __restrict__ zeros,
+    const T* __restrict__ input,
+    uint8_t* __restrict__ output,
+    T*       __restrict__ scales,
+    T*       __restrict__ zeros,
     int num_channels,
     int group_size)
 {
@@ -44,33 +49,22 @@ sycl::event quantize_keys_per_channel_submit(
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
 
                 float scale = (max_val - min_val) / 3.0f + 1e-10f;
-                scales[ch] = scale;
-                zeros[ch]  = min_val;
+                float scale_r, zero_r;
+                store_scale_zero(scale, min_val, scales, zeros, ch,
+                                 scale_r, zero_r);
 
                 int out_base = ch * (group_size / 4);
-                pack_vec(input, base, group_size, min_val, scale, output, out_base);
+                pack_vec(input, base, group_size, zero_r, scale_r, output, out_base);
             });
     });
 }
 
-void quantize_keys_per_channel(
-    const float* __restrict__ input,
-    uint8_t*     __restrict__ output,
-    float*       __restrict__ scales,
-    float*       __restrict__ zeros,
-    int num_channels,
-    int group_size)
-{
-    quantize_keys_per_channel_submit(input, output, scales, zeros,
-                                      num_channels, group_size)
-        .wait_and_throw();
-}
-
+template <typename T>
 sycl::event quantize_values_per_token_submit(
-    const float* __restrict__ input,
-    uint8_t*     __restrict__ output,
-    float*       __restrict__ scales,
-    float*       __restrict__ zeros,
+    const T* __restrict__ input,
+    uint8_t* __restrict__ output,
+    T*       __restrict__ scales,
+    T*       __restrict__ zeros,
     int num_tokens,
     int head_dim,
     int group_size)
@@ -96,25 +90,22 @@ sycl::event quantize_values_per_token_submit(
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
 
                 float scale = (max_val - min_val) / 3.0f + 1e-10f;
-                scales[gid] = scale;
-                zeros[gid]  = min_val;
+                float scale_r, zero_r;
+                store_scale_zero(scale, min_val, scales, zeros, gid,
+                                 scale_r, zero_r);
 
                 int out_base = token_idx * packed_per_token + group_in_tok * (group_size / 4);
-                pack_vec(input, base, group_size, min_val, scale, output, out_base);
+                pack_vec(input, base, group_size, zero_r, scale_r, output, out_base);
             });
     });
 }
 
-void quantize_values_per_token(
-    const float* __restrict__ input,
-    uint8_t*     __restrict__ output,
-    float*       __restrict__ scales,
-    float*       __restrict__ zeros,
-    int num_tokens,
-    int head_dim,
-    int group_size)
-{
-    quantize_values_per_token_submit(input, output, scales, zeros,
-                                      num_tokens, head_dim, group_size)
-        .wait_and_throw();
-}
+// Explicit instantiations — the only element types the ops layer dispatches.
+template sycl::event quantize_keys_per_channel_submit<float>(
+    const float*, uint8_t*, float*, float*, int, int);
+template sycl::event quantize_keys_per_channel_submit<sycl::half>(
+    const sycl::half*, uint8_t*, sycl::half*, sycl::half*, int, int);
+template sycl::event quantize_values_per_token_submit<float>(
+    const float*, uint8_t*, float*, float*, int, int, int);
+template sycl::event quantize_values_per_token_submit<sycl::half>(
+    const sycl::half*, uint8_t*, sycl::half*, sycl::half*, int, int, int);

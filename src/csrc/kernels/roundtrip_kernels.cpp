@@ -2,7 +2,7 @@
 // KIVI: fused quantize->dequantize round-trip kernels.
 // See roundtrip_kernels.hpp for the rationale, internal/quant_tile.hpp for
 // why parallelism is one work-item per channel/group with vectorized
-// float4 loads/stores rather than sub-group-cooperative reduction.
+// 4-wide loads/stores rather than sub-group-cooperative reduction.
 // ==========================================================================
 
 #include "roundtrip_kernels.hpp"
@@ -11,9 +11,25 @@
 
 using namespace kivi::detail;
 
+namespace {
+
+// Round scale/zero through T so the round-trip result matches
+// quantize<T> -> dequantize<T> exactly (identity for T=float). The narrowing
+// must go through round_through_storage — see the comment on that helper for
+// why an inline `float(T(x))` here does not survive -O3.
+template <typename T>
+inline void round_scale_zero(float& scale, float& zero)
+{
+    scale = round_through_storage<T>(scale);
+    zero  = round_through_storage<T>(zero);
+}
+
+}  // namespace
+
+template <typename T>
 sycl::event quant_dequant_roundtrip_keys_submit(
-    const float* __restrict__ input,
-    float*       __restrict__ output,
+    const T* __restrict__ input,
+    T*       __restrict__ output,
     int num_channels,
     int group_size)
 {
@@ -31,25 +47,17 @@ sycl::event quant_dequant_roundtrip_keys_submit(
                 float min_val, max_val;
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
                 float scale = (max_val - min_val) / 3.0f + 1e-10f;
+                round_scale_zero<T>(scale, min_val);
 
                 roundtrip_vec(input, base, group_size, min_val, scale, output, base);
             });
     });
 }
 
-void quant_dequant_roundtrip_keys(
-    const float* __restrict__ input,
-    float*       __restrict__ output,
-    int num_channels,
-    int group_size)
-{
-    quant_dequant_roundtrip_keys_submit(input, output, num_channels, group_size)
-        .wait_and_throw();
-}
-
+template <typename T>
 sycl::event quant_dequant_roundtrip_values_submit(
-    const float* __restrict__ input,
-    float*       __restrict__ output,
+    const T* __restrict__ input,
+    T*       __restrict__ output,
     int num_tokens,
     int head_dim,
     int group_size)
@@ -73,19 +81,19 @@ sycl::event quant_dequant_roundtrip_values_submit(
                 float min_val, max_val;
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
                 float scale = (max_val - min_val) / 3.0f + 1e-10f;
+                round_scale_zero<T>(scale, min_val);
 
                 roundtrip_vec(input, base, group_size, min_val, scale, output, base);
             });
     });
 }
 
-void quant_dequant_roundtrip_values(
-    const float* __restrict__ input,
-    float*       __restrict__ output,
-    int num_tokens,
-    int head_dim,
-    int group_size)
-{
-    quant_dequant_roundtrip_values_submit(input, output, num_tokens, head_dim, group_size)
-        .wait_and_throw();
-}
+// Explicit instantiations — the only element types the ops layer dispatches.
+template sycl::event quant_dequant_roundtrip_keys_submit<float>(
+    const float*, float*, int, int);
+template sycl::event quant_dequant_roundtrip_keys_submit<sycl::half>(
+    const sycl::half*, sycl::half*, int, int);
+template sycl::event quant_dequant_roundtrip_values_submit<float>(
+    const float*, float*, int, int, int);
+template sycl::event quant_dequant_roundtrip_values_submit<sycl::half>(
+    const sycl::half*, sycl::half*, int, int, int);
