@@ -4,9 +4,18 @@ KIVI Benchmark — demonstrates plug-and-play usage of kivi_sycl
 Run: python examples/benchmark.py [model_name] [--tokens N] [--R N] [--G N]
 
 Examples:
-    python examples/benchmark.py                          # GPT-2 (default)
-    python examples/benchmark.py gpt2-medium              # GPT-2 Medium
-    python examples/benchmark.py meta-llama/Llama-2-7b-hf --tokens 100
+    python examples/benchmark.py                          # TinyLlama-1.1B (default)
+    python examples/benchmark.py gpt2                     # quick check, no 2.2 GB download
+    python examples/benchmark.py Qwen/Qwen2-0.5B --tokens 100
+
+Defaults to TinyLlama-1.1B rather than gpt2 because the point of this script is
+the measured compression figure, and gpt2's KV cache is far too small for that
+number to mean anything (docs/status_and_roadmap.md 2.7). Pass `gpt2` explicitly
+for a fast smoke test on a machine without the weights cached.
+
+Note this benchmark generates from a short prompt, so it reports compression in
+the short-context regime. For the long-context numbers that actually motivate
+KIVI, use examples/eval_longctx.py.
 """
 
 import torch
@@ -44,12 +53,25 @@ def benchmark(model_id, num_gen_tokens, G, R, prompt):
     print(f"\nPrompt: '{prompt[:80]}{'...' if len(prompt) > 80 else ''}'")
     print(f"\n--- FP32 Reference (no quantization) ---")
     ref_input_ids = input_ids_orig.clone()
-    ref_past = None
     ref_tokens = []
+
+    # Prefill is deliberately OUTSIDE the timed region, matching the KIVI path
+    # below. Timing the prompt forward on one side only inflates the other
+    # side's apparent speed — the same asymmetry in eval_longctx.py once made
+    # KIVI look 2.5x *faster* than the FP baseline at 2k context.
+    with torch.no_grad():
+        out = model(ref_input_ids, use_cache=True)
+    ref_past = out.past_key_values
+    ref_input_ids = out.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+    ref_tokens.append(ref_input_ids)
+    ref_hit_eos = (tokenizer.eos_token_id is not None
+                   and ref_input_ids.item() == tokenizer.eos_token_id)
 
     start_ref = time.time()
     with torch.no_grad():
-        for step in range(num_gen_tokens):
+        for step in range(1, num_gen_tokens):
+            if ref_hit_eos:
+                break
             out = model(ref_input_ids, past_key_values=ref_past, use_cache=True)
             ref_past = out.past_key_values
             ref_input_ids = out.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
@@ -58,9 +80,12 @@ def benchmark(model_id, num_gen_tokens, G, R, prompt):
                 break
     elapsed_ref = time.time() - start_ref
     actual_ref_tokens = len(ref_tokens)
+    # Rate is over *timed* tokens only: the prefill token is excluded from both
+    # the numerator and the denominator, on both paths.
+    ref_timed_tokens = actual_ref_tokens - 1
     ref_text = tokenizer.decode(torch.cat(ref_tokens, dim=1)[0])
-    print(f"  {actual_ref_tokens} tokens in {elapsed_ref:.2f}s "
-          f"({actual_ref_tokens/elapsed_ref:.1f} tok/s)")
+    print(f"  {ref_timed_tokens} tokens in {elapsed_ref:.2f}s "
+          f"({ref_timed_tokens/elapsed_ref:.1f} tok/s), prefill excluded")
     print(f"  Output: {ref_text[:200]}{'...' if len(ref_text) > 200 else ''}")
 
     # -----------------------------------------------------------
@@ -97,10 +122,14 @@ def benchmark(model_id, num_gen_tokens, G, R, prompt):
 
     elapsed = time.time() - start
     actual_kivi_tokens = len(all_tokens)
+    # As on the FP path: the prefill-produced token is not in the timed region,
+    # so it must not be counted in the rate either. Charging 200 tokens against
+    # the time for 199 was overstating KIVI's throughput.
+    kivi_timed_tokens = actual_kivi_tokens - 1
     generated = tokenizer.decode(torch.cat(all_tokens, dim=1)[0])
 
-    print(f"\n  {actual_kivi_tokens} tokens in {elapsed:.2f}s "
-          f"({actual_kivi_tokens/elapsed:.1f} tok/s)")
+    print(f"\n  {kivi_timed_tokens} tokens in {elapsed:.2f}s "
+          f"({kivi_timed_tokens/elapsed:.1f} tok/s), prefill excluded")
     print(f"  Output: {generated[:200]}{'...' if len(generated) > 200 else ''}")
 
     # -----------------------------------------------------------
@@ -109,18 +138,22 @@ def benchmark(model_id, num_gen_tokens, G, R, prompt):
     s = cache.get_stats(layer=0)
 
     print(f"\n{'='*60}")
-    print(f"Cache stats (layer 0):")
-    print(f"  Total tokens:      {s['total_tokens']}")
-    print(f"  Quantized tokens:  {s['quantized_tokens']}")
-    print(f"  Residual tokens:   {s['residual_tokens']}")
-    print(f"  KIVI memory:       {s['kivi_bytes']/1024:.1f} KB")
-    print(f"  FP32 baseline:     {s['fp32_bytes']/1024:.1f} KB")
-    print(f"  Compression ratio: {s['compression']:.2f}x")
-    print(f"\nPerformance:")
-    print(f"  FP32 speed:        {actual_ref_tokens/elapsed_ref:.1f} tok/s")
-    print(f"  KIVI speed:        {actual_kivi_tokens/elapsed:.1f} tok/s")
-    kivi_toks = actual_kivi_tokens / elapsed
-    ref_toks = actual_ref_tokens / elapsed_ref
+    print(f"Cache stats (layer 0) — all byte counts measured, not projected:")
+    print(f"  Total tokens:        {s['total_tokens']}")
+    print(f"  Quantized tokens:    {s['quantized_tokens']}")
+    print(f"  Residual tokens:     {s['residual_tokens']}")
+    print(f"  Packed (2-bit) KB:   {s['packed_bytes']/1024:.1f}")
+    print(f"  Residual (FP) KB:    {s['residual_bytes']/1024:.1f}")
+    print(f"  Serving copy KB:     {s['serving_copy_bytes']/1024:.1f} "
+          f"(0 unless serving='cached')")
+    print(f"  KIVI resident KB:    {s['kivi_bytes']/1024:.1f}")
+    print(f"  FP baseline KB:      {s['fp_baseline_bytes']/1024:.1f}")
+    print(f"  Compression ratio:   {s['compression']:.2f}x")
+    print(f"\nPerformance (decode only — prefill excluded on both paths):")
+    print(f"  FP32 speed:        {ref_timed_tokens/elapsed_ref:.1f} tok/s")
+    print(f"  KIVI speed:        {kivi_timed_tokens/elapsed:.1f} tok/s")
+    kivi_toks = kivi_timed_tokens / elapsed
+    ref_toks = ref_timed_tokens / elapsed_ref
     if kivi_toks >= ref_toks:
         print(f"  KIVI speedup:      {(kivi_toks/ref_toks - 1)*100:.0f}%")
     else:
@@ -143,13 +176,22 @@ def benchmark(model_id, num_gen_tokens, G, R, prompt):
     print(f"\nQuality comparison:")
     print(f"  Token match rate:     {match*100:.1f}%")
     print(f"  First divergence at:  token {diverge_at} / {min_len}")
+    if diverge_at < min_len:
+        print("  NOTE: greedy decoding diverges irreversibly — once one token")
+        print("  differs, every later token is compared against a different")
+        print("  prefix, so the match rate mostly encodes *where* it diverged,")
+        print("  not how much quality was lost. Read the generated text above,")
+        print("  and use examples/eval_perplexity.py for a quantitative answer.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="KIVI 2-bit KV Cache Benchmark")
-    parser.add_argument("model", nargs="?", default="gpt2",
-                        help="HuggingFace model name/path (default: gpt2)")
+    parser.add_argument("model", nargs="?",
+                        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                        help="HuggingFace model name/path "
+                             "(default: TinyLlama-1.1B; pass 'gpt2' for a fast "
+                             "smoke test with no large download)")
     parser.add_argument("--tokens", type=int, default=200,
                         help="Number of tokens to generate (default: 200)")
     parser.add_argument("--G", type=int, default=32,
