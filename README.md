@@ -9,17 +9,122 @@ text = generate(model, tokenizer, "Once upon a time", max_new_tokens=200)
 
 ## Results
 
-Benchmarked on Intel Iris Xe Graphics with GPT-2 (12 layers, 12 heads, head_dim=64), generating 200 tokens:
+The packed-2-bit representation (uint8 payload + scales + zeros) is the resident CPU
+store for flushed history — `KiviCache` no longer dequantizes-and-discards on flush, so
+`get_stats()` reports **measured** resident bytes (`packed_bytes`, `residual_bytes`,
+`kivi_bytes`, `fp_baseline_bytes`, `compression`), not a projected figure.
 
-| Metric | FP32 Baseline | KIVI 2-bit |
-|--------|:---:|:---:|
-| **Speed** | 16.3 tok/s | 14.4 tok/s |
-| **KV cache memory** | 1,386 KB | 378 KB |
-| **Compression** | 1× | **3.67×** |
-| **Token match vs FP32** | — | **100%** |
-| **Overhead** | — | 13% |
+All measured 2026-07-25/26 on Intel Iris Xe Graphics, fp32, G=32, via
+`get_stats()` — every byte count is read off live tensors, none are projected.
 
-The 100% token match is achieved through the CPU-residual architecture (see below), which eliminates floating-point rounding from unnecessary device transfers.
+### Measured across models and context lengths
+
+| Model | KV heads × head_dim | Layers | Context | Resident KV cache | Compression | Decode cost |
+|---|---|---|---|---|---|---|
+| gpt2 | 12 × 64 | 12 | 230 | 16.2 → 4.36 MB | 3.71× | −36% |
+| TinyLlama-1.1B | 4 × 64 | 22 | 238 | 10.2 → 3.01 MB | 3.40× | −14% |
+| TinyLlama-1.1B | 4 × 64 | 22 | 2k | 83.0 → 14.4 MB | 5.76× | −26% |
+| Qwen2-0.5B | 2 × 64 | 24 | 4k | 96.7 → 14.7 MB | 6.58× | −27% |
+| Qwen2.5-0.5B-Instruct | 2 × 64 | 24 | **8k** | 192.7 → **26.7 MB** | **7.22×** | −32% |
+
+Short-context rows use R=64, long-context rows R=128. Cache sizes are summed over **all**
+layers (`get_stats()` reports one layer; every layer holds identically shaped tensors, so
+scaling by the layer count is exact). Throughput excludes prefill on both paths and counts
+only tokens produced inside the timed region.
+
+### Compression does not depend on the model
+
+The architectures above span 12 → 2 KV heads and 12 → 24 layers, but that variation does
+not move the ratio. Per token, with `H` KV heads, head_dim `D`, group size `G`, and fp32
+scales/zeros:
+
+```
+fp32 cache      = 2·H·D·4              = 8·H·D          bytes/token
+2-bit payload   = 2·H·D·0.25           = 0.5·H·D
+key   metadata  = H·D·2·4 / G          = 8·H·D/G        (per-channel, amortized over G tokens)
+value metadata  = (D/G)·H·2·4          = 8·H·D/G        (per-token, one group per G channels)
+                                       ─────────────────
+quantized total = H·D·(0.5 + 16/G)
+```
+
+`H·D` cancels in the ratio, so the **ceiling is 8× for any architecture** at G=32. What
+actually varies is how much of the cache is still in the FP residual window. With
+`ρ = residual_tokens / total_tokens`:
+
+> **compression = 8 / (1 + 7ρ)**
+
+More generally, for a ceiling `C` (see *Raising the ceiling* below):
+`compression = C / (1 + ρ·(C−1))`. The 8× form above is the G=32 / fp32-metadata case.
+
+That single expression reproduces every measurement above to two decimal places:
+
+| Run | H·D | fp32 B/tok | quantized B/tok | ρ | predicted | measured |
+|---|---|---|---|---|---|---|
+| gpt2 @230, R=64 | 768 | 6144 | 768 | 0.165 | 3.71× | **3.71×** |
+| TinyLlama @238, R=64 | 256 | 2048 | 256 | 0.193 | 3.40× | **3.40×** |
+| TinyLlama @2k, R=128 | 256 | 2048 | 256 | 0.055 | 5.76× | **5.76×** |
+| Qwen2-0.5B @4k, R=128 | 128 | 1024 | 128 | 0.031 | 6.58× | **6.58×** |
+| Qwen2.5-0.5B @8k, R=128 | 128 | 1024 | 128 | 0.015 | 7.22× | **7.22×** |
+
+So the practical guidance is: **pick your context length and R, not your model.** A
+larger model does not compress better — it just has a bigger cache to compress. The
+8k run reaches 90% of the theoretical maximum because only 1.5% of its tokens are still
+in the residual window.
+
+Two independent checks that this is not curve-fitting: at *equal* conversation length
+TinyLlama-1.1B and Qwen2.5-0.5B measure 5.17× and 5.36× despite a 2× difference in KV
+heads; and the measured per-token packed cost (768 / 256 / 128 B) matches `H·D·(0.5+16/G)`
+exactly for all three architectures.
+
+### Raising the ceiling
+
+The 8× ceiling is set by `G` and the metadata dtype, not the model. Metadata is currently
+fp32 and, at G=32, costs exactly as much as the 2-bit payload itself:
+
+| Group size | fp32 scales/zeros | fp16 scales/zeros |
+|---|---|---|
+| G=16 | 5.33× | 8.00× |
+| **G=32** (default) | **8.00×** | 10.67× |
+| G=64 | 10.67× | 12.80× |
+| G=128 | 12.80× | 14.22× |
+
+Storing scales/zeros in fp16 would lift the ceiling from 8× to 10.67× — a ~33%
+improvement on the headline figure. The fp16 kernels already exist; see
+`docs/status_and_roadmap.md` §6.2 for why this is currently blocked on this hardware.
+Raising `G` costs quality (coarser quantization groups), so it is a real trade rather
+than free headroom.
+
+### Quality
+
+WikiText-2 perplexity, gpt2, 10×512-token windows, G=32:
+
+| Residual window | Perplexity | vs FP |
+|---|---|---|
+| FP32 baseline | 38.08 | — |
+| KIVI, R=128 | 38.79 | **+1.87%** |
+| KIVI, R=64 | 39.13 | **+2.76%** |
+
+Halving the residual window roughly doubles the quality gap, in the direction the paper
+predicts — the FP window is the mechanism that keeps 2-bit usable.
+
+`examples/benchmark.py` also prints a greedy token-match rate, but read that number
+carefully: greedy decoding diverges irreversibly, so it mostly encodes *where* the two
+runs split rather than how much quality was lost.
+
+For historical context, earlier versions of this README claimed 3.67×, computed
+analytically while the flush path still dequantized-and-discarded — the actual resident
+footprint then was ~1.0× (`docs/status_and_roadmap.md` §2.1).
+
+### When KIVI helps
+
+The savings scale with the cache, which grows with model size and context. At 2k on TinyLlama the KV cache is 83 MB against ~4.4 GB of fp32 weights, so the
+68 MB saved is under 2% of resident memory — real but not decisive. At 8k on
+Qwen2.5-0.5B the cache is 192.7 MB against 1885 MB of weights, and the 166 MB saved is
+8.8% of total resident memory. It becomes decisive where the cache rivals the weights
+(≥3B params at ≥8k, ~1 GB of fp32 KV). Note the decode cost grows with context too
+(−26% at 2k → −32% at 8k): it is the price of reconstructing full precision on read, and
+`docs/status_and_roadmap.md` §2.6 explains why it has a floor that only fused quantized
+attention can remove.
 
 ## How KIVI Works
 
@@ -74,13 +179,13 @@ Token stream: [t₀, t₁, ..., t_{n-R}, ..., tₙ]
     │                                │
     ▼                                ▼
 ┌──────────────┐          ┌──────────────────┐
-│  Residual    │          │  Quantized Store │
-│  Buffer      │          │  (XPU Memory)    │
-│  (FP32, CPU) │          │                  │
+│  Residual    │          │  Packed Store    │
+│  Buffer      │          │  (CPU-resident)  │
+│  (FP, CPU)   │          │                  │
 │              │          │ packed: uint8    │
-│ Last R tokens│          │ scales: float32  │
-│ No device    │          │ zeros:  float32  │
-│ transfers    │          │                  │
+│ Last R tokens│          │ scales: fp32/16  │
+│ No device    │          │ zeros:  fp32/16  │
+│ transfers    │          │ dequant on read  │
 └──────────────┘          └────────┬─────────┘
                                    │
                          ┌─────────┴─────────┐
@@ -112,27 +217,36 @@ The critical performance optimization: **residual buffers live on CPU**, not XPU
 
 | Decode step type | What happens | XPU involved? |
 |---|---|---|
-| **Normal** (~97% of steps) | CPU `torch.cat` of cached history + residual | No |
-| **Flush** (~3% of steps) | CPU→XPU transfer, SYCL quantize+dequantize, XPU→CPU transfer back | Yes |
+| **Normal** (~97% of steps) | CPU-side unpack of the packed history + `torch.cat` with the residual | No |
+| **Flush** (~3% of steps) | CPU→XPU transfer, SYCL quantize, packed/scales/zeros back to CPU | Yes |
 
-This eliminates per-step XPU synchronization stalls that otherwise dominate latency on integrated GPUs. The dequantized history is cached on CPU and incrementally updated only when a flush occurs.
+This eliminates per-step XPU synchronization stalls that otherwise dominate latency on integrated GPUs.
+
+Two things worth knowing about the flush path:
+
+- **The packed representation is the resident store.** A flush quantizes only — it does not dequantize back. Full precision is reconstructed transiently on read, which is where the memory saving comes from and also where the decode overhead in the tables above comes from. `serving="cached"` keeps a persistent FP copy instead, trading the memory back for speed — but measured at 2k context that puts the resident cache *above* the FP baseline (0.89× compression), so it is rarely the right choice. `get_stats()` reports it honestly via `serving_copy_bytes`.
+- **Flush is asynchronous by default.** The kernels are submitted and the call returns; the flushed tokens stay in the FP residual (still served correctly) until the next `add_tokens()` harvests them, so kernel and transfer time overlap the model's forward pass. Pass `async_flush=False` for synchronous harvest in the same call.
 
 ## Tensor Shapes
 
+`T` below is the element dtype — `float32` or `float16` (bfloat16 is upcast to fp32 at
+ingestion; there is no bf16 kernel). See `docs/tensor_spec_and_shapes.md` for the full
+contract.
+
 ### Key Storage (Per-Channel)
 ```
-Input:   [B, H, D, Seq]     float32  (keys transposed for per-channel quant)
-Packed:  [B, H, D, Seq/4]   uint8    (4 values per byte)
-Scales:  [B, H, D]          float32  (1 scale per channel)
-Zeros:   [B, H, D]          float32  (1 zero-point per channel)
+Input:   [B, H, D, Seq]              T      (keys transposed for per-channel quant)
+Packed:  [B, H, D, Seq/4]            uint8  (4 values per byte)
+Scales:  [B, H, D, Seq/group_size]   T      (1 scale per G-token group, per channel)
+Zeros:   [B, H, D, Seq/group_size]   T      (1 zero-point per group)
 ```
 
 ### Value Storage (Per-Token)
 ```
-Input:   [B, H, Seq, D]             float32
-Packed:  [B, H, Seq, D/4]           uint8    (4 values per byte)
-Scales:  [B, H, Seq, D/group_size]  float32  (1 scale per group)
-Zeros:   [B, H, Seq, D/group_size]  float32  (1 zero-point per group)
+Input:   [B, H, Seq, D]             T
+Packed:  [B, H, Seq, D/4]           uint8  (4 values per byte)
+Scales:  [B, H, Seq, D/group_size]  T      (1 scale per G-channel group, per token)
+Zeros:   [B, H, Seq, D/group_size]  T      (1 zero-point per group)
 ```
 
 ## Setup
@@ -231,7 +345,12 @@ from kivi_sycl import KiviCache
 import torch
 
 # Auto-configure from any HuggingFace model
-cache = KiviCache.from_model(model, group_size=32, residual_length=128)
+cache = KiviCache.from_model(
+    model, group_size=32, residual_length=128,
+    serving="rebuild",   # "rebuild" (default, memory-honest) or "cached" (faster,
+                          # keeps an extra FP history copy resident — see below)
+    async_flush=True,    # overlap flush kernels with the next forward pass
+)
 
 input_ids = tokenizer("Hello world", return_tensors="pt").input_ids
 
@@ -258,8 +377,15 @@ cache.reset()
 ```python
 stats = cache.get_stats(layer=0)
 print(f"Compression: {stats['compression']:.1f}x")
-print(f"KIVI: {stats['kivi_bytes']/1024:.0f} KB vs FP32: {stats['fp32_bytes']/1024:.0f} KB")
+print(f"Packed (2-bit): {stats['packed_bytes']/1024:.0f} KB")
+print(f"Residual (FP):  {stats['residual_bytes']/1024:.0f} KB")
+print(f"KIVI resident:  {stats['kivi_bytes']/1024:.0f} KB vs FP baseline: {stats['fp_baseline_bytes']/1024:.0f} KB")
 ```
+
+All fields are measured from live tensors (`numel() * element_size()`), not projected.
+`serving="cached"` mode also reports `serving_copy_bytes` — the extra FP history copy it
+keeps resident — folded into the `compression` denominator, so switching to `"cached"`
+honestly shows less compression in exchange for speed.
 
 ### Use with Any Model
 
@@ -297,14 +423,19 @@ kivi_sycl_native.quantize_values(input, packed, scales, zeros, head_dim, group_s
 kivi_sycl_native.dequantize_values(packed, scales, zeros, output, head_dim, group_size)
 
 # Fused round-trip: quantize to 2-bit fidelity and dequantize back in one
-# kernel launch, without ever materializing packed/scales/zeros. Use this
-# instead of a quantize_*+dequantize_* pair when the packed representation
-# itself is discarded by the caller (this is what KiviCache's flush does).
+# kernel launch, without ever materializing packed/scales/zeros. Useful when
+# the packed representation itself is discarded by the caller — KiviCache's
+# flush does NOT use this (packed/scales/zeros ARE its resident store); it
+# calls quantize_keys_async/quantize_values_async instead (see below).
 kivi_sycl_native.quant_dequant_roundtrip_keys(input, output, group_size)
 kivi_sycl_native.quant_dequant_roundtrip_values(input, output, head_dim, group_size)
 
 # Non-blocking variants of every op above (suffix _async) return a
 # KiviEvent instead of blocking; call .wait() on it before reading output.
+# KiviCache uses these by default (async_flush=True): a flush's quantize
+# kernels are submitted during add_tokens() and harvested (packed store
+# updated, residual trimmed) at the start of the *next* add_tokens() call,
+# overlapping kernel + transfer time with the model's forward pass.
 ```
 
 ### Parameters
@@ -318,7 +449,7 @@ For GPT-2 (short sequences), `R=64` is sufficient. For 7B+ models with long cont
 
 ## Project Layout
 
-The project uses a modular `src/`-layout: a pure-Python package (`src/kivi_sycl/`) and its native SYCL sources (`src/csrc/`) are kept fully separate, each broken down by single responsibility. See [`docs/architecture.md`](docs/architecture.md) for the full design rationale.
+The project uses a modular `src/`-layout: a pure-Python package (`src/kivi_sycl/`) and its native SYCL sources (`src/csrc/`) are kept fully separate, each broken down by single responsibility. See [`docs/architecture_and_state.md`](docs/architecture_and_state.md) for the full design rationale.
 
 ```
 src/
@@ -343,11 +474,17 @@ src/
 | `src/kivi_sycl/` | **Plug-and-play package**: `KiviCache` class + `generate()` one-liner (src-layout) |
 | `src/csrc/` | SYCL kernels, ops, and pybind11 bindings for 2-bit quantize/dequantize |
 | `examples/benchmark.py` | Benchmark script with FP32 comparison (uses `kivi_sycl`) |
+| `examples/chat.py` | Interactive terminal chat (ollama-style), Qwen2.5-0.5B-Instruct by default, with live compression stats |
 | `examples/app.py` | Minimal one-liner demo |
 | `scripts/build_wheel.sh` | Build pre-built wheel for distribution |
 | `setup.py` | Package config with auto-detected SYCL paths |
 | `pyproject.toml` | Modern Python packaging metadata |
-| `docs/architecture.md` | Project layout / module design notes |
+| `docs/commands.md` | Command reference — run, test, benchmark, rebuild, gotchas |
+| `docs/architecture_and_state.md` | Cache state machine, storage invariants, module design |
+| `docs/status_and_roadmap.md` | What works, what's measured, what's still missing, known issues |
+| `docs/sycl_kernel_interface.md` | Kernel / ops-layer contract, sync and async entry points |
+| `docs/tensor_spec_and_shapes.md` | Exact shapes and dtypes across the Python↔SYCL boundary |
+| `docs/dev-environment-setup.md` | From-scratch oneAPI + conda + build setup on this machine |
 | `tests/integration/test_kivi.py` | Comprehensive validation suite (15 checks) |
 | `tests/integration/test_quantize_simple.py` | Deterministic known-value verification |
 | `tests/integration/test_attention_fix.py` | End-to-end attention pipeline vs FP32 reference |

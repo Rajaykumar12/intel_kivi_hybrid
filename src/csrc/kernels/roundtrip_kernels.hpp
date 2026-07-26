@@ -5,46 +5,60 @@
 // ==========================================================================
 // KIVI: fused quantize->dequantize round-trip kernels.
 // ==========================================================================
-// The CPU-residual flush path (KiviCache._flush_group) always calls
-// quantize_* immediately followed by dequantize_* on the same data, and
-// never reads the intermediate packed/scales/zeros buffers again — see
-// docs/architecture_and_state.md's "critical invariant" and
-// manager.py::_flush_group. These entry points compute the round-trip
-// (quantize to 2-bit fidelity, then immediately reconstruct as float) in a
-// single kernel launch, without ever writing the packed uint8 buffer (or
-// scales/zeros) to global memory. Use these instead of a
-// quantize_*+dequantize_* pair whenever the packed representation itself
-// is not needed by the caller.
+// These entry points compute the round-trip (quantize to 2-bit fidelity,
+// then immediately reconstruct) in a single kernel launch, without ever
+// writing the packed uint8 buffer (or scales/zeros) to global memory. Use
+// these instead of a quantize_*+dequantize_* pair whenever the packed
+// representation itself is not needed by the caller.
 //
-// The original quantize_*/dequantize_* entry points in quantize_kernels.hpp
-// / dequantize_kernels.hpp remain unchanged and are still required for any
-// path that persists the 2-bit representation (e.g. paged/long-context
-// storage).
+// NOTE: since the packed-resident storage change (see
+// docs/architecture_and_state.md), KiviCache._submit_flush no longer uses
+// these — the flush persists the packed representation, so it calls
+// quantize_* and keeps the outputs. The round-trip kernels remain for
+// fidelity-simulation use cases and the direct kernel API.
+//
+// Templated on element type T (float / sycl::half — explicit
+// instantiations in roundtrip_kernels.cpp). The internally computed
+// scale/zero are rounded through T before reconstruction so the result is
+// bit-identical to quantize_*<T> followed by dequantize_*<T>.
 // --------------------------------------------------------------------------
 
-void quant_dequant_roundtrip_keys(
-    const float* input,
-    float*       output,
-    int num_channels,
-    int group_size);
-
-void quant_dequant_roundtrip_values(
-    const float* input,
-    float*       output,
-    int num_tokens,
-    int head_dim,
-    int group_size);
-
 // Non-blocking variants — see quantize_kernels.hpp for the rationale.
+template <typename T>
 sycl::event quant_dequant_roundtrip_keys_submit(
-    const float* input,
-    float*       output,
+    const T* input,
+    T*       output,
     int num_channels,
     int group_size);
 
+template <typename T>
 sycl::event quant_dequant_roundtrip_values_submit(
-    const float* input,
-    float*       output,
+    const T* input,
+    T*       output,
     int num_tokens,
     int head_dim,
     int group_size);
+
+template <typename T>
+inline void quant_dequant_roundtrip_keys(
+    const T* input,
+    T*       output,
+    int num_channels,
+    int group_size)
+{
+    quant_dequant_roundtrip_keys_submit<T>(input, output, num_channels, group_size)
+        .wait_and_throw();
+}
+
+template <typename T>
+inline void quant_dequant_roundtrip_values(
+    const T* input,
+    T*       output,
+    int num_tokens,
+    int head_dim,
+    int group_size)
+{
+    quant_dequant_roundtrip_values_submit<T>(input, output, num_tokens,
+                                             head_dim, group_size)
+        .wait_and_throw();
+}

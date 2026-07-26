@@ -19,6 +19,8 @@ def generate(
     group_size: int = 32,
     residual_length: int = 128,
     device: str = "xpu",
+    serving: str = "rebuild",
+    async_flush: bool = True,
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     do_sample: bool = False,
@@ -38,6 +40,10 @@ def generate(
         group_size:       Quantization group size G (default 32).
         residual_length:  FP32 residual window R (default 128).
         device:           XPU device for quantization (default "xpu").
+        serving:          "rebuild" (packed-resident, memory-honest) or
+                          "cached" (FP serving copy kept, fastest) — see
+                          KiviCache.
+        async_flush:      Overlap flush kernels with the next forward pass.
         temperature:      Sampling temperature (1.0 = greedy with do_sample=False).
         top_k:            Top-k filtering (None = disabled).
         do_sample:        Whether to sample (False = greedy argmax).
@@ -52,7 +58,8 @@ def generate(
     """
     cache = KiviCache.from_model(
         model, device=device, group_size=group_size,
-        residual_length=residual_length,
+        residual_length=residual_length, serving=serving,
+        async_flush=async_flush,
     )
 
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids

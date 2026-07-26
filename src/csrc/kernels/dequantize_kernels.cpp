@@ -5,8 +5,12 @@
 //
 // One work-item per packed byte (4 output values). No reduction is needed
 // here (scale/zero are already computed), so the only optimization that
-// applies is vectorizing the unpack+store as a single float4 write instead
+// applies is vectorizing the unpack+store as a single 4-wide write instead
 // of four scalar stores.
+//
+// Templated on element type T; explicit instantiations for float and
+// sycl::half at the bottom. scales/zeros are read as T and promoted to
+// float for the multiply-add.
 // ==========================================================================
 
 #include "dequantize_kernels.hpp"
@@ -14,26 +18,28 @@
 
 namespace {
 
+template <typename T>
 inline void unpack_and_store(
     uint8_t packed, float scale, float zero,
-    float* __restrict__ output, int out_base)
+    T* __restrict__ output, int out_base)
 {
-    sycl::vec<float, 4> vals;
+    sycl::vec<T, 4> vals;
     #pragma unroll
     for (int j = 0; j < 4; ++j) {
         uint8_t qi = (packed >> (j * 2)) & 0x3;
-        vals[j] = static_cast<float>(qi) * scale + zero;
+        vals[j] = static_cast<T>(static_cast<float>(qi) * scale + zero);
     }
-    vals.store(0, sycl::global_ptr<float>(output + out_base));
+    vals.store(0, sycl::global_ptr<T>(output + out_base));
 }
 
 }  // namespace
 
+template <typename T>
 sycl::event dequantize_keys_per_channel_submit(
     const uint8_t* __restrict__ input,
-    const float*   __restrict__ scales,
-    const float*   __restrict__ zeros,
-    float*         __restrict__ output,
+    const T*       __restrict__ scales,
+    const T*       __restrict__ zeros,
+    T*             __restrict__ output,
     int num_channels,
     int group_size)
 {
@@ -53,8 +59,8 @@ sycl::event dequantize_keys_per_channel_submit(
                 int ch         = idx / bytes_per_channel;
                 int byte_in_ch = idx % bytes_per_channel;
 
-                float scale    = scales[ch];
-                float zero     = zeros[ch];
+                float scale    = static_cast<float>(scales[ch]);
+                float zero     = static_cast<float>(zeros[ch]);
                 uint8_t packed = input[idx];
 
                 int out_base = ch * group_size + byte_in_ch * 4;
@@ -63,24 +69,12 @@ sycl::event dequantize_keys_per_channel_submit(
     });
 }
 
-void dequantize_keys_per_channel(
-    const uint8_t* __restrict__ input,
-    const float*   __restrict__ scales,
-    const float*   __restrict__ zeros,
-    float*         __restrict__ output,
-    int num_channels,
-    int group_size)
-{
-    dequantize_keys_per_channel_submit(input, scales, zeros, output,
-                                        num_channels, group_size)
-        .wait_and_throw();
-}
-
+template <typename T>
 sycl::event dequantize_values_per_token_submit(
     const uint8_t* __restrict__ input,
-    const float*   __restrict__ scales,
-    const float*   __restrict__ zeros,
-    float*         __restrict__ output,
+    const T*       __restrict__ scales,
+    const T*       __restrict__ zeros,
+    T*             __restrict__ output,
     int num_groups,
     int group_size)
 {
@@ -100,8 +94,8 @@ sycl::event dequantize_values_per_token_submit(
                 int group_idx   = byte_idx / bytes_per_group;
                 int byte_in_grp = byte_idx % bytes_per_group;
 
-                float scale    = scales[group_idx];
-                float zero     = zeros[group_idx];
+                float scale    = static_cast<float>(scales[group_idx]);
+                float zero     = static_cast<float>(zeros[group_idx]);
                 uint8_t packed = input[byte_idx];
 
                 int out_base = group_idx * group_size + byte_in_grp * 4;
@@ -110,15 +104,12 @@ sycl::event dequantize_values_per_token_submit(
     });
 }
 
-void dequantize_values_per_token(
-    const uint8_t* __restrict__ input,
-    const float*   __restrict__ scales,
-    const float*   __restrict__ zeros,
-    float*         __restrict__ output,
-    int num_groups,
-    int group_size)
-{
-    dequantize_values_per_token_submit(input, scales, zeros, output,
-                                        num_groups, group_size)
-        .wait_and_throw();
-}
+// Explicit instantiations — the only element types the ops layer dispatches.
+template sycl::event dequantize_keys_per_channel_submit<float>(
+    const uint8_t*, const float*, const float*, float*, int, int);
+template sycl::event dequantize_keys_per_channel_submit<sycl::half>(
+    const uint8_t*, const sycl::half*, const sycl::half*, sycl::half*, int, int);
+template sycl::event dequantize_values_per_token_submit<float>(
+    const uint8_t*, const float*, const float*, float*, int, int);
+template sycl::event dequantize_values_per_token_submit<sycl::half>(
+    const uint8_t*, const sycl::half*, const sycl::half*, sycl::half*, int, int);
