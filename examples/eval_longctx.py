@@ -70,9 +70,12 @@ def run_fp_baseline(model, input_ids, num_gen_tokens):
     return elapsed, fp_bytes, num_layers
 
 
-def run_kivi(model, input_ids, num_gen_tokens, G, R, serving="rebuild"):
+def run_kivi(model, input_ids, num_gen_tokens, G, R, serving="rebuild",
+             key_flush="drain", prefill_chunk=None):
     cache = KiviCache.from_model(model, device="xpu", group_size=G,
-                                 residual_length=R, serving=serving)
+                                 residual_length=R, serving=serving,
+                                 key_flush=key_flush,
+                                 prefill_chunk=prefill_chunk)
     with torch.no_grad():
         out = model(input_ids, use_cache=True)
     cache.add_tokens(out.past_key_values)
@@ -98,6 +101,19 @@ def main():
     parser.add_argument("--gen", type=int, default=64, help="Tokens to generate after prefill")
     parser.add_argument("--G", type=int, default=32, help="Quantization group size")
     parser.add_argument("--R", type=int, default=128, help="Residual window size")
+    parser.add_argument("--key-flush", choices=["drain", "reset"], default="drain",
+                        dest="key_flush",
+                        help="drain: quantize a group at a time, key window "
+                             "averages ~R (this repo's original policy). "
+                             "reset: quantize the whole key buffer at R and "
+                             "leave it empty, averaging R/2 (paper-faithful, "
+                             "compresses better). Requires R %% G == 0.")
+    parser.add_argument("--prefill-chunk", type=int, default=None,
+                        dest="prefill_chunk",
+                        help="Ingest a long prompt in slices of this many "
+                             "tokens, harvesting between them. Bounds peak "
+                             "memory; packed output is unchanged. Must be a "
+                             "multiple of G and >= R. Default: one submission.")
     parser.add_argument("--serving", choices=["rebuild", "cached"], default="rebuild",
                         help="rebuild: dequantize history on every read (keeps the "
                              "memory win). cached: retain a persistent FP history copy "
@@ -134,9 +150,10 @@ def main():
     print(f"  {args.gen - 1} tokens in {fp_elapsed:.2f}s ({fp_toks:.1f} tok/s), prefill excluded")
     print(f"  Resident KV, all {num_layers} layers (analytical): {fp_bytes/1024/1024:.1f} MB")
 
-    print(f"\n--- KIVI 2-bit (serving={args.serving}) ---")
+    print(f"\n--- KIVI 2-bit (serving={args.serving}, key_flush={args.key_flush}) ---")
     kivi_elapsed, stats = run_kivi(model, input_ids.clone(), args.gen, args.G,
-                                   args.R, args.serving)
+                                   args.R, args.serving, args.key_flush,
+                                   args.prefill_chunk)
     kivi_toks = (args.gen - 1) / kivi_elapsed
     print(f"  {args.gen - 1} tokens in {kivi_elapsed:.2f}s ({kivi_toks:.1f} tok/s)")
     print(f"  Layer 0, measured: packed {stats['packed_bytes']/1024:.1f} KB + "
@@ -146,23 +163,46 @@ def main():
     if stats["serving_copy_bytes"]:
         print(f"  Layer 0, persistent FP serving copy: "
               f"{stats['serving_copy_bytes']/1024:.1f} KB (counted against compression)")
+    print(f"  Layer 0, mean FP window: keys {stats['mean_residual_tokens']:.1f} "
+          f"tok, values {stats['mean_residual_tokens_v']:.1f} tok "
+          f"(rho_mean {stats['rho_mean']:.4f})")
 
     # Every layer holds identically shaped tensors, so scaling layer 0 by the
     # layer count is exact — and it is the only way to compare against the
     # all-layers FP figure above without mixing scopes.
     kivi_total = (stats["kivi_bytes"] + stats["serving_copy_bytes"]) * num_layers
     fp_total = stats["fp_baseline_bytes"] * num_layers
+    peak_total = stats["peak_bytes"] * num_layers
 
     print(f"\n{'='*64}")
     print(f"Summary @ ctx={args.ctx}, gen={args.gen}, G={args.G}, R={args.R}, "
-          f"serving={args.serving}")
+          f"serving={args.serving}, key_flush={args.key_flush}, "
+          f"prefill_chunk={args.prefill_chunk}")
     print(f"  Throughput:  FP {fp_toks:.1f} tok/s  ->  KIVI {kivi_toks:.1f} tok/s "
           f"({(kivi_toks/fp_toks - 1) * 100:+.0f}%)")
     print(f"  Resident KV, all {num_layers} layers (measured):")
     print(f"    FP baseline: {fp_total/1024/1024:8.1f} MB")
     print(f"    KIVI:        {kivi_total/1024/1024:8.1f} MB")
     print(f"    Saved:       {(fp_total - kivi_total)/1024/1024:8.1f} MB "
-          f"({stats['compression']:.2f}x compression)")
+          f"({stats['compression']:.2f}x compression, final step)")
+    # Compare configurations on this line, not the one above: a single
+    # instantaneous reading depends on where in the flush cycle the run
+    # stopped, and under key_flush="reset" the key window sweeps 0..R.
+    print(f"    Time-averaged over {stats['compression_samples']} steps: "
+          f"{stats['mean_compression']:.2f}x")
+    # KIVI's headline memory claim is PEAK, not resident. Reporting only the
+    # resident line against it would be comparing two different metrics —
+    # the error class recorded in docs/status_and_roadmap.md §2.1.
+    print(f"  Peak KV, all {num_layers} layers (measured high-water mark,")
+    print(f"  incl. in-flight flush inputs + the FP view served to the model):")
+    print(f"    KIVI peak:   {peak_total/1024/1024:8.1f} MB "
+          f"({stats['peak_compression']:.2f}x vs FP baseline)")
+    print(f"    reached at {stats['peak_at_tokens']} of "
+          f"{stats['total_tokens']} tokens")
+    if stats["peak_compression"] < 1.0:
+        print(f"    NOTE: peak exceeds the FP baseline. The resident win is "
+              f"real, but a peak-constrained\n          deployment sees no "
+              f"saving here — report both numbers, not just the first.")
     print(f"{'='*64}")
 
 

@@ -71,12 +71,16 @@ def _install_identity_shortcut(KiviCache):
     a token mismatch; only the quantization noise is removed."""
     submit_flush = KiviCache._submit_flush
 
-    def _submit_flush(self, layer_idx, flush_len):
+    def _submit_flush(self, layer_idx, flush_len_k, flush_len_v=None):
+        if flush_len_v is None:
+            flush_len_v = flush_len_k
         shadow = self.__dict__.setdefault("_identity_shadow", {})
         k, v = shadow.setdefault(layer_idx, ([], []))
-        k.append(self.res_keys[layer_idx][:, :, :flush_len, :].clone())
-        v.append(self.res_values[layer_idx][:, :, :flush_len, :].clone())
-        submit_flush(self, layer_idx, flush_len)
+        if flush_len_k:
+            k.append(self.res_keys[layer_idx][:, :, :flush_len_k, :].clone())
+        if flush_len_v:
+            v.append(self.res_values[layer_idx][:, :, :flush_len_v, :].clone())
+        submit_flush(self, layer_idx, flush_len_k, flush_len_v)
 
     def _serve_layer(self, layer_idx):
         # Chunks are stashed at *submit* time, but a chunk only becomes
@@ -84,18 +88,25 @@ def _install_identity_shortcut(KiviCache):
         # served from the FP residual. Truncating to the manager's own
         # quantized-token count keeps an in-flight async flush from being
         # served twice.
-        n = self._quant_token_count[layer_idx]
+        # Key and value histories advance at different rates under
+        # key_flush="reset", so each side is truncated to its own count.
+        n_k = self._quant_token_count[layer_idx]
+        n_v = self._quant_token_count_v[layer_idx]
         res_k, res_v = self.res_keys[layer_idx], self.res_values[layer_idx]
         n_res = res_k.shape[2] if res_k is not None else 0
-        if n == 0:
+        if n_k == 0 and n_v == 0:
             return (res_k, res_v) if n_res else (None, None)
         k, v = self.__dict__["_identity_shadow"][layer_idx]
-        hist_k = torch.cat(k, dim=2)[:, :, :n, :]
-        hist_v = torch.cat(v, dim=2)[:, :, :n, :]
-        if not n_res:
-            return hist_k, hist_v
-        return (torch.cat([hist_k, res_k], dim=2),
-                torch.cat([hist_v, res_v], dim=2))
+
+        def _side(chunks, n, res):
+            if n == 0:
+                return res
+            hist = torch.cat(chunks, dim=2)[:, :, :n, :]
+            if res is None or res.shape[2] == 0:
+                return hist
+            return torch.cat([hist, res], dim=2)
+
+        return _side(k, n_k, res_k), _side(v, n_v, res_v)
 
     KiviCache._submit_flush = _submit_flush
     KiviCache._serve_layer = _serve_layer
@@ -131,6 +142,14 @@ def main():
                         help="small residual on purpose: forces flushes early")
     parser.add_argument("--identity", action="store_true",
                         help="lossless flush — output must match FP32 exactly")
+    parser.add_argument("--key-flush", choices=["drain", "reset"],
+                        default="drain", dest="key_flush",
+                        help="reset is the paper's key window (quantize the "
+                             "whole buffer at R, leave it empty). Worth running "
+                             "with --identity: it drives the key and value "
+                             "stores to different lengths, so any slip in the "
+                             "split token counters shows up as a token "
+                             "mismatch. Requires R %% G == 0.")
     parser.add_argument("--prompt", default="In a shocking finding, scientists "
                         "discovered a herd of unicorns living in a remote "
                         "valley. The unicorns were")
@@ -156,11 +175,13 @@ def main():
     print(ref_text)
 
     mode = "identity (lossless)" if args.identity else "2-bit reference"
-    print(f"\n--- KIVI pipeline on CPU [{mode}, G={args.G}, R={args.R}] ---")
+    print(f"\n--- KIVI pipeline on CPU [{mode}, G={args.G}, R={args.R}, "
+          f"key_flush={args.key_flush}] ---")
     kivi_text = generate(model, tokenizer, args.prompt,
                          max_new_tokens=args.tokens,
                          group_size=args.G, residual_length=args.R,
-                         device="cpu", do_sample=False)
+                         device="cpu", do_sample=False,
+                         key_flush=args.key_flush)
     print(kivi_text)
 
     kivi_ids = tokenizer(kivi_text, return_tensors="pt").input_ids[0]

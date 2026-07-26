@@ -21,6 +21,8 @@ def generate(
     device: str = "xpu",
     serving: str = "rebuild",
     async_flush: bool = True,
+    key_flush: str = "drain",
+    prefill_chunk: Optional[int] = None,
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     do_sample: bool = False,
@@ -43,7 +45,12 @@ def generate(
         serving:          "rebuild" (packed-resident, memory-honest) or
                           "cached" (FP serving copy kept, fastest) — see
                           KiviCache.
+        prefill_chunk:    Ingest prompts longer than this in slices, bounding
+                          peak memory. None = single submission. See KiviCache.
         async_flush:      Overlap flush kernels with the next forward pass.
+        key_flush:        "drain" (default) or "reset" — the paper-faithful
+                          key window, averaging R/2 instead of ~R. See
+                          KiviCache.
         temperature:      Sampling temperature (1.0 = greedy with do_sample=False).
         top_k:            Top-k filtering (None = disabled).
         do_sample:        Whether to sample (False = greedy argmax).
@@ -59,7 +66,8 @@ def generate(
     cache = KiviCache.from_model(
         model, device=device, group_size=group_size,
         residual_length=residual_length, serving=serving,
-        async_flush=async_flush,
+        async_flush=async_flush, key_flush=key_flush,
+        prefill_chunk=prefill_chunk,
     )
 
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids

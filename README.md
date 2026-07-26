@@ -32,6 +32,76 @@ layers (`get_stats()` reports one layer; every layer holds identically shaped te
 scaling by the layer count is exact). Throughput excludes prefill on both paths and counts
 only tokens produced inside the timed region.
 
+**Decode-cost figures are single runs and are noisy.** Repeat runs of an *identical*
+configuration on this part have landed as far apart as −12% and −28%; the observed range
+across all configurations is −12% to −28%, which is wider than any difference between the
+configurations themselves. Treat every decode-cost number here as one sample from that
+band, not as a measurement that distinguishes two settings. Resolving differences of this
+size needs repeated runs with a median and a spread — not yet done. The memory columns do
+not have this problem: they are deterministic byte counts, subject only to the sampling
+phase noted below.
+
+### Resident is not peak
+
+Every figure above is **resident** — what the cache occupies between steps. KIVI's own
+headline memory claim (2.6× for Llama-2-7B) is **peak**. They are different metrics, and
+on this design they point in opposite directions.
+
+A flush holds its tokens in three places until it is harvested: the FP residual, the
+retained device-side kernel inputs, and the packed output. In steady-state decode that is
+one group and is negligible. During bulk prefill it covers the prompt's entire grouped
+part. Measured on TinyLlama-1.1B at ctx 1792, G=32, R=128, all 22 layers:
+
+| | resident | peak | peak vs FP |
+|---|---|---|---|
+| FP baseline | 88.0 MB | — | 1.00× |
+| KIVI | 15.8 MB (5.69×) | 159.0 MB | **0.55×** |
+| KIVI, `prefill_chunk=256` | 15.8 MB (5.69×) | 103.8 MB | **0.85×** |
+
+At its worst moment an unmitigated bulk prefill uses **1.8× the full-precision baseline**,
+while resident sits 5.7× below it. `prefill_chunk=N` ingests a long prompt in slices of N,
+harvesting between them, which bounds the transient to one slice; the packed store is
+bit-identical either way, since slice boundaries are multiples of G and the quantization
+groups do not move. It is off by default, so the table above is unaffected.
+
+The residue at 0.85× is the full-precision reconstruction served to the model on every
+step. Chunking cannot reach it — only fusing dequantization into attention can, which is
+the same missing kernel that accounts for roughly half the decode cost. `get_stats()`
+reports `peak_bytes`, `peak_at_tokens` and `peak_compression` alongside the resident
+figures; peak is a measured lower bound (torch's own temporaries inside `torch.cat` are
+not counted).
+
+### Key-window flush policy
+
+The paper quantizes the whole key residual when it reaches R and leaves the buffer empty,
+so the key window averages R/2. This implementation defaults to draining one group at a
+time, which averages ≈R — roughly twice the paper's full-precision key window.
+`key_flush="reset"` selects the paper's policy (requires `R % G == 0`):
+
+| `key_flush` | mean key window | compression (time-averaged) |
+|---|---|---|
+| `"drain"` (default) | 111.5 tok | 5.69× |
+| `"reset"` (paper) | 63.5 tok | **6.07×** |
+
+Measured at TinyLlama-1.1B, ctx 1792 + 256 generated, G=32, R=128. The key window halves
+as predicted (63.5 against R/2 = 64), for **+6.7% compression**. No throughput column: see
+the measurement caveats below — single runs on this part cannot resolve a difference this
+size.
+
+**Two things will produce wrong numbers if you skip them.**
+
+*Compare with `mean_compression`, not `compression`.* The latter is a single instantaneous
+reading, and the residual window sawtooths, so where a run happens to stop moves it by
+±4%. At the exact context above both policies coincidentally report the same 5.58×, hiding
+the whole 6.7% difference. This affects the model/context table further up too: those rows
+are single readings, so each carries roughly ±4% of phase noise.
+
+*Generate at least 2R tokens before trusting a `"reset"` measurement.* The key window
+cycles over R steps. A run shorter than that samples only the low-occupancy start of the
+ramp and reports compression that is too good — at `--gen 64` with R=128 the mean key
+window reads 31.5 instead of its true 63.5, inflating compression to 6.37×. `"drain"`
+cycles every G steps and is not affected.
+
 ### Compression does not depend on the model
 
 The architectures above span 12 → 2 KV heads and 12 → 24 layers, but that variation does
