@@ -76,13 +76,16 @@ class ChatSession:
     """
 
     def __init__(self, model, tokenizer, use_kivi=True, G=32, R=128,
-                 device="xpu", serving="rebuild", async_flush=True):
+                 device="xpu", serving="rebuild", async_flush=True,
+                 key_flush="drain", prefill_chunk=None):
         self.model = model
         self.tokenizer = tokenizer
         self.use_kivi = use_kivi
         self._cache_kwargs = dict(device=device, group_size=G,
                                   residual_length=R, serving=serving,
-                                  async_flush=async_flush)
+                                  async_flush=async_flush,
+                                  key_flush=key_flush,
+                                  prefill_chunk=prefill_chunk)
         self.messages = []
         self._new_cache()
 
@@ -214,6 +217,27 @@ class ChatSession:
             # conversation outgrows the residual window.
             line += (f" (nothing quantized yet — the whole conversation still "
                      f"fits in the R={self.cache.R} FP residual)")
+            return line
+
+        # Second line only once there is something to report.
+        #
+        # `mean_compression` is labelled "session avg" here, NOT
+        # "time-averaged" as in the benchmarks, and the difference matters. In
+        # eval_longctx the context is fixed, so the average removes the
+        # residual window's sawtooth and is the figure to compare configs
+        # with. A chat conversation instead grows from empty, so this average
+        # is taken across every context length the session passed through —
+        # including the early turns that fit entirely in the FP residual and
+        # compressed ~1x. It will therefore sit *below* the instantaneous
+        # figure and drift up as the conversation lengthens. That is correct,
+        # but it is a session history, not a better estimate of the current
+        # state. Do not quote it as a headline compression number.
+        peak_mb = s["peak_bytes"] * layers / 1024 / 1024
+        line += (f"\n  {s['mean_compression']:.2f}x session avg "
+                 f"(incl. early short turns) | "
+                 f"peak {peak_mb:.1f} MB ({s['peak_compression']:.2f}x vs FP) | "
+                 f"key window {s['mean_residual_tokens']:.0f} tok avg "
+                 f"[{s['key_flush']}]")
         return line
 
 
@@ -234,6 +258,16 @@ def main():
     p.add_argument("--G", type=int, default=32, help="quantization group size")
     p.add_argument("--R", type=int, default=128, help="FP residual window")
     p.add_argument("--serving", choices=["rebuild", "cached"], default="rebuild")
+    p.add_argument("--key-flush", choices=["drain", "reset"], default="drain",
+                   dest="key_flush",
+                   help="reset is the paper's key window: quantize the whole "
+                        "key buffer at R and leave it empty, averaging R/2 "
+                        "instead of ~R. Compresses better. Requires R %% G == 0")
+    p.add_argument("--prefill-chunk", type=int, default=None,
+                   dest="prefill_chunk",
+                   help="ingest long prompts in slices of this many tokens to "
+                        "bound peak memory (packed output is unchanged). Must "
+                        "be a multiple of G and >= R")
     p.add_argument("--no-kivi", action="store_true",
                    help="run a plain FP cache, for side-by-side comparison")
     p.add_argument("--system", type=str, default=None,
@@ -268,12 +302,19 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     session = ChatSession(model, tokenizer, use_kivi=use_kivi, G=args.G, R=args.R,
-                          serving=args.serving)
+                          serving=args.serving, key_flush=args.key_flush,
+                          prefill_chunk=args.prefill_chunk)
     if args.system:
         session.messages.append({"role": "system", "content": args.system})
 
-    mode = (f"KIVI 2-bit (G={args.G}, R={args.R}, serving={args.serving})"
-            if use_kivi else "FP baseline")
+    if use_kivi:
+        opts = [f"G={args.G}", f"R={args.R}", f"serving={args.serving}",
+                f"key_flush={args.key_flush}"]
+        if args.prefill_chunk:
+            opts.append(f"prefill_chunk={args.prefill_chunk}")
+        mode = f"KIVI 2-bit ({', '.join(opts)})"
+    else:
+        mode = "FP baseline"
     print(f"{BANNER}Mode: {mode}\n")
 
     interactive = sys.stdin.isatty()
