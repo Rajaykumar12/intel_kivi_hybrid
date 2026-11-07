@@ -70,9 +70,11 @@ def run_fp_baseline(model, input_ids, num_gen_tokens):
     return elapsed, fp_bytes, num_layers
 
 
-def run_kivi(model, input_ids, num_gen_tokens, G, R, serving="rebuild"):
+def run_kivi(model, input_ids, num_gen_tokens, G, R, serving="rebuild",
+             metadata_dtype="auto"):
     cache = KiviCache.from_model(model, device="xpu", group_size=G,
-                                 residual_length=R, serving=serving)
+                                 residual_length=R, serving=serving,
+                                 metadata_dtype=metadata_dtype)
     with torch.no_grad():
         out = model(input_ids, use_cache=True)
     cache.add_tokens(out.past_key_values)
@@ -102,7 +104,11 @@ def main():
                         help="rebuild: dequantize history on every read (keeps the "
                              "memory win). cached: retain a persistent FP history copy "
                              "(faster reads, trades the memory back).")
+    parser.add_argument("--metadata", choices=["fp16", "fp32"], default="fp16",
+                        help="scale/zero dtype (fp16 = default 10.67x ceiling at G=32; "
+                             "fp32 = previous 8x ceiling)")
     args = parser.parse_args()
+    meta = torch.float32 if args.metadata == "fp32" else "auto"
 
     if not torch.xpu.is_available():
         print("Error: XPU not found.")
@@ -134,9 +140,9 @@ def main():
     print(f"  {args.gen - 1} tokens in {fp_elapsed:.2f}s ({fp_toks:.1f} tok/s), prefill excluded")
     print(f"  Resident KV, all {num_layers} layers (analytical): {fp_bytes/1024/1024:.1f} MB")
 
-    print(f"\n--- KIVI 2-bit (serving={args.serving}) ---")
+    print(f"\n--- KIVI 2-bit (serving={args.serving}, metadata={args.metadata}) ---")
     kivi_elapsed, stats = run_kivi(model, input_ids.clone(), args.gen, args.G,
-                                   args.R, args.serving)
+                                   args.R, args.serving, meta)
     kivi_toks = (args.gen - 1) / kivi_elapsed
     print(f"  {args.gen - 1} tokens in {kivi_elapsed:.2f}s ({kivi_toks:.1f} tok/s)")
     print(f"  Layer 0, measured: packed {stats['packed_bytes']/1024:.1f} KB + "
@@ -155,7 +161,12 @@ def main():
 
     print(f"\n{'='*64}")
     print(f"Summary @ ctx={args.ctx}, gen={args.gen}, G={args.G}, R={args.R}, "
-          f"serving={args.serving}")
+          f"serving={args.serving}, metadata={args.metadata}")
+    rho = stats["residual_tokens"] / stats["total_tokens"]
+    m = 2 if args.metadata == "fp16" else 4
+    ceiling = 8 / (0.5 + 4 * m / args.G)
+    print(f"  Model: ceiling C={ceiling:.2f}x, rho={rho:.4f} -> predicted "
+          f"{ceiling / (1 + rho * (ceiling - 1)):.2f}x (fp32 baseline)")
     print(f"  Throughput:  FP {fp_toks:.1f} tok/s  ->  KIVI {kivi_toks:.1f} tok/s "
           f"({(kivi_toks/fp_toks - 1) * 100:+.0f}%)")
     print(f"  Resident KV, all {num_layers} layers (measured):")

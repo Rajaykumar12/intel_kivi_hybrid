@@ -14,10 +14,24 @@ store for flushed history — `KiviCache` no longer dequantizes-and-discards on 
 `get_stats()` reports **measured** resident bytes (`packed_bytes`, `residual_bytes`,
 `kivi_bytes`, `fp_baseline_bytes`, `compression`), not a projected figure.
 
-All measured 2026-07-25/26 on Intel Iris Xe Graphics, fp32, G=32, via
-`get_stats()` — every byte count is read off live tensors, none are projected.
+All measured on Intel Iris Xe Graphics, fp32 models, G=32, via `get_stats()` — every
+byte count is read off live tensors, none are projected.
 
-### Measured across models and context lengths
+### fp16 metadata (default since 2026-11-07)
+
+Scales and zeros are now stored in fp16 for every model, which lifts the G=32 ceiling
+from 8× to 10.67× (see *Raising the ceiling*). Same inputs, A/B on `--metadata`:
+
+| Model | Context | fp32 metadata | **fp16 metadata** | Formula (fp16) |
+|---|---|---|---|---|
+| TinyLlama-1.1B | 1.9k + 32 | 83.0 → 14.4 MB, 5.76× | 83.0 → **11.9 MB, 6.95×** | 6.95× |
+| Qwen2.5-0.5B-Instruct | 8k + 32 | 192.7 → 26.7 MB, 7.22× | 192.7 → **20.8 MB, 9.28×** | 9.28× |
+
+The fp32-metadata column reproduces the July measurements below exactly. Pass
+`metadata_dtype=torch.float32` (or `--metadata fp32` to the eval scripts) for the old
+behaviour.
+
+### Measured across models and context lengths (fp32 metadata, 2026-07-25/26)
 
 | Model | KV heads × head_dim | Layers | Context | Resident KV cache | Compression | Decode cost |
 |---|---|---|---|---|---|---|
@@ -78,8 +92,10 @@ exactly for all three architectures.
 
 ### Raising the ceiling
 
-The 8× ceiling is set by `G` and the metadata dtype, not the model. Metadata is currently
-fp32 and, at G=32, costs exactly as much as the 2-bit payload itself:
+The ceiling is set by `G` and the metadata dtype, not the model:
+`C = 8 / (0.5 + 4m/G)` against an fp32 baseline, with m the metadata width in bytes
+(4 for fp32, 2 for fp16). At G=32, fp32 metadata costs exactly as much as the 2-bit
+payload itself:
 
 | Group size | fp32 scales/zeros | fp16 scales/zeros |
 |---|---|---|
@@ -88,11 +104,13 @@ fp32 and, at G=32, costs exactly as much as the 2-bit payload itself:
 | G=64 | 10.67× | 12.80× |
 | G=128 | 12.80× | 14.22× |
 
-Storing scales/zeros in fp16 would lift the ceiling from 8× to 10.67× — a ~33%
-improvement on the headline figure. The fp16 kernels already exist; see
-`docs/status_and_roadmap.md` §6.2 for why this is currently blocked on this hardware.
-Raising `G` costs quality (coarser quantization groups), so it is a real trade rather
-than free headroom.
+fp16 metadata is now the default (the table at the top). It was previously blocked on
+this hardware because torch's XPU dtype-cast kernel fails on Iris Xe
+(`docs/status_and_roadmap.md` §6.2); the quantize kernels now narrow the scale and zero to
+fp16 themselves, so fp32 data with fp16 metadata never goes through that cast. For fp16
+*models* the metadata was already fp16, and their ceiling against an fp16 baseline is
+5.33×. Raising `G` costs quality (coarser quantization groups), so it is a real trade
+rather than free headroom.
 
 ### Quality
 
