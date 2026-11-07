@@ -133,19 +133,22 @@ inline void reduce_min_max_vec(
     }
 }
 
-// Round the freshly computed scale/zero through the storage dtype T before
+// Round the freshly computed scale/zero through the metadata dtype M before
 // using them, so quantize followed by dequantize (which reads them back as
-// T) is self-consistent. For T=float this is the identity.
-template <typename T>
+// M) is self-consistent. For M=float this is the identity. M is independent
+// of the element type: fp32 input with fp16 metadata narrows here, inside
+// the kernel, which never touches torch's XPU cast kernel (broken on this
+// Iris Xe stack — docs/status_and_roadmap.md §6.2).
+template <typename M>
 inline void store_scale_zero(
     float scale_f, float zero_f,
-    T* __restrict__ scales, T* __restrict__ zeros, int idx,
+    M* __restrict__ scales, M* __restrict__ zeros, int idx,
     float& scale_out, float& zero_out)
 {
-    scales[idx] = static_cast<T>(scale_f);
-    zeros[idx]  = static_cast<T>(zero_f);
-    scale_out = round_through_storage<T>(scale_f);
-    zero_out  = round_through_storage<T>(zero_f);
+    scales[idx] = static_cast<M>(scale_f);
+    zeros[idx]  = static_cast<M>(zero_f);
+    scale_out = round_through_storage<M>(scale_f);
+    zero_out  = round_through_storage<M>(zero_f);
 }
 
 // Vectorized pack: reload the same group_size elements (4 at a time)

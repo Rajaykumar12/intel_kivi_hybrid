@@ -8,9 +8,9 @@
 // applies is vectorizing the unpack+store as a single 4-wide write instead
 // of four scalar stores.
 //
-// Templated on element type T; explicit instantiations for float and
-// sycl::half at the bottom. scales/zeros are read as T and promoted to
-// float for the multiply-add.
+// Templated on element type T and metadata type M; explicit instantiations
+// at the bottom. scales/zeros are read as M and promoted to float for the
+// multiply-add.
 // ==========================================================================
 
 #include "dequantize_kernels.hpp"
@@ -34,11 +34,11 @@ inline void unpack_and_store(
 
 }  // namespace
 
-template <typename T>
+template <typename T, typename M>
 sycl::event dequantize_keys_per_channel_submit(
     const uint8_t* __restrict__ input,
-    const T*       __restrict__ scales,
-    const T*       __restrict__ zeros,
+    const M*       __restrict__ scales,
+    const M*       __restrict__ zeros,
     T*             __restrict__ output,
     int num_channels,
     int group_size)
@@ -69,11 +69,11 @@ sycl::event dequantize_keys_per_channel_submit(
     });
 }
 
-template <typename T>
+template <typename T, typename M>
 sycl::event dequantize_values_per_token_submit(
     const uint8_t* __restrict__ input,
-    const T*       __restrict__ scales,
-    const T*       __restrict__ zeros,
+    const M*       __restrict__ scales,
+    const M*       __restrict__ zeros,
     T*             __restrict__ output,
     int num_groups,
     int group_size)
@@ -104,12 +104,20 @@ sycl::event dequantize_values_per_token_submit(
     });
 }
 
-// Explicit instantiations — the only element types the ops layer dispatches.
-template sycl::event dequantize_keys_per_channel_submit<float>(
+// Explicit instantiations — the (element, metadata) pairs the ops layer
+// dispatches: fp32 with fp32 or fp16 metadata, and fp16 with fp16 metadata.
+// <half, float> is deliberately absent: widening metadata past the element
+// precision buys nothing and doubles its footprint.
+template sycl::event dequantize_keys_per_channel_submit<float, float>(
     const uint8_t*, const float*, const float*, float*, int, int);
-template sycl::event dequantize_keys_per_channel_submit<sycl::half>(
+template sycl::event dequantize_keys_per_channel_submit<float, sycl::half>(
+    const uint8_t*, const sycl::half*, const sycl::half*, float*, int, int);
+template sycl::event dequantize_keys_per_channel_submit<sycl::half, sycl::half>(
     const uint8_t*, const sycl::half*, const sycl::half*, sycl::half*, int, int);
-template sycl::event dequantize_values_per_token_submit<float>(
+
+template sycl::event dequantize_values_per_token_submit<float, float>(
     const uint8_t*, const float*, const float*, float*, int, int);
-template sycl::event dequantize_values_per_token_submit<sycl::half>(
+template sycl::event dequantize_values_per_token_submit<float, sycl::half>(
+    const uint8_t*, const sycl::half*, const sycl::half*, float*, int, int);
+template sycl::event dequantize_values_per_token_submit<sycl::half, sycl::half>(
     const uint8_t*, const sycl::half*, const sycl::half*, sycl::half*, int, int);

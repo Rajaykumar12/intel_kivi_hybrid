@@ -14,9 +14,8 @@
 // vectorizes its own min/max reduction and packing pass as 4-wide
 // loads/stores instead of scalar ones.
 //
-// Templated on element type T; explicit instantiations for float and
-// sycl::half are at the bottom of this file. Arithmetic accumulates in
-// float for both.
+// Templated on element type T and metadata type M; explicit instantiations
+// are at the bottom of this file. Arithmetic accumulates in float.
 // ==========================================================================
 
 #include "quantize_kernels.hpp"
@@ -25,12 +24,12 @@
 
 using namespace kivi::detail;
 
-template <typename T>
+template <typename T, typename M>
 sycl::event quantize_keys_per_channel_submit(
     const T* __restrict__ input,
     uint8_t* __restrict__ output,
-    T*       __restrict__ scales,
-    T*       __restrict__ zeros,
+    M*       __restrict__ scales,
+    M*       __restrict__ zeros,
     int num_channels,
     int group_size)
 {
@@ -48,8 +47,8 @@ sycl::event quantize_keys_per_channel_submit(
                 float min_val, max_val;
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
 
-                float scale = compute_scale<T>(min_val, max_val);
-                min_val = saturate_zero<T>(min_val);
+                float scale = compute_scale<M>(min_val, max_val);
+                min_val = saturate_zero<M>(min_val);
                 float scale_r, zero_r;
                 store_scale_zero(scale, min_val, scales, zeros, ch,
                                  scale_r, zero_r);
@@ -60,12 +59,12 @@ sycl::event quantize_keys_per_channel_submit(
     });
 }
 
-template <typename T>
+template <typename T, typename M>
 sycl::event quantize_values_per_token_submit(
     const T* __restrict__ input,
     uint8_t* __restrict__ output,
-    T*       __restrict__ scales,
-    T*       __restrict__ zeros,
+    M*       __restrict__ scales,
+    M*       __restrict__ zeros,
     int num_tokens,
     int head_dim,
     int group_size)
@@ -90,8 +89,8 @@ sycl::event quantize_values_per_token_submit(
                 float min_val, max_val;
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
 
-                float scale = compute_scale<T>(min_val, max_val);
-                min_val = saturate_zero<T>(min_val);
+                float scale = compute_scale<M>(min_val, max_val);
+                min_val = saturate_zero<M>(min_val);
                 float scale_r, zero_r;
                 store_scale_zero(scale, min_val, scales, zeros, gid,
                                  scale_r, zero_r);
@@ -102,12 +101,20 @@ sycl::event quantize_values_per_token_submit(
     });
 }
 
-// Explicit instantiations — the only element types the ops layer dispatches.
-template sycl::event quantize_keys_per_channel_submit<float>(
+// Explicit instantiations — the (element, metadata) pairs the ops layer
+// dispatches: fp32 with fp32 or fp16 metadata, and fp16 with fp16 metadata.
+// <half, float> is deliberately absent: widening metadata past the element
+// precision buys nothing and doubles its footprint.
+template sycl::event quantize_keys_per_channel_submit<float, float>(
     const float*, uint8_t*, float*, float*, int, int);
-template sycl::event quantize_keys_per_channel_submit<sycl::half>(
+template sycl::event quantize_keys_per_channel_submit<float, sycl::half>(
+    const float*, uint8_t*, sycl::half*, sycl::half*, int, int);
+template sycl::event quantize_keys_per_channel_submit<sycl::half, sycl::half>(
     const sycl::half*, uint8_t*, sycl::half*, sycl::half*, int, int);
-template sycl::event quantize_values_per_token_submit<float>(
+
+template sycl::event quantize_values_per_token_submit<float, float>(
     const float*, uint8_t*, float*, float*, int, int, int);
-template sycl::event quantize_values_per_token_submit<sycl::half>(
+template sycl::event quantize_values_per_token_submit<float, sycl::half>(
+    const float*, uint8_t*, sycl::half*, sycl::half*, int, int, int);
+template sycl::event quantize_values_per_token_submit<sycl::half, sycl::half>(
     const sycl::half*, uint8_t*, sycl::half*, sycl::half*, int, int, int);

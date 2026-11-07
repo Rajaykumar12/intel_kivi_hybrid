@@ -212,7 +212,7 @@ sycl::event submit_quant_keys(
     torch::Tensor& scales, torch::Tensor& zeros,
     int64_t num_channels, int group_size)
 {
-    return quantize_keys_per_channel_submit<T>(
+    return quantize_keys_per_channel_submit<T, T>(
         const_elem_ptr<T>(input), output.data_ptr<uint8_t>(),
         elem_ptr<T>(scales), elem_ptr<T>(zeros),
         static_cast<int>(num_channels), group_size);
@@ -224,7 +224,7 @@ sycl::event submit_quant_values(
     torch::Tensor& scales, torch::Tensor& zeros,
     int64_t num_tokens, int head_dim, int group_size)
 {
-    return quantize_values_per_token_submit<T>(
+    return quantize_values_per_token_submit<T, T>(
         const_elem_ptr<T>(input), output.data_ptr<uint8_t>(),
         elem_ptr<T>(scales), elem_ptr<T>(zeros),
         static_cast<int>(num_tokens), head_dim, group_size);
@@ -236,7 +236,7 @@ sycl::event submit_dequant_keys(
     torch::Tensor& zeros, torch::Tensor& output,
     int64_t num_channels, int group_size)
 {
-    return dequantize_keys_per_channel_submit<T>(
+    return dequantize_keys_per_channel_submit<T, T>(
         input.data_ptr<uint8_t>(),
         const_elem_ptr<T>(scales), const_elem_ptr<T>(zeros),
         elem_ptr<T>(output), static_cast<int>(num_channels), group_size);
@@ -248,7 +248,7 @@ sycl::event submit_dequant_values(
     torch::Tensor& zeros, torch::Tensor& output,
     int64_t num_groups, int group_size)
 {
-    return dequantize_values_per_token_submit<T>(
+    return dequantize_values_per_token_submit<T, T>(
         input.data_ptr<uint8_t>(),
         const_elem_ptr<T>(scales), const_elem_ptr<T>(zeros),
         elem_ptr<T>(output), static_cast<int>(num_groups), group_size);
@@ -259,7 +259,7 @@ sycl::event submit_roundtrip_keys(
     torch::Tensor& input, torch::Tensor& output,
     int64_t num_channels, int group_size)
 {
-    return quant_dequant_roundtrip_keys_submit<T>(
+    return quant_dequant_roundtrip_keys_submit<T, T>(
         const_elem_ptr<T>(input), elem_ptr<T>(output),
         static_cast<int>(num_channels), group_size);
 }
@@ -269,7 +269,7 @@ sycl::event submit_roundtrip_values(
     torch::Tensor& input, torch::Tensor& output,
     int64_t num_tokens, int head_dim, int group_size)
 {
-    return quant_dequant_roundtrip_values_submit<T>(
+    return quant_dequant_roundtrip_values_submit<T, T>(
         const_elem_ptr<T>(input), elem_ptr<T>(output),
         static_cast<int>(num_tokens), head_dim, group_size);
 }

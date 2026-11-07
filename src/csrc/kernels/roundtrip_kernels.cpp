@@ -26,7 +26,7 @@ inline void round_scale_zero(float& scale, float& zero)
 
 }  // namespace
 
-template <typename T>
+template <typename T, typename M>
 sycl::event quant_dequant_roundtrip_keys_submit(
     const T* __restrict__ input,
     T*       __restrict__ output,
@@ -46,16 +46,16 @@ sycl::event quant_dequant_roundtrip_keys_submit(
                 int base = ch * group_size;
                 float min_val, max_val;
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
-                float scale = compute_scale<T>(min_val, max_val);
-                min_val = saturate_zero<T>(min_val);
-                round_scale_zero<T>(scale, min_val);
+                float scale = compute_scale<M>(min_val, max_val);
+                min_val = saturate_zero<M>(min_val);
+                round_scale_zero<M>(scale, min_val);
 
                 roundtrip_vec(input, base, group_size, min_val, scale, output, base);
             });
     });
 }
 
-template <typename T>
+template <typename T, typename M>
 sycl::event quant_dequant_roundtrip_values_submit(
     const T* __restrict__ input,
     T*       __restrict__ output,
@@ -81,21 +81,29 @@ sycl::event quant_dequant_roundtrip_values_submit(
 
                 float min_val, max_val;
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
-                float scale = compute_scale<T>(min_val, max_val);
-                min_val = saturate_zero<T>(min_val);
-                round_scale_zero<T>(scale, min_val);
+                float scale = compute_scale<M>(min_val, max_val);
+                min_val = saturate_zero<M>(min_val);
+                round_scale_zero<M>(scale, min_val);
 
                 roundtrip_vec(input, base, group_size, min_val, scale, output, base);
             });
     });
 }
 
-// Explicit instantiations — the only element types the ops layer dispatches.
-template sycl::event quant_dequant_roundtrip_keys_submit<float>(
+// Explicit instantiations — the (element, metadata) pairs the ops layer
+// dispatches: fp32 with fp32 or fp16 metadata, and fp16 with fp16 metadata.
+// <half, float> is deliberately absent: widening metadata past the element
+// precision buys nothing and doubles its footprint.
+template sycl::event quant_dequant_roundtrip_keys_submit<float, float>(
     const float*, float*, int, int);
-template sycl::event quant_dequant_roundtrip_keys_submit<sycl::half>(
+template sycl::event quant_dequant_roundtrip_keys_submit<float, sycl::half>(
+    const float*, float*, int, int);
+template sycl::event quant_dequant_roundtrip_keys_submit<sycl::half, sycl::half>(
     const sycl::half*, sycl::half*, int, int);
-template sycl::event quant_dequant_roundtrip_values_submit<float>(
+
+template sycl::event quant_dequant_roundtrip_values_submit<float, float>(
     const float*, float*, int, int, int);
-template sycl::event quant_dequant_roundtrip_values_submit<sycl::half>(
+template sycl::event quant_dequant_roundtrip_values_submit<float, sycl::half>(
+    const float*, float*, int, int, int);
+template sycl::event quant_dequant_roundtrip_values_submit<sycl::half, sycl::half>(
     const sycl::half*, sycl::half*, int, int, int);
