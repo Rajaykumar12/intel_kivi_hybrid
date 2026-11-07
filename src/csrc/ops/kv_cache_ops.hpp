@@ -12,19 +12,23 @@
 // dequantize back to float, in a single kernel launch, without ever
 // materializing the packed/scales/zeros buffers. Use these instead of a
 // quantize_+dequantize_ pair whenever the packed representation itself is
-// discarded by the caller (this is the flush path's actual usage pattern —
-// see roundtrip_kernels.hpp).
+// discarded by the caller (see roundtrip_kernels.hpp).
+//
+// half_metadata=true rounds the internal scale/zero through fp16, matching
+// what quantize_* + dequantize_* produce with fp16 scales/zeros tensors.
 // --------------------------------------------------------------------------
 void kivi_quant_dequant_roundtrip_keys(
     torch::Tensor input,
     torch::Tensor output,
-    int group_size);
+    int group_size,
+    bool half_metadata = false);
 
 void kivi_quant_dequant_roundtrip_values(
     torch::Tensor input,
     torch::Tensor output,
     int head_dim,
-    int group_size);
+    int group_size,
+    bool half_metadata = false);
 
 // --------------------------------------------------------------------------
 // Non-blocking variants of every op above: submit the kernel and return a
@@ -51,10 +55,12 @@ kivi::KiviEvent kivi_dequant_values_async(
     torch::Tensor zeros, torch::Tensor output, int head_dim, int group_size);
 
 kivi::KiviEvent kivi_quant_dequant_roundtrip_keys_async(
-    torch::Tensor input, torch::Tensor output, int group_size);
+    torch::Tensor input, torch::Tensor output, int group_size,
+    bool half_metadata = false);
 
 kivi::KiviEvent kivi_quant_dequant_roundtrip_values_async(
-    torch::Tensor input, torch::Tensor output, int head_dim, int group_size);
+    torch::Tensor input, torch::Tensor output, int head_dim, int group_size,
+    bool half_metadata = false);
 
 void kivi_quant_keys(
     torch::Tensor input,

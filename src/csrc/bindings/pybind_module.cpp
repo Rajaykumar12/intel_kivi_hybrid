@@ -41,13 +41,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "straight back out, without ever materializing the packed byte, "
           "scale, or zero-point buffers. Use instead of quantize_keys + "
           "dequantize_keys whenever the packed representation itself is "
-          "discarded by the caller.",
-          py::arg("input"), py::arg("output"), py::arg("group_size"));
+          "discarded by the caller. half_metadata=True rounds the internal "
+          "scale/zero through fp16, matching quantize_keys with fp16 scales.",
+          py::arg("input"), py::arg("output"), py::arg("group_size"),
+          py::arg("half_metadata") = false);
 
     m.def("quant_dequant_roundtrip_values", &kivi_quant_dequant_roundtrip_values,
           "Fused quantize->dequantize round-trip (per-token). See "
           "quant_dequant_roundtrip_keys.",
-          py::arg("input"), py::arg("output"), py::arg("head_dim"), py::arg("group_size"));
+          py::arg("input"), py::arg("output"), py::arg("head_dim"), py::arg("group_size"),
+          py::arg("half_metadata") = false);
 
     // --- Non-blocking variants: submit and return a KiviEvent immediately.
     // Caller must call .wait() on the returned event before reading output
@@ -74,9 +77,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("quant_dequant_roundtrip_keys_async", &kivi_quant_dequant_roundtrip_keys_async,
           "Non-blocking quant_dequant_roundtrip_keys — returns a KiviEvent, does not wait.",
-          py::arg("input"), py::arg("output"), py::arg("group_size"));
+          py::arg("input"), py::arg("output"), py::arg("group_size"),
+          py::arg("half_metadata") = false);
 
     m.def("quant_dequant_roundtrip_values_async", &kivi_quant_dequant_roundtrip_values_async,
           "Non-blocking quant_dequant_roundtrip_values — returns a KiviEvent, does not wait.",
-          py::arg("input"), py::arg("output"), py::arg("head_dim"), py::arg("group_size"));
+          py::arg("input"), py::arg("output"), py::arg("head_dim"), py::arg("group_size"),
+          py::arg("half_metadata") = false);
 }
