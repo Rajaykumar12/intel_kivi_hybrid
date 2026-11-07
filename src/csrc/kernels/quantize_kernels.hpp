@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <sycl/sycl.hpp>
+#include "kivi/layout.hpp"
 
 // --------------------------------------------------------------------------
 // All kernels are templated on the element type T and the metadata type M
@@ -30,7 +31,8 @@ sycl::event quantize_keys_per_channel_submit(
     M*        scales,
     M*        zeros,
     int num_channels,
-    int group_size);
+    int group_size,
+    kivi::KiviLayout layout);
 
 template <typename T, typename M>
 sycl::event quantize_values_per_token_submit(
@@ -40,7 +42,8 @@ sycl::event quantize_values_per_token_submit(
     M*        zeros,
     int num_tokens,
     int head_dim,
-    int group_size);
+    int group_size,
+    kivi::KiviLayout layout);
 
 // --------------------------------------------------------------------------
 // 1. KEY QUANTIZATION — Per-Channel Asymmetric 2-bit
@@ -66,7 +69,8 @@ inline void quantize_keys_per_channel(
     int group_size)
 {
     quantize_keys_per_channel_submit<T, M>(input, output, scales, zeros,
-                                        num_channels, group_size)
+                                        num_channels, group_size,
+                                        kivi::KiviLayout::contiguous(num_channels))
         .wait_and_throw();
 }
 
@@ -90,7 +94,9 @@ inline void quantize_values_per_token(
     int head_dim,
     int group_size)
 {
-    quantize_values_per_token_submit<T, M>(input, output, scales, zeros,
-                                        num_tokens, head_dim, group_size)
+    quantize_values_per_token_submit<T, M>(
+        input, output, scales, zeros, num_tokens, head_dim, group_size,
+        kivi::KiviLayout::contiguous(
+            static_cast<int64_t>(num_tokens) * (head_dim / group_size)))
         .wait_and_throw();
 }

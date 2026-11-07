@@ -114,7 +114,7 @@ inline float saturate_zero<sycl::half>(float zero)
 // (by kv_cache_ops.cpp validation) to be a multiple of 4.
 template <typename T>
 inline void reduce_min_max_vec(
-    const T* __restrict__ input, int base, int group_size,
+    const T* __restrict__ input, int64_t base, int group_size,
     float& min_val, float& max_val)
 {
     min_val = 1e30f;
@@ -142,7 +142,7 @@ inline void reduce_min_max_vec(
 template <typename M>
 inline void store_scale_zero(
     float scale_f, float zero_f,
-    M* __restrict__ scales, M* __restrict__ zeros, int idx,
+    M* __restrict__ scales, M* __restrict__ zeros, int64_t idx,
     float& scale_out, float& zero_out)
 {
     scales[idx] = static_cast<M>(scale_f);
@@ -155,9 +155,9 @@ inline void store_scale_zero(
 // and write one packed byte per 4 values.
 template <typename T>
 inline void pack_vec(
-    const T* __restrict__ input, int base, int group_size,
+    const T* __restrict__ input, int64_t base, int group_size,
     float min_val, float scale,
-    uint8_t* __restrict__ output, int out_base)
+    uint8_t* __restrict__ output, int64_t out_base)
 {
     for (int i = 0; i < group_size; i += 4) {
         sycl::vec<T, 4> v;
@@ -178,9 +178,9 @@ inline void pack_vec(
 // reconstructed value straight back out. No packed byte is ever stored.
 template <typename T>
 inline void roundtrip_vec(
-    const T* __restrict__ input, int base, int group_size,
+    const T* __restrict__ input, int64_t base, int group_size,
     float min_val, float scale,
-    T* __restrict__ output, int out_base)
+    T* __restrict__ output, int64_t out_base)
 {
     for (int i = 0; i < group_size; i += 4) {
         sycl::vec<T, 4> v;

@@ -17,6 +17,7 @@
 
 #include "kv_cache_ops.hpp"
 #include "kivi/common.hpp"
+#include "kivi/layout.hpp"
 #include "kernels/quantize_kernels.hpp"
 #include "kernels/dequantize_kernels.hpp"
 #include "kernels/roundtrip_kernels.hpp"
@@ -67,15 +68,103 @@ torch::ScalarType meta_dtype_of(const torch::Tensor& scales,
     return mdt;
 }
 
+// ---------------------------------------------------------------------------
+// Output layout for the quantize ops (see kivi/layout.hpp).
+//
+// Contiguous outputs keep the original flat addressing and any shape whose
+// numel matches. Non-contiguous outputs are views into a preallocated arena:
+// each must be `rows` equally spaced rows whose trailing `inner_dims` dims are
+// contiguous (keys: the token-group axis, inner_dims=1; values: the token and
+// channel-group axes, inner_dims=2). packed, scales and zeros must agree on
+// the row count, and zeros must have exactly the scales' strides.
+// ---------------------------------------------------------------------------
+
+struct RowView {
+    int64_t rows;
+    int64_t row_len;     // elements per row (product of the inner dims)
+    int64_t row_stride;  // elements between consecutive rows
+};
+
+RowView row_view(const torch::Tensor& t, int inner_dims, const char* name)
+{
+    const int64_t nd = t.dim();
+    TORCH_CHECK(nd > inner_dims, name, ": a strided output needs more than ",
+                inner_dims, " dims, got shape ", t.sizes());
+    auto sz = t.sizes();
+    auto st = t.strides();
+
+    // Inner dims: dense, row-major. Size-1 dims carry no stride information.
+    int64_t expect = 1;
+    for (int64_t d = nd - 1; d >= nd - inner_dims; --d) {
+        TORCH_CHECK(sz[d] == 1 || st[d] == expect, name,
+                    ": the trailing ", inner_dims, " dim(s) must be contiguous; "
+                    "shape ", sz, " strides ", st);
+        expect *= sz[d];
+    }
+    const int64_t row_len = expect;
+
+    // Outer dims: collapse into one evenly strided row axis.
+    int64_t rows = 1, row_stride = 0, next = -1;
+    for (int64_t d = nd - inner_dims - 1; d >= 0; --d) {
+        if (sz[d] == 1) continue;
+        if (next < 0) {
+            row_stride = st[d];
+        } else {
+            TORCH_CHECK(st[d] == next, name,
+                        ": leading dims must collapse into evenly spaced rows; "
+                        "shape ", sz, " strides ", st);
+        }
+        rows *= sz[d];
+        next = st[d] * sz[d];
+    }
+    TORCH_CHECK(rows == 1 || row_stride >= row_len, name,
+                ": rows overlap (row stride ", row_stride, " < row length ",
+                row_len, ")");
+    return RowView{rows, row_len, row_stride};
+}
+
+kivi::KiviLayout derive_quant_layout(
+    const torch::Tensor& output, const torch::Tensor& scales,
+    const torch::Tensor& zeros, int inner_dims, int group_size,
+    int64_t num_groups)
+{
+    if (output.is_contiguous() && scales.is_contiguous() && zeros.is_contiguous())
+        return kivi::KiviLayout::contiguous(num_groups);
+
+    TORCH_CHECK(zeros.sizes() == scales.sizes() && zeros.strides() == scales.strides(),
+                "zeros must have the same shape and strides as scales");
+    RowView p = row_view(output, inner_dims, "output");
+    RowView m = row_view(scales, inner_dims, "scales");
+    TORCH_CHECK(p.rows == m.rows, "output and scales disagree on the row count (",
+                p.rows, " vs ", m.rows, ")");
+    TORCH_CHECK(p.row_len == m.row_len * (group_size / 4),
+                "output row length (", p.row_len, ") must be scales row length (",
+                m.row_len, ") * group_size/4");
+    TORCH_CHECK(m.rows * m.row_len == num_groups,
+                "strided outputs cover ", m.rows * m.row_len,
+                " groups but the input has ", num_groups);
+    return kivi::KiviLayout{m.row_len, p.row_stride, m.row_stride};
+}
+
+// dtype + kernel accessibility, without the contiguity requirement — for
+// quantize outputs, which may be arena views (validated by derive_quant_layout).
+void check_output_tensor(const torch::Tensor& t, const char* name,
+                         torch::ScalarType dtype)
+{
+    TORCH_CHECK(t.scalar_type() == dtype, name, " must be ", torch::toString(dtype),
+                " but got ", torch::toString(t.scalar_type()));
+    kivi::check_kernel_accessible(t, name);
+}
+
 int64_t validate_quant_keys_args(
     const torch::Tensor& input, const torch::Tensor& output,
     const torch::Tensor& scales, const torch::Tensor& zeros,
     int group_size, torch::ScalarType dt, torch::ScalarType mdt)
 {
     kivi::check_tensor(input,  "input",  dt);
-    kivi::check_tensor(output, "output", torch::kUInt8);
-    kivi::check_tensor(scales, "scales", mdt);
-    kivi::check_tensor(zeros,  "zeros",  mdt);
+    check_output_tensor(output, "output", torch::kUInt8);
+    check_output_tensor(scales, "scales", mdt);
+    check_output_tensor(zeros,  "zeros",  mdt);
     TORCH_CHECK(group_size > 0 && group_size % 4 == 0,
                 "group_size must be positive and divisible by 4, got ", group_size);
 
@@ -101,9 +190,9 @@ int64_t validate_quant_values_args(
     int head_dim, int group_size, torch::ScalarType dt, torch::ScalarType mdt)
 {
     kivi::check_tensor(input,  "input",  dt);
-    kivi::check_tensor(output, "output", torch::kUInt8);
-    kivi::check_tensor(scales, "scales", mdt);
-    kivi::check_tensor(zeros,  "zeros",  mdt);
+    check_output_tensor(output, "output", torch::kUInt8);
+    check_output_tensor(scales, "scales", mdt);
+    check_output_tensor(zeros,  "zeros",  mdt);
     TORCH_CHECK(group_size > 0 && group_size % 4 == 0,
                 "group_size must be positive and divisible by 4");
     TORCH_CHECK(head_dim > 0 && head_dim % group_size == 0,
@@ -230,24 +319,24 @@ template <typename T, typename M>
 sycl::event submit_quant_keys(
     torch::Tensor& input, torch::Tensor& output,
     torch::Tensor& scales, torch::Tensor& zeros,
-    int64_t num_channels, int group_size)
+    int64_t num_channels, int group_size, kivi::KiviLayout layout)
 {
     return quantize_keys_per_channel_submit<T, M>(
         const_elem_ptr<T>(input), output.data_ptr<uint8_t>(),
         elem_ptr<M>(scales), elem_ptr<M>(zeros),
-        static_cast<int>(num_channels), group_size);
+        static_cast<int>(num_channels), group_size, layout);
 }
 
 template <typename T, typename M>
 sycl::event submit_quant_values(
     torch::Tensor& input, torch::Tensor& output,
     torch::Tensor& scales, torch::Tensor& zeros,
-    int64_t num_tokens, int head_dim, int group_size)
+    int64_t num_tokens, int head_dim, int group_size, kivi::KiviLayout layout)
 {
     return quantize_values_per_token_submit<T, M>(
         const_elem_ptr<T>(input), output.data_ptr<uint8_t>(),
         elem_ptr<M>(scales), elem_ptr<M>(zeros),
-        static_cast<int>(num_tokens), head_dim, group_size);
+        static_cast<int>(num_tokens), head_dim, group_size, layout);
 }
 
 template <typename T, typename M>
@@ -326,10 +415,12 @@ sycl::event run_quant_keys(
     auto dt = float_dtype_of(input, op);
     auto mdt = meta_dtype_of(scales, zeros, dt, op);
     int64_t nc = validate_quant_keys_args(input, output, scales, zeros, group_size, dt, mdt);
+    auto layout = derive_quant_layout(output, scales, zeros, /*inner_dims=*/1,
+                                      group_size, nc);
     return dispatch_types(dt, mdt, [&](auto p) {
         using P = decltype(p);
         return submit_quant_keys<typename P::elem, typename P::meta>(
-            input, output, scales, zeros, nc, group_size);
+            input, output, scales, zeros, nc, group_size, layout);
     });
 }
 
@@ -342,10 +433,12 @@ sycl::event run_quant_values(
     auto mdt = meta_dtype_of(scales, zeros, dt, op);
     int64_t nt = validate_quant_values_args(input, output, scales, zeros,
                                             head_dim, group_size, dt, mdt);
+    auto layout = derive_quant_layout(output, scales, zeros, /*inner_dims=*/2,
+                                      group_size, nt * (head_dim / group_size));
     return dispatch_types(dt, mdt, [&](auto p) {
         using P = decltype(p);
         return submit_quant_values<typename P::elem, typename P::meta>(
-            input, output, scales, zeros, nt, head_dim, group_size);
+            input, output, scales, zeros, nt, head_dim, group_size, layout);
     });
 }
 
