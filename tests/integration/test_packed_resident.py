@@ -75,6 +75,33 @@ def test_fp_dtypes_roundtrip_error_bounded(dtype):
     assert err <= max_scale / 2 + 1e-2, f"value error {err} vs scale {max_scale}"
 
 
+@pytest.mark.parametrize("label,make", [
+    ("constant", lambda: torch.full((G,), 0.5)),
+    # range below fp16's smallest subnormal step once divided by 3
+    ("subnormal range", lambda: torch.arange(G) % 2 * 6e-8),
+    ("tiny range", lambda: 0.5 + 1e-4 * torch.arange(G)),
+])
+def test_fp16_degenerate_groups_store_nonzero_scale(label, make):
+    """fp16 metadata must never store scale == 0. With the old `+1e-10`
+    epsilon (below fp16's subnormal range) a constant group stored 0 and the
+    pack pass divided by it — correct bytes only because this GPU converts
+    NaN/inf to 0 on float->int, which is undefined behaviour."""
+    row = make().to(torch.float16)
+    x = row.expand(B, H, D, G).contiguous().to("xpu")
+    packed, scales, zeros = _quant_keys_xpu(x, torch.float16)
+    out = torch.empty_like(x)
+    kivi_native.dequantize_keys(packed, scales, zeros, out, G)
+    fused = torch.empty_like(x)
+    kivi_native.quant_dequant_roundtrip_keys(x, fused, G)
+
+    scales_c = scales.cpu().float()
+    assert (scales_c > 0).all(), f"{label}: zero scale stored"
+    out_c, x_c = out.cpu().float(), x.cpu().float()
+    assert torch.isfinite(out_c).all()
+    assert (out_c - x_c).abs().max().item() <= scales_c.max().item() / 2 + 1e-3
+    assert torch.equal(out.cpu(), fused.cpu())
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_fused_roundtrip_matches_quant_then_dequant(dtype):
     """The fused round-trip kernel must be bit-identical to quantize

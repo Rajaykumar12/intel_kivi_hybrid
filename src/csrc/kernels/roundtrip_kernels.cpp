@@ -46,7 +46,8 @@ sycl::event quant_dequant_roundtrip_keys_submit(
                 int base = ch * group_size;
                 float min_val, max_val;
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
-                float scale = (max_val - min_val) / 3.0f + 1e-10f;
+                float scale = compute_scale<T>(min_val, max_val);
+                min_val = saturate_zero<T>(min_val);
                 round_scale_zero<T>(scale, min_val);
 
                 roundtrip_vec(input, base, group_size, min_val, scale, output, base);
@@ -80,7 +81,8 @@ sycl::event quant_dequant_roundtrip_values_submit(
 
                 float min_val, max_val;
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
-                float scale = (max_val - min_val) / 3.0f + 1e-10f;
+                float scale = compute_scale<T>(min_val, max_val);
+                min_val = saturate_zero<T>(min_val);
                 round_scale_zero<T>(scale, min_val);
 
                 roundtrip_vec(input, base, group_size, min_val, scale, output, base);

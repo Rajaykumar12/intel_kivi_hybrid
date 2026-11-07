@@ -48,7 +48,8 @@ sycl::event quantize_keys_per_channel_submit(
                 float min_val, max_val;
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
 
-                float scale = (max_val - min_val) / 3.0f + 1e-10f;
+                float scale = compute_scale<T>(min_val, max_val);
+                min_val = saturate_zero<T>(min_val);
                 float scale_r, zero_r;
                 store_scale_zero(scale, min_val, scales, zeros, ch,
                                  scale_r, zero_r);
@@ -89,7 +90,8 @@ sycl::event quantize_values_per_token_submit(
                 float min_val, max_val;
                 reduce_min_max_vec(input, base, group_size, min_val, max_val);
 
-                float scale = (max_val - min_val) / 3.0f + 1e-10f;
+                float scale = compute_scale<T>(min_val, max_val);
+                min_val = saturate_zero<T>(min_val);
                 float scale_r, zero_r;
                 store_scale_zero(scale, min_val, scales, zeros, gid,
                                  scale_r, zero_r);

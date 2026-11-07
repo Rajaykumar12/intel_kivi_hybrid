@@ -61,6 +61,54 @@ inline float round_through_storage(float v)
     return static_cast<float>(sycl::bit_cast<T>(bits));
 }
 
+// Quantization step for one group, given its float min/max, for metadata
+// stored as M.
+//
+// fp32 metadata keeps the historical `range/3 + 1e-10f` exactly, so every
+// fp32 reference in the tests (and examples/cpu_sim.py) stays bit-identical.
+//
+// fp16 metadata cannot use that epsilon: 1e-10 is far below fp16's smallest
+// subnormal (~6e-8), so a constant (or near-constant) group stored scale = 0
+// and the pack pass then computed (x - min) / 0 — NaN for x == min, inf
+// otherwise — and fed it to a float->int conversion, which is undefined
+// behaviour. It only produced correct bytes because this GPU happens to
+// convert NaN/inf to 0. Flooring the step at fp16's smallest *normal* value
+// (2^-14) keeps the stored scale non-zero and exactly representable; the
+// cost is a reconstruction error of at most 2^-15 on groups whose true range
+// is below 3 * 2^-14, which is under fp16's own resolution for any value
+// above 0.5. The upper clamp keeps fp32-input ranges wider than fp16 can
+// express from storing inf.
+constexpr float kHalfMax = 65504.0f;
+constexpr float kHalfScaleFloor = 6.103515625e-05f;  // 2^-14, smallest normal fp16
+
+template <typename M>
+inline float compute_scale(float min_val, float max_val);
+
+template <>
+inline float compute_scale<float>(float min_val, float max_val)
+{
+    return (max_val - min_val) / 3.0f + 1e-10f;
+}
+
+template <>
+inline float compute_scale<sycl::half>(float min_val, float max_val)
+{
+    return sycl::clamp((max_val - min_val) / 3.0f, kHalfScaleFloor, kHalfMax);
+}
+
+// Zero-point (the group minimum) clamped to what M can hold. Identity for
+// float; for half it only bites on fp32 input with |min| > 65504, where the
+// alternative is storing +/-inf. Applied before round_through_storage so the
+// pack pass and a later dequantize use the same saturated value.
+template <typename M>
+inline float saturate_zero(float zero) { return zero; }
+
+template <>
+inline float saturate_zero<sycl::half>(float zero)
+{
+    return sycl::clamp(zero, -kHalfMax, kHalfMax);
+}
+
 // Vectorized (4-wide) min/max reduction over one channel's group_size
 // elements, done serially by a single work-item. group_size is guaranteed
 // (by kv_cache_ops.cpp validation) to be a multiple of 4.
