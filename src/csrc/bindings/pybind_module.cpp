@@ -5,6 +5,7 @@
 
 #include "ops/kv_cache_ops.hpp"
 #include "kivi/event.hpp"
+#include "kivi/usm.hpp"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "KIVI: Asymmetric 2-bit KV Cache Quantization for Intel XPU (SYCL)";
@@ -14,6 +15,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "reading any tensor the kernel writes.")
         .def("wait", &kivi::KiviEvent::wait,
              "Block until the kernel completes; rethrows any async SYCL error.");
+
+    // --- USM host memory (zero-copy on integrated GPUs; see kivi/usm.hpp)
+    m.def("alloc_usm_host",
+          [](std::vector<int64_t> sizes, at::ScalarType dtype, int64_t align) {
+              return kivi::alloc_usm_host(sizes, dtype, align);
+          },
+          "Allocate an uninitialized CPU tensor backed by SYCL USM host memory, "
+          "aligned to `align` bytes. Torch treats it as an ordinary CPU tensor; "
+          "the KIVI kernels can also read and write it directly, with no "
+          "host<->device copy.",
+          py::arg("sizes"), py::arg("dtype"), py::arg("align") = 64);
+
+    m.def("is_kernel_accessible", &kivi::is_kernel_accessible,
+          "True if KIVI kernels can dereference this tensor's memory: an XPU "
+          "tensor, or a CPU tensor allocated with alloc_usm_host.",
+          py::arg("tensor"));
 
     m.def("quantize_keys",     &kivi_quant_keys,
           "Asymmetric 2-bit key quantization (per-channel)",

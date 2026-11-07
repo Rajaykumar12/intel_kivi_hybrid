@@ -61,17 +61,37 @@ inline sycl::queue& get_queue() {
 }
 #endif  // KIVI_USE_TORCH_XPU_QUEUE
 
+// True if a kernel submitted on get_queue() may dereference `t`'s memory:
+// an XPU tensor, or a CPU tensor whose storage is a USM allocation in the
+// queue's context (see kivi/usm.hpp). An ordinary malloc-backed CPU tensor
+// is not — passing one to a kernel is undefined behaviour (a page fault or
+// silent garbage), which is why this is checked rather than assumed.
+inline bool is_kernel_accessible(const torch::Tensor& t) {
+    if (t.device().is_xpu()) return true;
+    if (!t.device().is_cpu()) return false;
+    // Empty tensors have a null data pointer and are never dereferenced.
+    if (t.numel() == 0) return true;
+    auto kind = sycl::get_pointer_type(t.data_ptr(), get_queue().get_context());
+    return kind != sycl::usm::alloc::unknown;
+}
+
+inline void check_kernel_accessible(const torch::Tensor& t, const char* name) {
+    TORCH_CHECK(is_kernel_accessible(t),
+                name, " is a ", torch::DeviceTypeName(t.device().type(), true),
+                " tensor not backed by USM, so SYCL kernels cannot read or write "
+                "it. Use an XPU tensor or allocate it with "
+                "kivi_sycl._C.alloc_usm_host().");
+}
+
+// Contiguity, dtype, and kernel accessibility (XPU, or USM-backed CPU).
 inline void check_tensor(const torch::Tensor& t, const char* name,
-                          torch::ScalarType expected_dtype,
-                          torch::DeviceType expected_device = torch::kXPU) {
+                          torch::ScalarType expected_dtype) {
     TORCH_CHECK(t.is_contiguous(),
                 name, " must be contiguous");
     TORCH_CHECK(t.scalar_type() == expected_dtype,
                 name, " must be ", torch::toString(expected_dtype),
                 " but got ", torch::toString(t.scalar_type()));
-    TORCH_CHECK(t.device().type() == expected_device,
-                name, " must be on ", torch::DeviceTypeName(expected_device, true),
-                " but got ", torch::DeviceTypeName(t.device().type(), true));
+    check_kernel_accessible(t, name);
 }
 
 }  // namespace kivi
