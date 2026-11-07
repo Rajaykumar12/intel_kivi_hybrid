@@ -462,6 +462,9 @@ kivi_sycl_native.quant_dequant_roundtrip_values(input, output, head_dim, group_s
 |---|---|---|
 | `group_size` (G) | 32 | Quantization granularity. Smaller = better quality, more metadata |
 | `residual_length` (R) | 128 | Recent FP32 tokens. Larger = better quality, less compression |
+| `metadata_dtype` | `"auto"` (fp16) | Scale/zero dtype. fp16 lifts the G=32 ceiling to 10.67×; `torch.float32` restores 8× (fp32 models only) |
+| `zero_copy` | `"auto"` | On XPU, keep the packed store in USM host memory that the kernels write directly — no host↔device copies. `False` stages through XPU tensors |
+| `cache.reserve(n)` | — | Optional: size the packed store once for an `n`-token sequence (`generate()` calls it), so it never grows and carries no spare capacity |
 
 For GPT-2 (short sequences), `R=64` is sufficient. For 7B+ models with long contexts, `R=128` is recommended per the paper.
 

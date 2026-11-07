@@ -65,6 +65,8 @@ def generate(
     )
 
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+    # Final length is known: size the packed arenas once, with no spare tail.
+    cache.reserve(input_ids.shape[1] + max_new_tokens)
 
     # Prefill
     out = model(input_ids, use_cache=True)

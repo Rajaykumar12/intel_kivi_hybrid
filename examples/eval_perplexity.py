@@ -60,6 +60,7 @@ def ppl_kivi(model, ids, G, R, metadata_dtype="auto"):
     """Token-by-token forward through KiviCache, accumulating NLL."""
     cache = KiviCache.from_model(model, device="xpu", group_size=G, residual_length=R,
                                  metadata_dtype=metadata_dtype)
+    cache.reserve(ids.shape[1])
     total_nll = 0.0
     count = 0
     with torch.no_grad():

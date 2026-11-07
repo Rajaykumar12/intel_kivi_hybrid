@@ -106,6 +106,11 @@ class _FakeNative(types.ModuleType):
         _quantize_2bit_reference(inp, out, scales, zeros, group_size)
         return _FakeEvent()
 
+    def alloc_usm_host(self, sizes, dtype, align=64):
+        # Plain CPU memory stands in for USM host memory: the fake "kernels"
+        # above are torch ops, which can write strided arena views directly.
+        return torch.empty(sizes, dtype=dtype)
+
 
 _fake_native = _FakeNative()
 
@@ -207,13 +212,16 @@ class FakeModel:
 
 def _run_generation(mode, num_steps=24, prefill=6, G=4, R=8, head_dim=8,
                     layers=2, heads=2, batch=1, serving="rebuild",
-                    async_flush=True, seed=0, metadata_dtype="auto"):
+                    async_flush=True, seed=0, metadata_dtype="auto",
+                    zero_copy="auto", reserve=None):
     torch.manual_seed(seed)
     cache = KiviCache(num_layers=layers, head_dim=head_dim,
                       num_kv_heads=heads, device="cpu",
                       group_size=G, residual_length=R,
                       serving=serving, async_flush=async_flush,
-                      metadata_dtype=metadata_dtype)
+                      metadata_dtype=metadata_dtype, zero_copy=zero_copy)
+    if reserve is not None:
+        cache.reserve(reserve)
     model = FakeModel(layers, heads, head_dim, mode, batch=batch)
 
     cache.add_tokens(model.forward(prefill))
@@ -282,13 +290,15 @@ def test_packed_store_is_resident_and_measured():
     assert cache._scales_v[i].shape == (B, H, n_hist, D // cache.G)
 
     s = cache.get_stats(layer=i)
-    expected_packed = sum(
+    used_packed = sum(
         t.numel() * t.element_size()
         for t in (cache._packed_k[i], cache._scales_k[i], cache._zeros_k[i],
                   cache._packed_v[i], cache._scales_v[i], cache._zeros_v[i]))
-    assert s["packed_bytes"] == expected_packed
+    assert s["packed_used_bytes"] == used_packed
+    # Resident = the whole arena allocation, never less than what is used.
+    assert s["packed_bytes"] == cache._arena[i].allocated_bytes >= used_packed
     assert s["serving_copy_bytes"] == 0          # rebuild mode
-    assert s["kivi_bytes"] == expected_packed + s["residual_bytes"]
+    assert s["kivi_bytes"] == s["packed_bytes"] + s["residual_bytes"]
     assert s["quantized_tokens"] == n_hist
 
 
@@ -429,7 +439,8 @@ def test_fp16_metadata_shrinks_packed_store_by_metadata_half():
     assert payload(a) == payload(b)
     assert meta(a) * 2 == meta(b)
     sa, sb = a.get_stats(0), b.get_stats(0)
-    assert sb["packed_bytes"] - sa["packed_bytes"] == meta(b) - meta(a)
+    assert sb["packed_used_bytes"] - sa["packed_used_bytes"] == meta(b) - meta(a)
+    assert sa["packed_bytes"] < sb["packed_bytes"]
     assert sa["compression"] > sb["compression"]
 
 
@@ -446,3 +457,88 @@ def test_invalid_metadata_dtype_rejected():
     with pytest.raises(AssertionError, match="metadata_dtype"):
         KiviCache(num_layers=1, head_dim=8, group_size=4, residual_length=8,
                   device="cpu", metadata_dtype=torch.bfloat16)
+
+
+# ---------------------------------------------------------------------------
+# Packed arena (Phase 1 step 10)
+# ---------------------------------------------------------------------------
+
+def test_reserve_sizes_arena_exactly_and_never_grows():
+    """With the final length known up front, the arena is allocated once at
+    the exact final quantized size: no growth copy, no spare capacity."""
+    prefill, steps, G, R = 6, 40, 4, 8
+    total = prefill + steps
+    cache, model = _run_generation("in_place", num_steps=steps, prefill=prefill,
+                                   G=G, R=R, reserve=total)
+    cache.harvest_pending()
+    arena = cache._arena[0]
+    assert arena.used == cache._quant_token_count[0]
+    assert arena.cap == arena.used, (arena.cap, arena.used)
+    s = cache.get_stats(0)
+    # Row padding is the only allocation beyond the used bytes.
+    assert s["packed_capacity_tokens"] == arena.used
+    _check_against_reference(cache, model, G)
+
+
+def test_arena_grows_on_demand_and_history_stays_exact():
+    """No reserve: the arena starts at the first flush's size and must grow
+    repeatedly without corrupting the already-quantized history, while the
+    spare tail stays within the growth policy (max(4 groups, 25%))."""
+    G = 4
+    cache, model = _run_generation("in_place", num_steps=300, prefill=6, G=G, R=8)
+    cache.harvest_pending()
+    arena = cache._arena[0]
+    assert arena.used > 256 and arena.cap >= arena.used
+    assert arena.cap - arena.used <= max(4 * G, arena.cap // 4)
+    assert arena.cap % G == 0
+    _check_against_reference(cache, model, G)
+
+
+def test_flush_reuses_arena_until_capacity_runs_out():
+    """Steady-state flushes append in place: the arena object (and its
+    storage) must not be replaced while capacity remains."""
+    cache, model = _run_generation("in_place", num_steps=10, prefill=6, G=4, R=8,
+                                   reserve=6 + 10 + 40)
+    cache.harvest_pending()
+    arena = cache._arena[0]
+    assert arena.cap > arena.used          # spare capacity to append into
+    ptr = arena.packed_k.data_ptr()
+    for _ in range(40):
+        cache.add_tokens(model.forward(1, cache.get_full_cache()))
+    cache.harvest_pending()
+    assert cache._arena[0] is arena and arena.packed_k.data_ptr() == ptr
+
+
+@pytest.mark.parametrize("serving", ["rebuild", "cached"])
+def test_direct_and_staged_paths_store_identical_bytes(serving):
+    """zero_copy=True (kernels write arena views) vs False (temporaries
+    copied in at harvest) must leave bit-identical packed stores."""
+    a, _ = _run_generation("in_place", seed=11, serving=serving, zero_copy=True)
+    b, _ = _run_generation("in_place", seed=11, serving=serving, zero_copy=False)
+    a.harvest_pending(); b.harvest_pending()
+    for name in ("_packed_k", "_scales_k", "_zeros_k",
+                 "_packed_v", "_scales_v", "_zeros_v"):
+        for ta, tb in zip(getattr(a, name), getattr(b, name)):
+            assert torch.equal(ta, tb), name
+    for (ka, va), (kb, vb) in zip(_iter_kv_layers(a.get_full_cache()),
+                                  _iter_kv_layers(b.get_full_cache())):
+        assert torch.equal(ka, kb) and torch.equal(va, vb)
+
+
+def test_reset_clears_arena_and_reserve():
+    cache, _ = _run_generation("in_place", reserve=30)
+    cache.reset()
+    assert all(a is None for a in cache._arena)
+    assert cache._reserve_tokens == 0
+
+
+def test_row_padding_aligns_key_rows():
+    """row_align pads each key row (one per channel) to a byte multiple; the
+    used views and the served cache are unchanged by it."""
+    from kivi_sycl.cache.arena import LayerArena
+    a = LayerArena(1, 2, 8, 4, 12, torch.float16, lambda sh, dt: torch.empty(sh, dtype=dt),
+                   row_align=64)
+    assert a.packed_k.shape == (1, 2, 8, 3) and a.packed_k.stride(-2) == 64
+    assert a.scales_k.shape == (1, 2, 8, 3) and a.scales_k.stride(-2) * 2 == 64
+    b = LayerArena(1, 2, 8, 4, 12, torch.float16, lambda sh, dt: torch.empty(sh, dtype=dt))
+    assert a.allocated_bytes > b.allocated_bytes

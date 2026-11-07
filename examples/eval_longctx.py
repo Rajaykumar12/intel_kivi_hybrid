@@ -75,6 +75,7 @@ def run_kivi(model, input_ids, num_gen_tokens, G, R, serving="rebuild",
     cache = KiviCache.from_model(model, device="xpu", group_size=G,
                                  residual_length=R, serving=serving,
                                  metadata_dtype=metadata_dtype)
+    cache.reserve(input_ids.shape[1] + num_gen_tokens)
     with torch.no_grad():
         out = model(input_ids, use_cache=True)
     cache.add_tokens(out.past_key_values)

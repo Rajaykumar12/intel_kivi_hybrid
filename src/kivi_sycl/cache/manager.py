@@ -6,6 +6,7 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 from ..config.model_config import detect_model_config
+from .arena import LayerArena, ensure_capacity
 from ..extension.loader import kivi_native
 
 __all__ = ["KiviCache"]
@@ -89,6 +90,15 @@ class KiviCache:
     Pass ``async_flush=False`` to harvest immediately (blocking, simpler
     timing for benchmarks).
 
+    Packed storage is a preallocated per-layer arena (``cache/arena.py``):
+    a flush appends into spare capacity instead of re-concatenating the whole
+    history. With ``zero_copy`` (default on XPU) the arena is USM host
+    memory, which the quantize kernels write directly and the CPU dequant
+    path reads in place — no host<->device copies. Call ``reserve(n)`` with
+    the final sequence length when it is known (``generate()`` does) so the
+    arena is sized once and carries no spare tail; otherwise it grows by
+    max(4 groups, 25%). ``get_stats()`` counts the full allocation.
+
     Element dtype follows the model: fp32 and fp16 KV tensors are stored
     and quantized natively; bf16 is upcast to fp32 at ingestion (the
     kernels have no bf16 instantiation). The served cache always has the
@@ -113,6 +123,9 @@ class KiviCache:
         async_flush:      Overlap flush kernels with the next forward pass.
         metadata_dtype:   "auto" / torch.float16 (default: fp16 scales/zeros)
                           or torch.float32 (fp32 models only).
+        zero_copy:        "auto" (on when device is XPU and the extension
+                          provides USM allocation), True, or False (stage
+                          through XPU tensors and copy back at harvest).
     """
 
     def __init__(
@@ -126,6 +139,7 @@ class KiviCache:
         serving: str = "rebuild",
         async_flush: bool = True,
         metadata_dtype="auto",
+        zero_copy="auto",
     ):
         assert head_dim % group_size == 0, \
             f"head_dim ({head_dim}) must be divisible by group_size ({group_size})"
@@ -138,6 +152,8 @@ class KiviCache:
         )
         assert serving in ("rebuild", "cached"), \
             f"serving must be 'rebuild' or 'cached', got {serving!r}"
+        assert zero_copy in ("auto", True, False), \
+            f"zero_copy must be 'auto', True or False, got {zero_copy!r}"
         assert metadata_dtype in ("auto", torch.float16, torch.float32), (
             f"metadata_dtype must be 'auto', torch.float16 or torch.float32, "
             f"got {metadata_dtype!r}")
@@ -151,6 +167,7 @@ class KiviCache:
         self.serving = serving
         self.async_flush = async_flush
         self.metadata_dtype = metadata_dtype
+        self.zero_copy = zero_copy
         self.batch_size: Optional[int] = None
         self._cache_dtype: Optional[torch.dtype] = None
         # Resolved on the first add_tokens, once the model's dtype is known.
@@ -160,18 +177,17 @@ class KiviCache:
         self.res_keys: List[Optional[torch.Tensor]] = [None] * num_layers
         self.res_values: List[Optional[torch.Tensor]] = [None] * num_layers
 
-        # Packed-resident history on CPU. Keys are stored channel-major:
-        #   _packed_k [B,H,D,T/4] u8, _scales_k/_zeros_k [B,H,D,T/G]
-        # Values are stored token-major:
-        #   _packed_v [B,H,T,D/4] u8, _scales_v/_zeros_v [B,H,T,D/G]
-        # T (quantized token count) is always a multiple of G, so chunk
-        # concatenation along the token axis preserves group alignment.
-        self._packed_k: List[Optional[torch.Tensor]] = [None] * num_layers
-        self._scales_k: List[Optional[torch.Tensor]] = [None] * num_layers
-        self._zeros_k: List[Optional[torch.Tensor]] = [None] * num_layers
-        self._packed_v: List[Optional[torch.Tensor]] = [None] * num_layers
-        self._scales_v: List[Optional[torch.Tensor]] = [None] * num_layers
-        self._zeros_v: List[Optional[torch.Tensor]] = [None] * num_layers
+        # Packed-resident history: one preallocated arena per layer (see
+        # cache/arena.py). Keys channel-major [B,H,D,cap/4] + [B,H,D,cap/G],
+        # values token-major [B,H,cap,D/4] + [B,H,cap,D/G]. The first
+        # `arena.used` tokens are valid; `used` is always a multiple of G.
+        # The `_packed_k` ... `_zeros_v` properties expose the used region.
+        self._arena: List[Optional[LayerArena]] = [None] * num_layers
+        # Reusable USM staging buffers for flush inputs (zero_copy only),
+        # one pair per layer: every layer can have a flush in flight at once.
+        self._stage: List[Optional[dict]] = [None] * num_layers
+        # Final sequence length hint from reserve(); 0 = unknown.
+        self._reserve_tokens = 0
 
         # In-flight flush per layer: kernels submitted, outputs not yet
         # harvested. The record keeps the XPU *input* tensors alive too —
@@ -211,6 +227,7 @@ class KiviCache:
         serving: str = "rebuild",
         async_flush: bool = True,
         metadata_dtype="auto",
+        zero_copy="auto",
     ) -> "KiviCache":
         """
         Create a KiviCache auto-configured for a HuggingFace model.
@@ -228,11 +245,24 @@ class KiviCache:
             serving=serving,
             async_flush=async_flush,
             metadata_dtype=metadata_dtype,
+            zero_copy=zero_copy,
         )
 
     # ------------------------------------------------------------------ #
     #  Core API                                                            #
     # ------------------------------------------------------------------ #
+
+    def reserve(self, total_tokens: int):
+        """Size the packed arenas for a sequence of ``total_tokens`` tokens
+        (prompt + everything that will be generated). Optional: without it
+        the arenas grow on demand. With it they are allocated once at the
+        exact final size, so no growth copy ever runs and the resident
+        footprint carries no spare capacity. Call before the first
+        ``add_tokens`` of a sequence; ``reset()`` clears it."""
+        assert total_tokens >= 0
+        # The residual always keeps at least R-G tokens back, and the
+        # quantized prefix is a multiple of G.
+        self._reserve_tokens = max(0, (total_tokens - (self.R - self.G)) // self.G * self.G)
 
     def add_tokens(self, past_key_values):
         """
@@ -403,35 +433,24 @@ class KiviCache:
             p["ev_k"].wait()
             p["ev_v"].wait()
             n = p["n"]
+            arena = self._arena[i]
+            t0 = arena.used
 
-            packed_k = p["packed_k"].to("cpu")
-            scales_k = p["scales_k"].to("cpu")
-            zeros_k = p["zeros_k"].to("cpu")
-            packed_v = p["packed_v"].to("cpu")
-            scales_v = p["scales_v"].to("cpu")
-            zeros_v = p["zeros_v"].to("cpu")
-
-            if self._packed_k[i] is None:
-                self._packed_k[i] = packed_k
-                self._scales_k[i] = scales_k
-                self._zeros_k[i] = zeros_k
-                self._packed_v[i] = packed_v
-                self._scales_v[i] = scales_v
-                self._zeros_v[i] = zeros_v
-            else:
-                # Keys are channel-major: token axis is dim 3. Values are
-                # token-major: token axis is dim 2. Chunk lengths are
-                # multiples of G, so group alignment survives concatenation.
-                self._packed_k[i] = torch.cat([self._packed_k[i], packed_k], dim=3)
-                self._scales_k[i] = torch.cat([self._scales_k[i], scales_k], dim=3)
-                self._zeros_k[i] = torch.cat([self._zeros_k[i], zeros_k], dim=3)
-                self._packed_v[i] = torch.cat([self._packed_v[i], packed_v], dim=2)
-                self._scales_v[i] = torch.cat([self._scales_v[i], scales_v], dim=2)
-                self._zeros_v[i] = torch.cat([self._zeros_v[i], zeros_v], dim=2)
+            if not p["direct"]:
+                # Staged path: kernels wrote XPU temporaries; copy them into
+                # the arena's spare capacity (one D2H per tensor, no concat).
+                for dst, src in zip(arena.key_slices(t0, t0 + n),
+                                    (p["packed_k"], p["scales_k"], p["zeros_k"])):
+                    dst.copy_(src)
+                for dst, src in zip(arena.value_slices(t0, t0 + n),
+                                    (p["packed_v"], p["scales_v"], p["zeros_v"])):
+                    dst.copy_(src)
+            # Direct (zero-copy) path: the kernels already wrote the arena.
+            arena.used = t0 + n
 
             if self.serving == "cached":
-                new_k = self._dequant_keys_cpu(packed_k, scales_k, zeros_k)
-                new_v = self._dequant_values_cpu(packed_v, scales_v, zeros_v)
+                new_k = self._dequant_keys_cpu(*arena.key_slices(t0, t0 + n))
+                new_v = self._dequant_values_cpu(*arena.value_slices(t0, t0 + n))
                 cur = self._deq_serving[i]
                 if cur is None:
                     self._deq_serving[i] = (new_k, new_v)
@@ -467,16 +486,13 @@ class KiviCache:
             self._flush_count[i] = 0
             self.res_keys[i] = None
             self.res_values[i] = None
-            self._packed_k[i] = None
-            self._scales_k[i] = None
-            self._zeros_k[i] = None
-            self._packed_v[i] = None
-            self._scales_v[i] = None
-            self._zeros_v[i] = None
+            self._arena[i] = None
+            self._stage[i] = None
             self._deq_serving[i] = None
         self.batch_size = None
         self._cache_dtype = None
         self._meta_dtype = None
+        self._reserve_tokens = 0
         self._cache_view = None
         self._cache_view_valid = False
 
@@ -503,39 +519,119 @@ class KiviCache:
             f"{self.res_keys[i].shape[2]} at layer {i}."
         )
 
-        # --- Keys: per-channel quantization (transpose to [B,H,D,L]) ---
         k_chunk = self.res_keys[i][:, :, :flush_len, :]
+        v_chunk = self.res_values[i][:, :, :flush_len, :]
+        B, H, L, D = k_chunk.shape
+
+        # Room for this chunk in the layer's arena. Safe to grow (reallocate)
+        # here: the assert above guarantees no kernel is writing into it.
+        self._arena[i] = arena = ensure_capacity(
+            self._arena[i], self._quant_token_count[i] + flush_len,
+            B=B, H=H, D=D, G=G, meta_dtype=self._meta_dtype,
+            reserve=self._reserve_tokens, alloc=self._host_alloc)
+        t0 = arena.used
+
+        if self._zero_copy_enabled():
+            # Inputs go into reusable USM staging (keys transposed to the
+            # channel-major [B,H,D,L] the per-channel kernel reads); outputs
+            # are views straight into the arena. No device copies at all.
+            k_in = self._staging(i, "k", (B, H, D, L), k_chunk.dtype)
+            k_in.copy_(k_chunk.transpose(2, 3))
+            v_in = self._staging(i, "v", (B, H, L, D), v_chunk.dtype)
+            v_in.copy_(v_chunk)
+            pk, sk, zk = arena.key_slices(t0, t0 + flush_len)
+            pv, sv, zv = arena.value_slices(t0, t0 + flush_len)
+            ev_k = kivi_native.quantize_keys_async(k_in, pk, sk, zk, G)
+            ev_v = kivi_native.quantize_values_async(v_in, pv, sv, zv, D, G)
+            self._pending[i] = {"n": flush_len, "direct": True,
+                                "ev_k": ev_k, "ev_v": ev_v}
+            return
+
+        # Staged path: device temporaries, copied into the arena at harvest.
         k_trans = k_chunk.transpose(2, 3).contiguous().to(self.device)
-        batch, heads, dim, L = k_trans.shape
-
-        packed_k = torch.empty((batch, heads, dim, L // 4),
-                               dtype=torch.uint8, device=self.device)
-        scales_k = torch.empty((batch, heads, dim, L // G),
-                               dtype=self._meta_dtype, device=self.device)
+        packed_k = torch.empty((B, H, D, L // 4), dtype=torch.uint8, device=self.device)
+        scales_k = torch.empty((B, H, D, L // G), dtype=self._meta_dtype, device=self.device)
         zeros_k = torch.empty_like(scales_k)
-        ev_k = kivi_native.quantize_keys_async(k_trans, packed_k, scales_k,
-                                               zeros_k, G)
+        ev_k = kivi_native.quantize_keys_async(k_trans, packed_k, scales_k, zeros_k, G)
 
-        # --- Values: per-token quantization (natural [B,H,L,D] layout) ---
-        v_chunk = self.res_values[i][:, :, :flush_len, :].contiguous().to(self.device)
-        groups_per_token = self.head_dim // G
-
-        packed_v = torch.empty((batch, heads, L, self.head_dim // 4),
-                               dtype=torch.uint8, device=self.device)
-        scales_v = torch.empty((batch, heads, L, groups_per_token),
-                               dtype=self._meta_dtype, device=self.device)
+        v_dev = v_chunk.contiguous().to(self.device)
+        packed_v = torch.empty((B, H, L, D // 4), dtype=torch.uint8, device=self.device)
+        scales_v = torch.empty((B, H, L, D // G), dtype=self._meta_dtype, device=self.device)
         zeros_v = torch.empty_like(scales_v)
-        ev_v = kivi_native.quantize_values_async(v_chunk, packed_v, scales_v,
-                                                 zeros_v, self.head_dim, G)
+        ev_v = kivi_native.quantize_values_async(v_dev, packed_v, scales_v, zeros_v, D, G)
 
         self._pending[i] = {
-            "n": flush_len,
+            "n": flush_len, "direct": False,
             "ev_k": ev_k, "ev_v": ev_v,
             # Inputs are retained until harvest: the kernels read them.
-            "in_k": k_trans, "in_v": v_chunk,
+            "in_k": k_trans, "in_v": v_dev,
             "packed_k": packed_k, "scales_k": scales_k, "zeros_k": zeros_k,
             "packed_v": packed_v, "scales_v": scales_v, "zeros_v": zeros_v,
         }
+
+    # -- Arena / staging allocation ---------------------------------------- #
+
+    def _zero_copy_enabled(self) -> bool:
+        if self.zero_copy == "auto":
+            return (str(self.device).startswith("xpu")
+                    and hasattr(kivi_native, "alloc_usm_host"))
+        return bool(self.zero_copy)
+
+    def _host_alloc(self, shape, dtype):
+        """Arena storage: USM host memory when zero-copy (kernels write it
+        directly), ordinary CPU memory otherwise."""
+        if self._zero_copy_enabled():
+            return kivi_native.alloc_usm_host(list(shape), dtype)
+        return torch.empty(shape, dtype=dtype)
+
+    def _staging(self, layer: int, which: str, shape, dtype):
+        """A contiguous USM view of `shape`, from this layer's reusable
+        staging buffer (reallocated only when too small). Only called at
+        submit time, when the layer has no flush in flight."""
+        numel = 1
+        for d in shape:
+            numel *= d
+        st = self._stage[layer]
+        if st is None:
+            st = self._stage[layer] = {}
+        buf = st.get(which)
+        if buf is None or buf.numel() < numel or buf.dtype != dtype:
+            buf = st[which] = kivi_native.alloc_usm_host([numel], dtype)
+        return buf[:numel].view(shape)
+
+    # -- Packed store views (used region of each layer's arena) ----------- #
+
+    class _UsedViews:
+        """Lazy per-layer sequence over one tensor of the arenas' used
+        region: indexing builds only that layer's view. (Building all
+        layers' views on every access made get_full_cache() 4x slower.)
+        Kept for introspection and tests; the hot paths use the arena."""
+
+        def __init__(self, arenas, idx):
+            self._arenas, self._idx = arenas, idx
+
+        def __len__(self):
+            return len(self._arenas)
+
+        def __getitem__(self, i):
+            a = self._arenas[i]
+            if a is None or a.used == 0:
+                return None
+            views = a.used_keys() if self._idx < 3 else a.used_values()
+            return views[self._idx % 3]
+
+        def __iter__(self):
+            return (self[i] for i in range(len(self)))
+
+    def _arena_views(self, idx: int):
+        return KiviCache._UsedViews(self._arena, idx)
+
+    _packed_k = property(lambda self: self._arena_views(0))
+    _scales_k = property(lambda self: self._arena_views(1))
+    _zeros_k = property(lambda self: self._arena_views(2))
+    _packed_v = property(lambda self: self._arena_views(3))
+    _scales_v = property(lambda self: self._arena_views(4))
+    _zeros_v = property(lambda self: self._arena_views(5))
 
     # -- Dequant-on-read -------------------------------------------------- #
     #
@@ -630,7 +726,8 @@ class KiviCache:
         i = layer_idx
         res_k, res_v = self.res_keys[i], self.res_values[i]
         n_res = res_k.shape[2] if res_k is not None else 0
-        has_hist = self._packed_k[i] is not None
+        arena = self._arena[i]
+        has_hist = arena is not None and arena.used > 0
 
         if not has_hist:
             # Nothing quantized yet — the residual *is* the cache. Return it
@@ -644,13 +741,12 @@ class KiviCache:
             n_hist = hist_k.shape[2]
         else:
             hist_k = hist_v = None
-            n_hist = self._packed_k[i].shape[3] * 4
+            n_hist = arena.used
 
         if n_res == 0 and hist_k is not None:
             return hist_k, hist_v
 
-        B, H = self._packed_k[i].shape[0], self._packed_k[i].shape[1]
-        D = self.head_dim
+        B, H, D = arena.B, arena.H, self.head_dim
         T = n_hist + n_res
         # The model's dtype, not the metadata's: with fp16 metadata on an
         # fp32 model the scales are half but the served cache must be fp32.
@@ -662,10 +758,8 @@ class KiviCache:
             out_k[:, :, :n_hist, :].copy_(hist_k)
             out_v[:, :, :n_hist, :].copy_(hist_v)
         else:
-            self._dequant_keys_into(out_k[:, :, :n_hist, :], self._packed_k[i],
-                                    self._scales_k[i], self._zeros_k[i])
-            self._dequant_values_into(out_v[:, :, :n_hist, :], self._packed_v[i],
-                                      self._scales_v[i], self._zeros_v[i])
+            self._dequant_keys_into(out_k[:, :, :n_hist, :], *arena.used_keys())
+            self._dequant_values_into(out_v[:, :, :n_hist, :], *arena.used_values())
 
         if n_res:
             out_k[:, :, n_hist:, :].copy_(res_k)
@@ -686,7 +780,11 @@ class KiviCache:
         is *measured* from live tensors (``numel() × element_size()``),
         not projected.
 
-        - ``packed_bytes``: resident 2-bit payload + scales/zeros.
+        - ``packed_bytes``: resident packed store — the layer's whole arena
+          allocation (2-bit payload + scales/zeros, including spare capacity
+          and row padding).
+        - ``packed_used_bytes``: the part of it holding quantized tokens.
+        - ``packed_capacity_tokens``: arena capacity in tokens.
         - ``residual_bytes``: FP residual window (includes tokens covered
           by a not-yet-harvested flush).
         - ``kivi_bytes``: packed + residual — the resident cache footprint
@@ -717,9 +815,11 @@ class KiviCache:
             return sum(t.numel() * t.element_size()
                        for t in tensors if t is not None)
 
-        packed_bytes = _nbytes(
-            self._packed_k[i], self._scales_k[i], self._zeros_k[i],
-            self._packed_v[i], self._scales_v[i], self._zeros_v[i])
+        arena = self._arena[i]
+        # Resident = the whole arena allocation (spare capacity and row
+        # padding included); used = the bytes holding quantized tokens.
+        packed_bytes = arena.allocated_bytes if arena is not None else 0
+        packed_used_bytes = arena.used_bytes() if arena is not None else 0
         residual_bytes = _nbytes(self.res_keys[i], self.res_values[i])
         serving_copy_bytes = 0
         if self._deq_serving[i] is not None:
@@ -736,6 +836,8 @@ class KiviCache:
             "residual_tokens": res_tokens,
             "pending_tokens": pending_n,
             "packed_bytes": packed_bytes,
+            "packed_used_bytes": packed_used_bytes,
+            "packed_capacity_tokens": arena.cap if arena is not None else 0,
             "residual_bytes": residual_bytes,
             "serving_copy_bytes": serving_copy_bytes,
             "kivi_bytes": kivi_bytes,
@@ -749,4 +851,4 @@ class KiviCache:
         return (f"KiviCache(layers={self.num_layers}, head_dim={self.head_dim}, "
                 f"G={self.G}, R={self.R}, device='{self.device}', "
                 f"serving='{self.serving}', async_flush={self.async_flush}, "
-                f"metadata_dtype={self.metadata_dtype})")
+                f"metadata_dtype={self.metadata_dtype}, zero_copy={self.zero_copy})")
