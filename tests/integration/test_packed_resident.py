@@ -158,17 +158,24 @@ def test_cpu_dequant_matches_xpu_kernel(dtype):
     assert torch.allclose(cpu_out, kernel_out.cpu(), atol=tol, rtol=tol)
 
 
-def _reference_roundtrip(inp, group_size):
+def _reference_roundtrip(inp, group_size, meta_dtype):
+    """Torch mirror of quantize->dequantize for the given metadata dtype
+    (see compute_scale<M> / saturate_zero<M> in quant_tile.hpp)."""
     flat = inp.reshape(-1, group_size)
     mn = flat.min(dim=1, keepdim=True).values
     mx = flat.max(dim=1, keepdim=True).values
-    scale = (mx - mn) / 3.0 + 1e-10
+    if meta_dtype == torch.float32:
+        scale = (mx - mn) / 3.0 + 1e-10
+    else:
+        scale = torch.clamp((mx - mn) / 3.0, 2.0 ** -14, 65504.0).half().float()
+        mn = torch.clamp(mn, -65504.0, 65504.0).half().float()
     q = torch.clamp(torch.round((flat - mn) / scale), 0.0, 3.0)
     return (q * scale + mn).reshape(inp.shape)
 
 
+@pytest.mark.parametrize("metadata_dtype", ["auto", torch.float32])
 @pytest.mark.parametrize("async_flush", [True, False])
-def test_manager_end_to_end_on_xpu(async_flush):
+def test_manager_end_to_end_on_xpu(async_flush, metadata_dtype):
     """Full KiviCache loop with the real kernels: packed store resident,
     serving matches the torch KIVI reference, stats measured."""
     torch.manual_seed(3)
@@ -176,7 +183,9 @@ def test_manager_end_to_end_on_xpu(async_flush):
     layers = 2
     cache = KiviCache(num_layers=layers, head_dim=D, num_kv_heads=H,
                       device="xpu", group_size=G, residual_length=R,
-                      serving="rebuild", async_flush=async_flush)
+                      serving="rebuild", async_flush=async_flush,
+                      metadata_dtype=metadata_dtype)
+    meta = torch.float16 if metadata_dtype == "auto" else torch.float32
 
     truth_k = [None] * layers
     truth_v = [None] * layers
@@ -203,6 +212,8 @@ def test_manager_end_to_end_on_xpu(async_flush):
 
     for i, (k, v) in enumerate(_iter_kv_layers(cache.get_full_cache())):
         assert k.shape[2] == total
+        assert k.dtype == v.dtype == torch.float32      # served in model dtype
+        assert cache._scales_k[i].dtype == meta
         n_hist = cache._quant_token_count[i]
         assert n_hist > 0 and n_hist % G == 0
         # Residual exact
@@ -212,11 +223,11 @@ def test_manager_end_to_end_on_xpu(async_flush):
         # groups, values per-token in G-channel groups)
         for c0 in range(0, n_hist, G):
             chunk = truth_k[i][:, :, c0:c0 + G, :].transpose(2, 3).contiguous()
-            expect = _reference_roundtrip(chunk, G).transpose(2, 3)
+            expect = _reference_roundtrip(chunk, G, meta).transpose(2, 3)
             assert torch.allclose(k[:, :, c0:c0 + G, :], expect,
                                   atol=1e-6, rtol=0)
         expect_v = _reference_roundtrip(
-            truth_v[i][:, :, :n_hist, :].contiguous(), G)
+            truth_v[i][:, :, :n_hist, :].contiguous(), G, meta)
         assert torch.allclose(v[:, :, :n_hist, :], expect_v, atol=1e-6, rtol=0)
 
     s = cache.get_stats(layer=0)

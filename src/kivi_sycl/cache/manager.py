@@ -91,7 +91,16 @@ class KiviCache:
 
     Element dtype follows the model: fp32 and fp16 KV tensors are stored
     and quantized natively; bf16 is upcast to fp32 at ingestion (the
-    kernels have no bf16 instantiation).
+    kernels have no bf16 instantiation). The served cache always has the
+    model's dtype.
+
+    Metadata dtype (per-group scales/zeros) defaults to fp16 for every
+    model. At G=32 this lifts the compression ceiling against an fp32
+    baseline from 8x to 10.67x: fp32 metadata costs as much as the 2-bit
+    payload itself. The narrowing happens inside the quantize kernel, so it
+    never goes through torch's XPU dtype cast. Pass
+    ``metadata_dtype=torch.float32`` for the previous behaviour (fp32 models
+    only — fp32 metadata on fp16 data has no kernel instantiation).
 
     Args:
         num_layers:       Number of transformer layers.
@@ -102,6 +111,8 @@ class KiviCache:
         residual_length:  Number of recent full-precision tokens to keep (R in paper).
         serving:          "rebuild" (memory-honest) or "cached" (speed) — see above.
         async_flush:      Overlap flush kernels with the next forward pass.
+        metadata_dtype:   "auto" / torch.float16 (default: fp16 scales/zeros)
+                          or torch.float32 (fp32 models only).
     """
 
     def __init__(
@@ -114,6 +125,7 @@ class KiviCache:
         residual_length: int = 128,
         serving: str = "rebuild",
         async_flush: bool = True,
+        metadata_dtype="auto",
     ):
         assert head_dim % group_size == 0, \
             f"head_dim ({head_dim}) must be divisible by group_size ({group_size})"
@@ -126,6 +138,9 @@ class KiviCache:
         )
         assert serving in ("rebuild", "cached"), \
             f"serving must be 'rebuild' or 'cached', got {serving!r}"
+        assert metadata_dtype in ("auto", torch.float16, torch.float32), (
+            f"metadata_dtype must be 'auto', torch.float16 or torch.float32, "
+            f"got {metadata_dtype!r}")
 
         self.device = device
         self.G = group_size
@@ -135,8 +150,11 @@ class KiviCache:
         self.num_kv_heads = num_kv_heads
         self.serving = serving
         self.async_flush = async_flush
+        self.metadata_dtype = metadata_dtype
         self.batch_size: Optional[int] = None
         self._cache_dtype: Optional[torch.dtype] = None
+        # Resolved on the first add_tokens, once the model's dtype is known.
+        self._meta_dtype: Optional[torch.dtype] = None
 
         # FP residual buffers on CPU (model dtype)
         self.res_keys: List[Optional[torch.Tensor]] = [None] * num_layers
@@ -192,6 +210,7 @@ class KiviCache:
         residual_length: int = 128,
         serving: str = "rebuild",
         async_flush: bool = True,
+        metadata_dtype="auto",
     ) -> "KiviCache":
         """
         Create a KiviCache auto-configured for a HuggingFace model.
@@ -208,6 +227,7 @@ class KiviCache:
             residual_length=residual_length,
             serving=serving,
             async_flush=async_flush,
+            metadata_dtype=metadata_dtype,
         )
 
     # ------------------------------------------------------------------ #
@@ -266,6 +286,7 @@ class KiviCache:
                     k.dtype if k.dtype in (torch.float32, torch.float16)
                     else torch.float32
                 )
+                self._meta_dtype = self._resolve_meta_dtype(self._cache_dtype)
 
             # Extract only NEW tokens (model returns full cache)
             if self.res_keys[i] is not None:
@@ -455,6 +476,7 @@ class KiviCache:
             self._deq_serving[i] = None
         self.batch_size = None
         self._cache_dtype = None
+        self._meta_dtype = None
         self._cache_view = None
         self._cache_view_valid = False
 
@@ -489,7 +511,7 @@ class KiviCache:
         packed_k = torch.empty((batch, heads, dim, L // 4),
                                dtype=torch.uint8, device=self.device)
         scales_k = torch.empty((batch, heads, dim, L // G),
-                               dtype=k_trans.dtype, device=self.device)
+                               dtype=self._meta_dtype, device=self.device)
         zeros_k = torch.empty_like(scales_k)
         ev_k = kivi_native.quantize_keys_async(k_trans, packed_k, scales_k,
                                                zeros_k, G)
@@ -501,7 +523,7 @@ class KiviCache:
         packed_v = torch.empty((batch, heads, L, self.head_dim // 4),
                                dtype=torch.uint8, device=self.device)
         scales_v = torch.empty((batch, heads, L, groups_per_token),
-                               dtype=v_chunk.dtype, device=self.device)
+                               dtype=self._meta_dtype, device=self.device)
         zeros_v = torch.empty_like(scales_v)
         ev_v = kivi_native.quantize_values_async(v_chunk, packed_v, scales_v,
                                                  zeros_v, self.head_dim, G)
@@ -548,7 +570,7 @@ class KiviCache:
         B, H, D, _ = packed.shape
         q = (packed.unsqueeze(-1) >> _UNPACK_SHIFTS) & 0x3   # [B,H,D,T/4,4]
         T = q.numel() // (B * H * D)
-        q = q.reshape(B, H, D, T // self.G, self.G).to(scales.dtype)
+        q = q.reshape(B, H, D, T // self.G, self.G).to(out.dtype)
         q.mul_(scales.unsqueeze(-1)).add_(zeros.unsqueeze(-1))
         out.copy_(q.reshape(B, H, D, T).transpose(2, 3))
 
@@ -560,25 +582,43 @@ class KiviCache:
         B, H, T, _ = packed.shape
         q = (packed.unsqueeze(-1) >> _UNPACK_SHIFTS) & 0x3   # [B,H,T,D/4,4]
         D = q.numel() // (B * H * T)
-        q = q.reshape(B, H, T, D // self.G, self.G).to(scales.dtype)
+        q = q.reshape(B, H, T, D // self.G, self.G).to(out.dtype)
         q.mul_(scales.unsqueeze(-1)).add_(zeros.unsqueeze(-1))
         out.copy_(q.reshape(B, H, T, D))
 
-    def _dequant_keys_cpu(self, packed, scales, zeros):
-        """Allocating form of ``_dequant_keys_into`` — [B,H,T,D] keys."""
+    def _dequant_keys_cpu(self, packed, scales, zeros, dtype=None):
+        """Allocating form of ``_dequant_keys_into`` — [B,H,T,D] keys in
+        ``dtype`` (default: the cache's element dtype)."""
         B, H, D, _ = packed.shape
         T = (packed.numel() // (B * H * D)) * 4
-        out = torch.empty((B, H, T, D), dtype=scales.dtype)
+        out = torch.empty((B, H, T, D), dtype=self._out_dtype(dtype, scales))
         self._dequant_keys_into(out, packed, scales, zeros)
         return out
 
-    def _dequant_values_cpu(self, packed, scales, zeros):
-        """Allocating form of ``_dequant_values_into`` — [B,H,T,D] values."""
+    def _dequant_values_cpu(self, packed, scales, zeros, dtype=None):
+        """Allocating form of ``_dequant_values_into`` — [B,H,T,D] values in
+        ``dtype`` (default: the cache's element dtype)."""
         B, H, T, _ = packed.shape
         D = (packed.numel() // (B * H * T)) * 4
-        out = torch.empty((B, H, T, D), dtype=scales.dtype)
+        out = torch.empty((B, H, T, D), dtype=self._out_dtype(dtype, scales))
         self._dequant_values_into(out, packed, scales, zeros)
         return out
+
+    def _resolve_meta_dtype(self, cache_dtype: torch.dtype) -> torch.dtype:
+        """Metadata dtype for a model whose KV dtype is ``cache_dtype``.
+        Only (fp32, fp32), (fp32, fp16) and (fp16, fp16) have kernels."""
+        if self.metadata_dtype in ("auto", torch.float16):
+            return torch.float16
+        if cache_dtype != torch.float32:
+            raise ValueError(
+                f"metadata_dtype=torch.float32 needs an fp32 model, got "
+                f"{cache_dtype}: fp32 metadata on fp16 data has no kernel.")
+        return torch.float32
+
+    def _out_dtype(self, dtype, scales) -> torch.dtype:
+        if dtype is not None:
+            return dtype
+        return self._cache_dtype if self._cache_dtype is not None else scales.dtype
 
     def _serve_layer(self, layer_idx: int):
         """Build the full [B,H,T,D] keys/values for one layer.
@@ -612,7 +652,9 @@ class KiviCache:
         B, H = self._packed_k[i].shape[0], self._packed_k[i].shape[1]
         D = self.head_dim
         T = n_hist + n_res
-        dtype = self._scales_k[i].dtype
+        # The model's dtype, not the metadata's: with fp16 metadata on an
+        # fp32 model the scales are half but the served cache must be fp32.
+        dtype = self._cache_dtype
         out_k = torch.empty((B, H, T, D), dtype=dtype)
         out_v = torch.empty((B, H, T, D), dtype=dtype)
 
@@ -706,4 +748,5 @@ class KiviCache:
     def __repr__(self):
         return (f"KiviCache(layers={self.num_layers}, head_dim={self.head_dim}, "
                 f"G={self.G}, R={self.R}, device='{self.device}', "
-                f"serving='{self.serving}', async_flush={self.async_flush})")
+                f"serving='{self.serving}', async_flush={self.async_flush}, "
+                f"metadata_dtype={self.metadata_dtype})")

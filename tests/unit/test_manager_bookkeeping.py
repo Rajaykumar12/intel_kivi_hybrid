@@ -34,6 +34,29 @@ if os.path.isdir(_SRC) and _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 
+_HALF_MAX = 65504.0
+_HALF_SCALE_FLOOR = 2.0 ** -14   # smallest normal fp16
+
+
+def _scale_zero_reference(flat, meta_dtype):
+    """Mirror of compute_scale<M> / saturate_zero<M> / round_through_storage<M>
+    in kernels/internal/quant_tile.hpp: returns the step and zero point the
+    kernel actually packs with (already rounded through the metadata dtype),
+    so packing and a later dequantize agree exactly.
+
+    fp32 metadata: step = range/3 + 1e-10, unrounded.
+    fp16 metadata: step = clamp(range/3, 2^-14, 65504), zero clamped to
+    +/-65504, both rounded through fp16.
+    """
+    mn = flat.min(dim=1, keepdim=True).values
+    mx = flat.max(dim=1, keepdim=True).values
+    if meta_dtype == torch.float32:
+        return (mx - mn) / 3.0 + 1e-10, mn
+    scale = torch.clamp((mx - mn) / 3.0, _HALF_SCALE_FLOOR, _HALF_MAX)
+    zero = torch.clamp(mn, -_HALF_MAX, _HALF_MAX)
+    return scale.half().to(flat.dtype), zero.half().to(flat.dtype)
+
+
 def _quantize_2bit_reference(inp, packed_out, scales_out, zeros_out, group_size):
     """Exact torch mirror of the SYCL quantize kernels.
 
@@ -41,12 +64,11 @@ def _quantize_2bit_reference(inp, packed_out, scales_out, zeros_out, group_size)
     a flat [-1, group_size] view reproduces their grouping for keys
     ([B,H,D,L] input, groups along tokens) and values ([B,H,L,D] input,
     groups along channels) alike. Packing is LSB-first:
-    byte = q0 | q1<<2 | q2<<4 | q3<<6.
+    byte = q0 | q1<<2 | q2<<4 | q3<<6. The metadata dtype is taken from
+    `scales_out`, as the real ops do.
     """
     flat = inp.reshape(-1, group_size)
-    mn = flat.min(dim=1, keepdim=True).values
-    mx = flat.max(dim=1, keepdim=True).values
-    scale = (mx - mn) / 3.0 + 1e-10
+    scale, mn = _scale_zero_reference(flat, scales_out.dtype)
     q = torch.clamp(torch.round((flat - mn) / scale), 0.0, 3.0).to(torch.uint8)
     qb = q.reshape(-1, group_size // 4, 4)
     byte = (qb[..., 0] | (qb[..., 1] << 2) | (qb[..., 2] << 4)
@@ -56,13 +78,11 @@ def _quantize_2bit_reference(inp, packed_out, scales_out, zeros_out, group_size)
     zeros_out.copy_(mn.reshape(zeros_out.shape))
 
 
-def _roundtrip_2bit_reference(inp, group_size):
+def _roundtrip_2bit_reference(inp, group_size, meta_dtype=torch.float16):
     """Quantize + dequantize in one go — the expected served value of a
-    flushed chunk."""
+    flushed chunk. Defaults to fp16 metadata, KiviCache's default."""
     flat = inp.reshape(-1, group_size)
-    mn = flat.min(dim=1, keepdim=True).values
-    mx = flat.max(dim=1, keepdim=True).values
-    scale = (mx - mn) / 3.0 + 1e-10
+    scale, mn = _scale_zero_reference(flat, meta_dtype)
     q = torch.clamp(torch.round((flat - mn) / scale), 0.0, 3.0)
     return (q * scale + mn).reshape(inp.shape)
 
@@ -187,12 +207,13 @@ class FakeModel:
 
 def _run_generation(mode, num_steps=24, prefill=6, G=4, R=8, head_dim=8,
                     layers=2, heads=2, batch=1, serving="rebuild",
-                    async_flush=True, seed=0):
+                    async_flush=True, seed=0, metadata_dtype="auto"):
     torch.manual_seed(seed)
     cache = KiviCache(num_layers=layers, head_dim=head_dim,
                       num_kv_heads=heads, device="cpu",
                       group_size=G, residual_length=R,
-                      serving=serving, async_flush=async_flush)
+                      serving=serving, async_flush=async_flush,
+                      metadata_dtype=metadata_dtype)
     model = FakeModel(layers, heads, head_dim, mode, batch=batch)
 
     cache.add_tokens(model.forward(prefill))
@@ -206,7 +227,7 @@ def _run_generation(mode, num_steps=24, prefill=6, G=4, R=8, head_dim=8,
     return cache, model
 
 
-def _check_against_reference(cache, model, G):
+def _check_against_reference(cache, model, G, meta_dtype=torch.float16):
     """Residual tail must be bit-exact; quantized history must equal the
     reference 2-bit round-trip applied in G-token groups (group alignment
     is invariant to how flushes were chunked — every chunk is a multiple
@@ -223,14 +244,14 @@ def _check_against_reference(cache, model, G):
         # values per-token (group along channels).
         for c0 in range(0, n_hist, G):
             chunk_k = model.truth[i][:, :, c0:c0 + G, :].transpose(2, 3).contiguous()
-            expect_k = _roundtrip_2bit_reference(chunk_k, G).transpose(2, 3)
+            expect_k = _roundtrip_2bit_reference(chunk_k, G, meta_dtype).transpose(2, 3)
             assert torch.equal(k[:, :, c0:c0 + G, :], expect_k), (
                 f"layer {i} key flush chunk at token {c0} does not match "
                 f"the KIVI per-channel reference")
         # Values: per-token grouping is independent of flush chunking, so
         # the whole history can be checked in one shot.
         expect_v = _roundtrip_2bit_reference(
-            model.truth_v[i][:, :, :n_hist, :].contiguous(), G)
+            model.truth_v[i][:, :, :n_hist, :].contiguous(), G, meta_dtype)
         assert torch.equal(v[:, :, :n_hist, :], expect_v), (
             f"layer {i} value history does not match the KIVI "
             f"per-token reference")
@@ -368,3 +389,60 @@ def test_reset_clears_packed_store():
         assert cache.res_keys[i] is None
         assert cache._deq_serving[i] is None
         assert cache._quant_token_count[i] == 0
+
+
+# ---------------------------------------------------------------------------
+# Metadata dtype (fp16 scales/zeros by default)
+# ---------------------------------------------------------------------------
+
+def test_default_metadata_is_fp16_and_served_dtype_is_model_dtype():
+    """fp16 metadata on an fp32 model: scales/zeros are stored as fp16, but
+    the served cache must stay fp32 (a served-dtype regression would
+    silently run the model's attention in fp16)."""
+    cache, model = _run_generation("in_place", G=4, R=8)
+    cache.harvest_pending()
+    assert cache._scales_k[0].dtype == torch.float16
+    assert cache._zeros_v[0].dtype == torch.float16
+    for k, v in _iter_kv_layers(cache.get_full_cache()):
+        assert k.dtype == v.dtype == torch.float32
+    _check_against_reference(cache, model, 4, torch.float16)
+
+
+def test_fp32_metadata_reproduces_previous_behaviour():
+    cache, model = _run_generation("in_place", G=4, R=8,
+                                   metadata_dtype=torch.float32)
+    cache.harvest_pending()
+    assert cache._scales_k[0].dtype == torch.float32
+    _check_against_reference(cache, model, 4, torch.float32)
+
+
+def test_fp16_metadata_shrinks_packed_store_by_metadata_half():
+    """Same token stream, fp16 vs fp32 metadata: payload bytes are equal,
+    metadata bytes halve, and nothing else changes."""
+    a, _ = _run_generation("in_place", G=4, R=8, seed=3)
+    b, _ = _run_generation("in_place", G=4, R=8, seed=3,
+                           metadata_dtype=torch.float32)
+    a.harvest_pending(); b.harvest_pending()
+    nbytes = lambda *ts: sum(t.numel() * t.element_size() for t in ts)
+    meta = lambda c: nbytes(c._scales_k[0], c._zeros_k[0], c._scales_v[0], c._zeros_v[0])
+    payload = lambda c: nbytes(c._packed_k[0], c._packed_v[0])
+    assert payload(a) == payload(b)
+    assert meta(a) * 2 == meta(b)
+    sa, sb = a.get_stats(0), b.get_stats(0)
+    assert sb["packed_bytes"] - sa["packed_bytes"] == meta(b) - meta(a)
+    assert sa["compression"] > sb["compression"]
+
+
+def test_fp32_metadata_rejected_for_fp16_model():
+    cache = KiviCache(num_layers=1, head_dim=8, num_kv_heads=2, device="cpu",
+                      group_size=4, residual_length=8,
+                      metadata_dtype=torch.float32)
+    k = torch.randn(1, 2, 3, 8, dtype=torch.float16)
+    with pytest.raises(ValueError, match="fp32 model"):
+        cache.add_tokens(((k, k.clone()),))
+
+
+def test_invalid_metadata_dtype_rejected():
+    with pytest.raises(AssertionError, match="metadata_dtype"):
+        KiviCache(num_layers=1, head_dim=8, group_size=4, residual_length=8,
+                  device="cpu", metadata_dtype=torch.bfloat16)
