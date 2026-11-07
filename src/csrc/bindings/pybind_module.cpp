@@ -14,6 +14,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Handle for a kernel submitted via a *_async op. Call .wait() before "
         "reading any tensor the kernel writes.")
         .def("wait", &kivi::KiviEvent::wait,
+             // Release the GIL while blocked: a background thread waiting on a
+             // flush must not stall the Python thread running the model.
+             py::call_guard<py::gil_scoped_release>(),
              "Block until the kernel completes; rethrows any async SYCL error.");
 
     // --- USM host memory (zero-copy on integrated GPUs; see kivi/usm.hpp)

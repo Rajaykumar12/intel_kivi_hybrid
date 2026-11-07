@@ -5,12 +5,15 @@ Build & install:
     pip install . --no-build-isolation
 
 Requires:
-    - Intel oneAPI DPC++ compiler (source setvars.sh first)
-    - PyTorch with Intel Extension for PyTorch (IPEX)
+    - Intel oneAPI DPC++ compiler (icpx) whose SYCL runtime is compatible with
+      the one bundled in the installed torch XPU wheel. See
+      docs/optimization_roadmap/README.md §5 for the working recipe when
+      setvars.sh resolves to a newer oneAPI than torch was built with.
+    - PyTorch XPU build (torch >= 2.4 ships libc10_xpu; IPEX optional)
 """
 
 import os
-from setuptools import setup, find_packages
+from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 # --------------------------------------------------------------------------
@@ -42,29 +45,13 @@ if _has_c10_xpu:
     extra_libraries.append("c10_xpu")
 
 # --------------------------------------------------------------------------
-# Package metadata
+# Extension build only. Package metadata (name, version, license, deps,
+# classifiers) lives in pyproject.toml; the version comes from
+# src/kivi_sycl/_version.py.
 # --------------------------------------------------------------------------
-with open("README.md", encoding="utf-8") as f:
-    long_description = f.read()
-
 CSRC = os.path.join("src", "csrc")
 
 setup(
-    name="kivi-sycl",
-    version="0.1.0",
-    author="Rajay",
-    description="KIVI: Tuning-Free Asymmetric 2-bit KV Cache Quantization for Intel GPUs",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    url="https://github.com/Rajaykumar12/intel_kivi_hybrid",  # TODO: update with your repo URL
-    license="MIT",
-    python_requires=">=3.10",
-    install_requires=[
-        "torch",
-        "transformers",
-    ],
-    package_dir={"": "src"},
-    packages=find_packages(where="src"),
     ext_modules=[
         CppExtension(
             name="kivi_sycl._C",
@@ -83,14 +70,4 @@ setup(
         )
     ],
     cmdclass={"build_ext": BuildExtension},
-    classifiers=[
-        "Development Status :: 3 - Alpha",
-        "Intended Audience :: Science/Research",
-        "License :: OSI Approved :: MIT License",
-        "Programming Language :: Python :: 3",
-        "Programming Language :: C++",
-        "Topic :: Scientific/Engineering :: Artificial Intelligence",
-        "Operating System :: POSIX :: Linux",
-    ],
-    keywords="kv-cache quantization 2-bit sycl intel xpu llm inference",
 )
