@@ -300,23 +300,7 @@ class KiviCache:
         self.harvest_pending()
 
         for i, (k, v) in enumerate(_iter_kv_layers(past_key_values)):
-            if self.batch_size is None:
-                self.batch_size = k.shape[0]
-                self.num_kv_heads = k.shape[1]
-            else:
-                assert k.shape[0] == self.batch_size, (
-                    f"KiviCache batch size changed mid-session "
-                    f"({self.batch_size} -> {k.shape[0]}) at layer {i}. "
-                    f"Call reset() before starting a new request/batch."
-                )
-            if self._cache_dtype is None:
-                # bf16 has no kernel instantiation — upcast to fp32.
-                # fp32/fp16 are stored and quantized natively.
-                self._cache_dtype = (
-                    k.dtype if k.dtype in (torch.float32, torch.float16)
-                    else torch.float32
-                )
-                self._meta_dtype = self._resolve_meta_dtype(self._cache_dtype)
+            self._init_session(k, i)
 
             # Extract only NEW tokens (model returns full cache)
             if self.res_keys[i] is not None:
@@ -345,13 +329,7 @@ class KiviCache:
                 f"step's KV and corrupt all subsequent attention."
             )
 
-            # Append to CPU residual
-            if self.res_keys[i] is None:
-                self.res_keys[i] = new_k
-                self.res_values[i] = new_v
-            else:
-                self.res_keys[i] = torch.cat([self.res_keys[i], new_k], dim=2)
-                self.res_values[i] = torch.cat([self.res_values[i], new_v], dim=2)
+            self._append_layer(i, new_k, new_v)
 
             # No manual append to the cache view here: when the model grew
             # `self._cache_view` in place (the identity check at the top of
@@ -360,16 +338,6 @@ class KiviCache:
             # model returned a different object, the view was invalidated
             # above and the next get_full_cache() rebuilds it from the
             # residual, which does include this token.
-
-            # Flush the residual's excess in ONE kernel submission. The
-            # target leaves the residual in [R-G, R-1] tokens, matching
-            # the old while-loop's steady state, but a long prompt's
-            # entire grouped part goes to the XPU in a single launch
-            # instead of one launch per G tokens.
-            res_len = self.res_keys[i].shape[2]
-            if res_len >= self.R:
-                flush_len = ((res_len - (self.R - self.G)) // self.G) * self.G
-                self._submit_flush(i, flush_len)
 
         if self.async_flush:
             # Pending flushes are harvested at the top of the next
@@ -384,6 +352,48 @@ class KiviCache:
             # steps is packed history + residual only.
             self._cache_view = None
             self._cache_view_valid = False
+
+    def _init_session(self, k: torch.Tensor, layer_idx: int):
+        """Record batch size / KV heads / dtypes from the first tensor seen,
+        and check later tensors against them."""
+        if self.batch_size is None:
+            self.batch_size = k.shape[0]
+            self.num_kv_heads = k.shape[1]
+        else:
+            assert k.shape[0] == self.batch_size, (
+                f"KiviCache batch size changed mid-session "
+                f"({self.batch_size} -> {k.shape[0]}) at layer {layer_idx}. "
+                f"Call reset() before starting a new request/batch."
+            )
+        if self._cache_dtype is None:
+            # bf16 has no kernel instantiation — upcast to fp32.
+            # fp32/fp16 are stored and quantized natively.
+            self._cache_dtype = (
+                k.dtype if k.dtype in (torch.float32, torch.float16)
+                else torch.float32
+            )
+            self._meta_dtype = self._resolve_meta_dtype(self._cache_dtype)
+
+    def _append_layer(self, i: int, new_k: torch.Tensor, new_v: torch.Tensor):
+        """Append new tokens ([B,H,n,D], cache dtype) to layer i's FP residual
+        and submit a flush of the excess if the residual reached R.
+
+        The flush goes out in ONE kernel submission. The target leaves the
+        residual in [R-G, R-1] tokens, but a long prompt's entire grouped
+        part goes to the XPU in a single launch instead of one per G tokens.
+        Flushed tokens stay in the residual (served in FP) until harvest.
+        """
+        if self.res_keys[i] is None:
+            self.res_keys[i] = new_k
+            self.res_values[i] = new_v
+        else:
+            self.res_keys[i] = torch.cat([self.res_keys[i], new_k], dim=2)
+            self.res_values[i] = torch.cat([self.res_values[i], new_v], dim=2)
+
+        res_len = self.res_keys[i].shape[2]
+        if res_len >= self.R and self._pending[i] is None:
+            flush_len = ((res_len - (self.R - self.G)) // self.G) * self.G
+            self._submit_flush(i, flush_len)
 
     def get_full_cache(self) -> DynamicCache:
         """
@@ -427,51 +437,55 @@ class KiviCache:
         store fully up to date at an arbitrary point.
         """
         for i in range(self.num_layers):
-            p = self._pending[i]
-            if p is None:
-                continue
-            p["ev_k"].wait()
-            p["ev_v"].wait()
-            n = p["n"]
-            arena = self._arena[i]
-            t0 = arena.used
+            self._harvest_layer(i)
 
-            if not p["direct"]:
-                # Staged path: kernels wrote XPU temporaries; copy them into
-                # the arena's spare capacity (one D2H per tensor, no concat).
-                for dst, src in zip(arena.key_slices(t0, t0 + n),
-                                    (p["packed_k"], p["scales_k"], p["zeros_k"])):
-                    dst.copy_(src)
-                for dst, src in zip(arena.value_slices(t0, t0 + n),
-                                    (p["packed_v"], p["scales_v"], p["zeros_v"])):
-                    dst.copy_(src)
-            # Direct (zero-copy) path: the kernels already wrote the arena.
-            arena.used = t0 + n
+    def _harvest_layer(self, i: int):
+        """Collect layer i's in-flight flush, if any (see harvest_pending)."""
+        p = self._pending[i]
+        if p is None:
+            return
+        p["ev_k"].wait()
+        p["ev_v"].wait()
+        n = p["n"]
+        arena = self._arena[i]
+        t0 = arena.used
 
-            if self.serving == "cached":
-                new_k = self._dequant_keys_cpu(*arena.key_slices(t0, t0 + n))
-                new_v = self._dequant_values_cpu(*arena.value_slices(t0, t0 + n))
-                cur = self._deq_serving[i]
-                if cur is None:
-                    self._deq_serving[i] = (new_k, new_v)
-                else:
-                    self._deq_serving[i] = (
-                        torch.cat([cur[0], new_k], dim=2),
-                        torch.cat([cur[1], new_v], dim=2),
-                    )
+        if not p["direct"]:
+            # Staged path: kernels wrote XPU temporaries; copy them into
+            # the arena's spare capacity (one D2H per tensor, no concat).
+            for dst, src in zip(arena.key_slices(t0, t0 + n),
+                                (p["packed_k"], p["scales_k"], p["zeros_k"])):
+                dst.copy_(src)
+            for dst, src in zip(arena.value_slices(t0, t0 + n),
+                                (p["packed_v"], p["scales_v"], p["zeros_v"])):
+                dst.copy_(src)
+        # Direct (zero-copy) path: the kernels already wrote the arena.
+        arena.used = t0 + n
 
-            # Trim the flushed tokens from the residual only now — until
-            # this point they were still being served in full precision.
-            self.res_keys[i] = self.res_keys[i][:, :, n:, :].contiguous()
-            self.res_values[i] = self.res_values[i][:, :, n:, :].contiguous()
+        if self.serving == "cached":
+            new_k = self._dequant_keys_cpu(*arena.key_slices(t0, t0 + n))
+            new_v = self._dequant_values_cpu(*arena.value_slices(t0, t0 + n))
+            cur = self._deq_serving[i]
+            if cur is None:
+                self._deq_serving[i] = (new_k, new_v)
+            else:
+                self._deq_serving[i] = (
+                    torch.cat([cur[0], new_k], dim=2),
+                    torch.cat([cur[1], new_v], dim=2),
+                )
 
-            self._quant_token_count[i] += n
-            self._flush_count[i] += 1
-            self._pending[i] = None
-            # History composition changed (FP residual tokens replaced by
-            # their quantized representation) — the persistent view no
-            # longer matches what should be served.
-            self._cache_view_valid = False
+        # Trim the flushed tokens from the residual only now — until
+        # this point they were still being served in full precision.
+        self.res_keys[i] = self.res_keys[i][:, :, n:, :].contiguous()
+        self.res_values[i] = self.res_values[i][:, :, n:, :].contiguous()
+
+        self._quant_token_count[i] += n
+        self._flush_count[i] += 1
+        self._pending[i] = None
+        # History composition changed (FP residual tokens replaced by
+        # their quantized representation) — the persistent view no
+        # longer matches what should be served.
+        self._cache_view_valid = False
 
     def reset(self):
         """Clear all cached data. Reuse the same KiviCache for a new sequence."""
