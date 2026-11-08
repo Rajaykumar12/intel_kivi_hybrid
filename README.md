@@ -3,11 +3,31 @@
 Implementation of the **KIVI algorithm** ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)) targeting Intel XPU hardware via SYCL/oneAPI. Replaces the original CUDA kernels with DPC++ and provides a **plug-and-play** `kivi_sycl` module that works with **any** HuggingFace causal LM (GPT-2, LLaMA, Mistral, Phi, Qwen, Falcon, etc.).
 
 ```python
-from kivi_sycl import generate
-text = generate(model, tokenizer, "Once upon a time", max_new_tokens=200)
+from kivi_sycl import enable_kivi
+cache = enable_kivi(model)                 # native transformers Cache + "kivi" attention
+out = model.generate(input_ids, past_key_values=cache, max_new_tokens=200)
+print(cache.get_stats()["compression"])
 ```
 
 ## Results
+
+### Decode speed with the native integration (2026-11-08)
+
+`enable_kivi` plugs KIVI into transformers as a real `Cache` plus a registered `"kivi"`
+attention. Decode steps run a fused CPU kernel that attends directly over the packed 2-bit
+history — the dequantized history is never materialised. Same memory, most of the decode
+overhead gone. Three runs each; the percentage is KIVI vs the FP baseline measured in the
+same process (the FP baseline itself varies ~20% run to run on this laptop):
+
+| Model, context | Compression | Legacy loop (`get_full_cache`) | **Native + fused** |
+|---|---|---|---|
+| TinyLlama-1.1B, 1.9k + 64 | 6.99× | −1%, −18%, −28% (median **−18%**) | −6%, −2%, −2% (median **−2%**) |
+| Qwen2.5-0.5B-Instruct, 8k + 32 | 9.25× | −41%, −30%, −35% (median **−35%**) | +6%, +18%, −10% (≈ **parity**) |
+
+Per layer, the fused kernel is ~5× faster than dequantize-then-SDPA (Qwen2.5 shape, 8k:
+5.8 → 1.0 ms). Quality is unchanged: gpt2 WikiText-2 perplexity 38.794 (fused) vs 38.793
+(legacy). The native path's reference mode (`enable_kivi(model, fused=False)`) is
+bit-identical to the legacy loop on gpt2, TinyLlama, Qwen2, Qwen2.5 and OPT.
 
 The packed-2-bit representation (uint8 payload + scales + zeros) is the resident CPU
 store for flushed history — `KiviCache` no longer dequantizes-and-discards on flush, so
@@ -327,6 +347,26 @@ python examples/benchmark.py
 ```
 
 ## Usage
+
+### Native transformers integration (recommended)
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from kivi_sycl import enable_kivi
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype=torch.float32)
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+ids = tok("Once upon a time", return_tensors="pt").input_ids
+
+cache = enable_kivi(model, max_tokens=ids.shape[1] + 200)   # max_tokens is optional
+out = model.generate(ids, past_key_values=cache, max_new_tokens=200)
+print(tok.decode(out[0]), cache.get_stats()["compression"])
+```
+
+`enable_kivi` switches the model to the `"kivi"` attention and returns a fresh cache — use one
+per sequence. It accepts the same options as `KiviCache` (`group_size`, `residual_length`,
+`metadata_dtype`, `zero_copy`, …) plus `fused` (default `True`; `False` selects the
+dequantize-then-SDPA reference path). Beam search and cache cropping are not supported yet.
 
 ### Quick Start — One-liner Generation
 
