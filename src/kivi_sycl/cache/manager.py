@@ -383,6 +383,10 @@ class KiviCache:
         part goes to the XPU in a single launch instead of one per G tokens.
         Flushed tokens stay in the residual (served in FP) until harvest.
         """
+        self._append_residual(i, new_k, new_v)
+        self._maybe_flush(i)
+
+    def _append_residual(self, i: int, new_k: torch.Tensor, new_v: torch.Tensor):
         if self.res_keys[i] is None:
             self.res_keys[i] = new_k
             self.res_values[i] = new_v
@@ -390,8 +394,14 @@ class KiviCache:
             self.res_keys[i] = torch.cat([self.res_keys[i], new_k], dim=2)
             self.res_values[i] = torch.cat([self.res_values[i], new_v], dim=2)
 
-        res_len = self.res_keys[i].shape[2]
-        if res_len >= self.R and self._pending[i] is None:
+    def _maybe_flush(self, i: int):
+        """Submit a flush of layer i's residual excess if it reached R and no
+        flush is already in flight for the layer."""
+        res = self.res_keys[i]
+        if res is None or self._pending[i] is not None:
+            return
+        res_len = res.shape[2]
+        if res_len >= self.R:
             flush_len = ((res_len - (self.R - self.G)) // self.G) * self.G
             self._submit_flush(i, flush_len)
 

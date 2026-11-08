@@ -13,7 +13,11 @@ Usage:
     # Option 1: One-liner generation
     text = generate(model, tokenizer, "Once upon a time", max_new_tokens=200)
 
-    # Option 2: Manual control
+    # Option 2: native transformers integration (no full FP cache rebuilt)
+    cache = enable_kivi(model)
+    out = model.generate(input_ids, past_key_values=cache, max_new_tokens=200)
+
+    # Option 3: Manual control
     cache = KiviCache.from_model(model)
     # ... use cache.add_tokens() / cache.get_full_cache() in your own loop
 
@@ -24,5 +28,6 @@ Paper: "KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache"
 from ._version import __version__
 from .cache.manager import KiviCache
 from .generation.generate import generate
+from .hf import KiviHFCache, enable_kivi
 
-__all__ = ["KiviCache", "generate", "__version__"]
+__all__ = ["KiviCache", "KiviHFCache", "enable_kivi", "generate", "__version__"]
