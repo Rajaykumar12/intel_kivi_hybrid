@@ -6,6 +6,7 @@
 #include "ops/kv_cache_ops.hpp"
 #include "kivi/event.hpp"
 #include "kivi/usm.hpp"
+#include "cpu/fused_attention.hpp"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "KIVI: Asymmetric 2-bit KV Cache Quantization for Intel XPU (SYCL)";
@@ -34,6 +35,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "True if KIVI kernels can dereference this tensor's memory: an XPU "
           "tensor, or a CPU tensor allocated with alloc_usm_host.",
           py::arg("tensor"));
+
+    // --- CPU fused decode attention over the packed history (Phase 2 §B.4)
+    m.def("fused_decode_attention", &kivi_fused_decode_attention,
+          "One decode step of attention computed directly from the packed 2-bit "
+          "history plus the FP residual, without materialising the dequantized "
+          "history. Returns [B, 1, Hq, D].",
+          py::arg("query"), py::arg("k_res"), py::arg("v_res"),
+          py::arg("packed_k"), py::arg("scales_k"), py::arg("zeros_k"),
+          py::arg("packed_v"), py::arg("scales_v"), py::arg("zeros_v"),
+          py::arg("scaling"), py::arg("group_size"),
+          py::call_guard<py::gil_scoped_release>());
+    m.def("fused_attention_uses_avx2", &kivi_fused_attention_uses_avx2,
+          "Whether the fused attention runs its AVX2/FMA code path on this CPU.");
 
     m.def("quantize_keys",     &kivi_quant_keys,
           "Asymmetric 2-bit key quantization (per-channel)",
