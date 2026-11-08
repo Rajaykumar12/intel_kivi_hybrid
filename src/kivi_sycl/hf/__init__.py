@@ -14,12 +14,15 @@ __all__ = ["enable_kivi", "KiviHFCache", "KiviLayer", "kivi_attention_forward",
            "register_kivi_attention", "ATTN_NAME"]
 
 
-def enable_kivi(model, max_tokens: int = 0, **cache_kwargs) -> KiviHFCache:
+def enable_kivi(model, max_tokens: int = 0, fused: bool = True,
+                **cache_kwargs) -> KiviHFCache:
     """Switch ``model`` to the "kivi" attention and return a fresh KIVI cache
     to pass as ``past_key_values``. ``cache_kwargs`` go to
     ``KiviCache.from_model`` (group_size, residual_length, metadata_dtype,
     zero_copy, device, async_flush). ``max_tokens`` — prompt plus generated
     tokens, if known — sizes the packed store once (``KiviCache.reserve``).
+    ``fused`` selects the fused decode-attention kernel (default) over the
+    dequantize-then-SDPA reference path.
 
     One cache per sequence: create a new one (or call ``.reset()``) for each
     generation."""
@@ -28,4 +31,4 @@ def enable_kivi(model, max_tokens: int = 0, **cache_kwargs) -> KiviHFCache:
     engine = KiviCache.from_model(model, **cache_kwargs)
     if max_tokens:
         engine.reserve(max_tokens)
-    return KiviHFCache(engine)
+    return KiviHFCache(engine, fused=fused)

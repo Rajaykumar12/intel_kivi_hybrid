@@ -31,10 +31,14 @@ class KiviLayer(CacheLayerMixin):
     is_sliding = False
     is_compileable = False
 
-    def __init__(self, engine: KiviCache, layer_idx: int):
+    def __init__(self, engine: KiviCache, layer_idx: int, fused: bool = True):
         super().__init__()
         self.engine = engine
         self.layer_idx = layer_idx
+        # Use the fused decode-attention kernel when applicable (attention.py).
+        self.fused = fused
+        # Which attention path ran, per call — for tests and diagnostics.
+        self.calls = {"fused": 0, "reference": 0}
 
     def lazy_initialization(self, key_states, value_states) -> None:
         self.dtype, self.device = key_states.dtype, key_states.device
@@ -124,9 +128,14 @@ class KiviHFCache(Cache):
     ``kivi_sycl.enable_kivi(model)`` (which also selects the "kivi" attention)
     or ``KiviHFCache(KiviCache.from_model(model))``."""
 
-    def __init__(self, engine: KiviCache):
-        super().__init__(layers=[KiviLayer(engine, i) for i in range(engine.num_layers)])
+    def __init__(self, engine: KiviCache, fused: bool = True):
+        super().__init__(layers=[KiviLayer(engine, i, fused) for i in range(engine.num_layers)])
         self.kivi = engine
+
+    @property
+    def attention_calls(self) -> dict:
+        """How many attention calls took each path, summed over layers."""
+        return {k: sum(l.calls[k] for l in self.layers) for k in ("fused", "reference")}
 
     def get_stats(self, layer: Optional[int] = 0) -> dict:
         """Measured memory stats; see ``KiviCache.get_stats``."""

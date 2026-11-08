@@ -59,10 +59,11 @@ def _old_path(model, ids, async_flush=True):
     return logits, c
 
 
-def _new_path(model, ids, async_flush=True, max_tokens=0):
-    """Greedy decode with the HF-native cache, stepping the model by hand."""
+def _new_path(model, ids, async_flush=True, max_tokens=0, fused=False):
+    """Greedy decode with the HF-native cache, stepping the model by hand.
+    fused=False is the dequantize-then-SDPA reference path."""
     cache = enable_kivi(model, group_size=G, residual_length=R,
-                        async_flush=async_flush, max_tokens=max_tokens)
+                        async_flush=async_flush, max_tokens=max_tokens, fused=fused)
     logits = []
     with torch.no_grad():
         out = model(ids, past_key_values=cache, use_cache=True)
@@ -89,6 +90,25 @@ def test_hf_path_bit_identical_to_add_tokens_path(kind, async_flush):
     # Same packed bytes in the store.
     for name in ("_packed_k", "_scales_k", "_packed_v", "_zeros_v"):
         assert torch.equal(getattr(old, name)[0], getattr(new.kivi, name)[0]), name
+
+
+@pytest.mark.parametrize("kind", ["gpt2", "llama-gqa", "qwen2-gqa"])
+def test_fused_path_matches_reference_path(kind):
+    """The fused kernel sums in a different order than dequantize+SDPA, so it
+    is a tolerance check — but every decode step with history must take it,
+    and greedy tokens must not diverge on these runs."""
+    model = _tiny(kind)
+    ids = torch.randint(0, 97, (1, PROMPT))
+    ref_logits, ref = _new_path(model, ids, fused=False)
+    got_logits, got = _new_path(model, ids, fused=True)
+    calls = got.attention_calls
+    assert calls["fused"] > 0
+    # Only prefill and the decode steps before the first harvest use the reference.
+    assert ref.attention_calls["fused"] == 0
+    for step, (a, b) in enumerate(zip(ref_logits, got_logits)):
+        torch.testing.assert_close(b, a, rtol=1e-4, atol=1e-4,
+                                   msg=lambda m: f"{kind} step {step}: {m}")
+        assert a.argmax() == b.argmax(), f"{kind}: greedy token differs at step {step}"
 
 
 def test_generate_api_and_stats():
