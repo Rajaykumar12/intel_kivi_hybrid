@@ -31,6 +31,19 @@ ld_flags = os.environ.get("LDFLAGS", "").split()
 compile_flags = ["-fsycl", "-fPIC", "-std=c++17", "-O3", "-w"] + cxx_flags
 link_flags = compile_flags + ld_flags
 
+# Ahead-of-time device compilation (optional). Without it the SPIR-V device
+# code is JIT-compiled by the GPU driver on first use — measured ~1.5 s on
+# Iris Xe for the dequantize image on a cold driver cache. KIVI_AOT_DEVICE is
+# passed to ocloc's -device: a device (adl-p for Alder Lake Iris Xe, tgllp,
+# dg2, ...), a family (xe-lp, gen12lp, xe-hpg, ...), a PCI id (0x46a8) or a
+# comma list; `ocloc compile --help` lists them. The generic spir64 target is
+# kept alongside, so the binary still JIT-runs on any other Intel GPU.
+_aot_device = os.environ.get("KIVI_AOT_DEVICE", "").strip()
+if _aot_device:
+    _targets = ["-fsycl-targets=spir64_gen,spir64"]
+    compile_flags += _targets
+    link_flags += _targets + ["-Xsycl-target-backend=spir64_gen", f"-device {_aot_device}"]
+
 # Submit kernels on the SYCL queue backing PyTorch's current XPU stream
 # (see src/csrc/include/kivi/common.hpp) when the installed torch ships
 # libc10_xpu (torch >= 2.4 XPU builds). Older torch/IPEX stacks fall back
