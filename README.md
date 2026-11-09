@@ -313,21 +313,31 @@ pip install kivi_sycl-0.1.0-cp310-cp310-linux_x86_64.whl
 Needed only if you want to modify the SYCL kernels.
 
 ```bash
-# Prerequisites: Intel oneAPI DPC++ compiler
-source /opt/intel/oneapi/setvars.sh
-conda activate intel_xpu
-
-# Clone and install
 git clone https://github.com/Rajaykumar12/intel_kivi_hybrid.git
 cd intel_kivi_hybrid
-pip install . --no-build-isolation
+bash scripts/dev_build.sh        # clean in-place build
+bash scripts/dev_test.sh         # test suite
 ```
+
+The compiler must be compatible with the SYCL runtime bundled in your torch XPU wheel.
+`scripts/dev_build.sh` sources a specific oneAPI compiler (`KIVI_ICPX_VER`, default 2026.1)
+instead of `setvars.sh`, which resolves to the newest installed oneAPI and can break
+`import torch` (`undefined symbol: urKernelSetArgLocal`). `KIVI_ENV` selects the conda env.
+
+**Ahead-of-time GPU code (optional):** `KIVI_AOT_DEVICE=adl-p bash scripts/dev_build.sh`
+compiles native code for Alder Lake Iris Xe in addition to portable SPIR-V. Any `ocloc
+-device` value works (`tgllp`, `dg2`, a family such as `xe-lp`, or a PCI id). Measured on a
+cold driver cache, it removes the first-use JIT of the kernels (quantize 73 → 0.6 ms,
+dequantize 33 → 0.3 ms per process); with a warm driver cache JIT is already ~1 ms.
+
+`bash scripts/check_warnings.sh` audits the C++/SYCL sources with `-Wall -Wextra`
+(the regular build uses `-w` to keep torch's header warnings out of the log).
 
 ### Building a wheel (for maintainers)
 
 ```bash
-source /opt/intel/oneapi/setvars.sh
-bash scripts/build_wheel.sh
+bash scripts/build_wheel.sh                         # portable
+KIVI_AOT_DEVICE=adl-p bash scripts/build_wheel.sh   # + native Iris Xe code
 # Output: dist/kivi_sycl-0.1.0-cp310-cp310-linux_x86_64.whl
 ```
 
@@ -500,11 +510,26 @@ kivi_sycl_native.quant_dequant_roundtrip_values(input, output, head_dim, group_s
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `group_size` (G) | 32 | Quantization granularity. Smaller = better quality, more metadata |
+| `group_size` (G) | 32 | Quantization granularity. Smaller = better quality, more metadata. Also accepts a list with one G per layer (see below) |
 | `residual_length` (R) | 128 | Recent FP32 tokens. Larger = better quality, less compression |
 | `metadata_dtype` | `"auto"` (fp16) | Scale/zero dtype. fp16 lifts the G=32 ceiling to 10.67×; `torch.float32` restores 8× (fp32 models only) |
 | `zero_copy` | `"auto"` | On XPU, keep the packed store in USM host memory that the kernels write directly — no host↔device copies. `False` stages through XPU tensors |
 | `cache.reserve(n)` | — | Optional: size the packed store once for an `n`-token sequence (`generate()` calls it), so it never grows and carries no spare capacity |
+
+**Per-layer group size.** Which layers get coarse groups matters far more than how many:
+on gpt2 (WikiText-2, 10×512, R=128), coarsening the middle layers to G=64 costs ~+5% perplexity,
+while coarsening the first two layers is nearly free:
+
+| `group_size` | Ceiling (vs fp32) | Perplexity Δ vs FP |
+|---|---|---|
+| `32` (default) | 10.67× | +1.88% |
+| `[64, 64] + [32] * 10` | 10.97× | +1.89% |
+| `[64, 64] + [32] * 8 + [64, 64]` | 11.29× | +2.02% |
+| `[16, 16] + [64] * 10` (wrong layers coarsened) | 11.64× | +5.14% |
+| `64` | 12.80× | +5.23% |
+
+That is one model on ~5k tokens — measure your own model with
+`examples/eval_perplexity.py --G 64,64,32,...` before relying on a schedule.
 
 For GPT-2 (short sequences), `R=64` is sufficient. For 7B+ models with long contexts, `R=128` is recommended per the paper.
 
