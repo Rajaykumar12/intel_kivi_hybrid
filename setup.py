@@ -28,6 +28,16 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension
 cxx_flags = os.environ.get("CXXFLAGS", "").split()
 ld_flags = os.environ.get("LDFLAGS", "").split()
 
+# Floating point: icpx's default model is already "fast" — unsafe-math
+# reassociation, approximate libm (-fapprox-func), FTZ/DAZ denormals, FMA
+# contraction — but it still honours NaN/Inf. Measured 2026-11-09: forcing
+# -fp-model=precise made the CPU fused attention ~1.6x slower (median 1.44 vs
+# 0.91 ms per layer at 8k over repeated runs; its accumulation loops lose
+# reassociation) with no accuracy gain (1.5e-6 vs 1.0e-6 max error against the
+# dequantize+SDPA reference) and all tests passing either way.
+# Do NOT add -ffast-math: on top of the default it implies finite-math-only,
+# which lets the compiler drop the NaN/Inf handling the fp16 scale floor and
+# saturation in kernels/internal/quant_tile.hpp exist for.
 compile_flags = ["-fsycl", "-fPIC", "-std=c++17", "-O3", "-w"] + cxx_flags
 link_flags = compile_flags + ld_flags
 
