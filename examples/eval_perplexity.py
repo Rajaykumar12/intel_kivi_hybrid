@@ -98,7 +98,9 @@ def main():
     parser.add_argument("--dataset", choices=["wikitext2", "c4"], default="wikitext2")
     parser.add_argument("--windows", type=int, default=10, help="Number of eval windows")
     parser.add_argument("--window-len", type=int, default=256, help="Tokens per window")
-    parser.add_argument("--G", type=int, default=32, help="Quantization group size")
+    parser.add_argument("--G", type=str, default="32",
+                        help="Quantization group size, or a comma list with one G per layer "
+                             "(e.g. 16,16,64,...,64,16,16)")
     parser.add_argument("--R", type=int, default=64, help="Residual window size")
     parser.add_argument("--metadata", choices=["fp16", "fp32"], default="fp16",
                         help="scale/zero dtype (fp16 = default 10.67x ceiling at G=32; "
@@ -108,6 +110,8 @@ def main():
                              "decode attention. hf-reference: native Cache, dequantize+SDPA.")
     args = parser.parse_args()
     meta = torch.float32 if args.metadata == "fp32" else "auto"
+    G = [int(g) for g in args.G.split(",")]
+    args.G = G[0] if len(G) == 1 else G
 
     if not torch.xpu.is_available():
         print("Error: XPU not found.")
