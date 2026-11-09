@@ -16,7 +16,7 @@ def generate(
     tokenizer,
     prompt: str,
     max_new_tokens: int = 200,
-    group_size: int = 32,
+    group_size=32,
     residual_length: int = 128,
     device: str = "xpu",
     serving: str = "rebuild",
@@ -38,7 +38,7 @@ def generate(
         tokenizer:        Matching tokenizer.
         prompt:           Input text.
         max_new_tokens:   Number of tokens to generate.
-        group_size:       Quantization group size G (default 32).
+        group_size:       Quantization group size G (default 32), or one per layer.
         residual_length:  FP32 residual window R (default 128).
         device:           XPU device for quantization (default "xpu").
         serving:          "rebuild" (packed-resident, memory-honest) or

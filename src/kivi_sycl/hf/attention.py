@@ -79,7 +79,8 @@ def kivi_attention_forward(module, query, key, value, attention_mask,
         if scaling is None:
             scaling = query.shape[-1] ** -0.5
         out = kivi_native.fused_decode_attention(
-            query, key, value, *layer.history(), float(scaling), layer.engine.G)
+            query, key, value, *layer.history(), float(scaling),
+            layer.engine._G[layer.layer_idx])
         layer.calls["fused"] += 1
         return out, None
 

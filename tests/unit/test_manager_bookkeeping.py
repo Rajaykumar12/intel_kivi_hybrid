@@ -542,3 +542,57 @@ def test_row_padding_aligns_key_rows():
     assert a.scales_k.shape == (1, 2, 8, 3) and a.scales_k.stride(-2) * 2 == 64
     b = LayerArena(1, 2, 8, 4, 12, torch.float16, lambda sh, dt: torch.empty(sh, dtype=dt))
     assert a.allocated_bytes > b.allocated_bytes
+
+
+# ---------------------------------------------------------------------------
+# Per-layer group size (Phase 3 step 5)
+# ---------------------------------------------------------------------------
+
+def test_per_layer_group_size_history_matches_reference():
+    """group_size=[4, 8]: each layer flushes in multiples of its own G and its
+    history equals the KIVI reference at that G."""
+    Gs, R = [4, 8], 8
+    torch.manual_seed(0)
+    cache = KiviCache(num_layers=2, head_dim=8, num_kv_heads=2, device="cpu",
+                      group_size=Gs, residual_length=R)
+    assert cache.G is None and cache._G == Gs
+    model = FakeModel(2, 2, 8, "in_place")
+    cache.add_tokens(model.forward(6))
+    for _ in range(40):
+        cache.add_tokens(model.forward(1, cache.get_full_cache()))
+    cache.harvest_pending()
+    for i, (k, v) in enumerate(_iter_kv_layers(cache.get_full_cache())):
+        G = Gs[i]
+        n_hist = cache._quant_token_count[i]
+        assert n_hist > 0 and n_hist % G == 0
+        assert R - G <= k.shape[2] - n_hist <= R - 1      # residual window for this G
+        for c0 in range(0, n_hist, G):
+            chunk = model.truth[i][:, :, c0:c0 + G, :].transpose(2, 3).contiguous()
+            assert torch.equal(k[:, :, c0:c0 + G, :],
+                               _roundtrip_2bit_reference(chunk, G).transpose(2, 3))
+        assert torch.equal(v[:, :, :n_hist, :], _roundtrip_2bit_reference(
+            model.truth_v[i][:, :, :n_hist, :].contiguous(), G))
+        assert cache.get_stats(i)["group_size"] == G
+
+
+def test_per_layer_group_size_reserve_is_exact_per_layer():
+    Gs, R, prefill, steps = [4, 8], 8, 6, 40
+    cache = KiviCache(num_layers=2, head_dim=8, num_kv_heads=2, device="cpu",
+                      group_size=Gs, residual_length=R)
+    cache.reserve(prefill + steps)
+    model = FakeModel(2, 2, 8, "in_place")
+    cache.add_tokens(model.forward(prefill))
+    for _ in range(steps - 1):
+        cache.add_tokens(model.forward(1, cache.get_full_cache()))
+    cache.add_tokens(model.forward(1, cache.get_full_cache()))
+    cache.harvest_pending()
+    for i in range(2):
+        a = cache._arena[i]
+        assert a.cap == a.used == cache._quant_token_count[i], (i, a.cap, a.used)
+
+
+def test_per_layer_group_size_validation():
+    with pytest.raises(AssertionError, match="entries for 3 layers"):
+        KiviCache(num_layers=3, head_dim=8, group_size=[4, 8], residual_length=8, device="cpu")
+    with pytest.raises(AssertionError, match="must be divisible by group_size"):
+        KiviCache(num_layers=2, head_dim=8, group_size=[4, 12], residual_length=16, device="cpu")

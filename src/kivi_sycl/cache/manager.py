@@ -117,7 +117,9 @@ class KiviCache:
         head_dim:         Dimension per attention head.
         num_kv_heads:     Number of KV heads (optional, auto-detected on first call).
         device:           Device for quantization kernels ("xpu").
-        group_size:       Quantization group size G. Must divide head_dim and be >=4.
+        group_size:       Quantization group size G — an int, or a list with one G
+                          per layer. Each must divide head_dim, be a multiple of 4
+                          and not exceed residual_length.
         residual_length:  Number of recent full-precision tokens to keep (R in paper).
         serving:          "rebuild" (memory-honest) or "cached" (speed) — see above.
         async_flush:      Overlap flush kernels with the next forward pass.
@@ -134,22 +136,29 @@ class KiviCache:
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         device: str = "xpu",
-        group_size: int = 32,
+        group_size=32,
         residual_length: int = 128,
         serving: str = "rebuild",
         async_flush: bool = True,
         metadata_dtype="auto",
         zero_copy="auto",
     ):
-        assert head_dim % group_size == 0, \
-            f"head_dim ({head_dim}) must be divisible by group_size ({group_size})"
-        assert group_size >= 4 and group_size % 4 == 0, \
-            f"group_size ({group_size}) must be >= 4 and divisible by 4"
-        assert group_size <= residual_length, (
-            f"group_size ({group_size}) must not exceed residual_length "
-            f"({residual_length}) — flushing requires a full group of tokens "
-            f"to be available in the residual buffer, or tokens are silently dropped."
-        )
+        if isinstance(group_size, int):
+            group_sizes = [group_size] * num_layers
+        else:
+            group_sizes = [int(g) for g in group_size]
+            assert len(group_sizes) == num_layers, (
+                f"group_size list has {len(group_sizes)} entries for {num_layers} layers")
+        for g in group_sizes:
+            assert head_dim % g == 0, \
+                f"head_dim ({head_dim}) must be divisible by group_size ({g})"
+            assert g >= 4 and g % 4 == 0, \
+                f"group_size ({g}) must be >= 4 and divisible by 4"
+            assert g <= residual_length, (
+                f"group_size ({g}) must not exceed residual_length "
+                f"({residual_length}) — flushing requires a full group of tokens "
+                f"to be available in the residual buffer, or tokens are silently dropped."
+            )
         assert serving in ("rebuild", "cached"), \
             f"serving must be 'rebuild' or 'cached', got {serving!r}"
         assert zero_copy in ("auto", True, False), \
@@ -159,7 +168,10 @@ class KiviCache:
             f"got {metadata_dtype!r}")
 
         self.device = device
-        self.G = group_size
+        # Per-layer group sizes; self.G is the shared value when uniform (the
+        # common case, and what older code reads), None when layers differ.
+        self._G: List[int] = group_sizes
+        self.G = group_sizes[0] if len(set(group_sizes)) == 1 else None
         self.R = residual_length
         self.head_dim = head_dim
         self.num_layers = num_layers
@@ -222,7 +234,7 @@ class KiviCache:
         cls,
         model,
         device: str = "xpu",
-        group_size: int = 32,
+        group_size=32,
         residual_length: int = 128,
         serving: str = "rebuild",
         async_flush: bool = True,
@@ -260,9 +272,7 @@ class KiviCache:
         footprint carries no spare capacity. Call before the first
         ``add_tokens`` of a sequence; ``reset()`` clears it."""
         assert total_tokens >= 0
-        # The residual always keeps at least R-G tokens back, and the
-        # quantized prefix is a multiple of G.
-        self._reserve_tokens = max(0, (total_tokens - (self.R - self.G)) // self.G * self.G)
+        self._reserve_tokens = total_tokens
 
     def add_tokens(self, past_key_values):
         """
@@ -394,6 +404,15 @@ class KiviCache:
             self.res_keys[i] = torch.cat([self.res_keys[i], new_k], dim=2)
             self.res_values[i] = torch.cat([self.res_values[i], new_v], dim=2)
 
+    def _layer_reserve(self, i: int) -> int:
+        """Final quantized-token count for layer i implied by reserve(): the
+        residual keeps at least R-G tokens back, and the quantized prefix is a
+        multiple of G. 0 when no reserve was given."""
+        if not self._reserve_tokens:
+            return 0
+        G = self._G[i]
+        return max(0, (self._reserve_tokens - (self.R - G)) // G * G)
+
     def _maybe_flush(self, i: int):
         """Submit a flush of layer i's residual excess if it reached R and no
         flush is already in flight for the layer."""
@@ -402,7 +421,8 @@ class KiviCache:
             return
         res_len = res.shape[2]
         if res_len >= self.R:
-            flush_len = ((res_len - (self.R - self.G)) // self.G) * self.G
+            G = self._G[i]
+            flush_len = ((res_len - (self.R - G)) // G) * G
             self._submit_flush(i, flush_len)
 
     def get_full_cache(self) -> DynamicCache:
@@ -530,7 +550,7 @@ class KiviCache:
         the outputs are collected by ``harvest_pending``. The tokens stay
         in the residual (still served in FP) until harvest."""
         i = layer_idx
-        G = self.G
+        G = self._G[i]
         assert self._pending[i] is None, (
             f"Layer {i} already has an in-flight flush — harvest_pending() "
             f"must run before a new flush is submitted."
@@ -552,7 +572,7 @@ class KiviCache:
         self._arena[i] = arena = ensure_capacity(
             self._arena[i], self._quant_token_count[i] + flush_len,
             B=B, H=H, D=D, G=G, meta_dtype=self._meta_dtype,
-            reserve=self._reserve_tokens, alloc=self._host_alloc)
+            reserve=self._layer_reserve(i), alloc=self._host_alloc)
         t0 = arena.used
 
         if self._zero_copy_enabled():
@@ -690,7 +710,8 @@ class KiviCache:
         B, H, D, _ = packed.shape
         q = (packed.unsqueeze(-1) >> _UNPACK_SHIFTS) & 0x3   # [B,H,D,T/4,4]
         T = q.numel() // (B * H * D)
-        q = q.reshape(B, H, D, T // self.G, self.G).to(out.dtype)
+        G = T // scales.shape[-1]          # per-layer G, from the shapes
+        q = q.reshape(B, H, D, T // G, G).to(out.dtype)
         q.mul_(scales.unsqueeze(-1)).add_(zeros.unsqueeze(-1))
         out.copy_(q.reshape(B, H, D, T).transpose(2, 3))
 
@@ -702,7 +723,8 @@ class KiviCache:
         B, H, T, _ = packed.shape
         q = (packed.unsqueeze(-1) >> _UNPACK_SHIFTS) & 0x3   # [B,H,T,D/4,4]
         D = q.numel() // (B * H * T)
-        q = q.reshape(B, H, T, D // self.G, self.G).to(out.dtype)
+        G = D // scales.shape[-1]
+        q = q.reshape(B, H, T, D // G, G).to(out.dtype)
         q.mul_(scales.unsqueeze(-1)).add_(zeros.unsqueeze(-1))
         out.copy_(q.reshape(B, H, T, D))
 
@@ -855,6 +877,7 @@ class KiviCache:
         denom = kivi_bytes + serving_copy_bytes
 
         return {
+            "group_size": self._G[i],
             "total_tokens": total,
             "quantized_tokens": quant_tokens,
             "residual_tokens": res_tokens,
@@ -873,6 +896,6 @@ class KiviCache:
 
     def __repr__(self):
         return (f"KiviCache(layers={self.num_layers}, head_dim={self.head_dim}, "
-                f"G={self.G}, R={self.R}, device='{self.device}', "
+                f"G={self.G if self.G is not None else self._G}, R={self.R}, device='{self.device}', "
                 f"serving='{self.serving}', async_flush={self.async_flush}, "
                 f"metadata_dtype={self.metadata_dtype}, zero_copy={self.zero_copy})")

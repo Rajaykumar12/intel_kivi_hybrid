@@ -145,3 +145,36 @@ def test_unsupported_cache_ops_raise():
     cache = enable_kivi(_tiny("gpt2"), group_size=G, residual_length=R)
     with pytest.raises(NotImplementedError):
         cache.reorder_cache(torch.tensor([0]))
+
+
+def test_per_layer_group_size_through_hf_paths():
+    """Mixed G (layer 0: 8, layer 1: 16): the HF reference path stays
+    bit-identical to the legacy loop, and the fused kernel matches it."""
+    model = _tiny("llama-gqa")
+    ids = torch.randint(0, 97, (1, PROMPT))
+    Gs = [8, 16]
+    legacy = KiviCache.from_model(model, group_size=Gs, residual_length=R)
+    with torch.no_grad():
+        out = model(ids, use_cache=True); legacy.add_tokens(out.past_key_values)
+        nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+        legacy_logits = []
+        for _ in range(STEPS):
+            out = model(nxt, past_key_values=legacy.get_full_cache(), use_cache=True)
+            legacy_logits.append(out.logits[:, -1]); legacy.add_tokens(out.past_key_values)
+            nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+    for fused in (False, True):
+        cache = enable_kivi(model, group_size=Gs, residual_length=R, fused=fused)
+        with torch.no_grad():
+            out = model(ids, past_key_values=cache, use_cache=True)
+            nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+            for step in range(STEPS):
+                out = model(nxt, past_key_values=cache, use_cache=True)
+                got = out.logits[:, -1]
+                if fused:
+                    torch.testing.assert_close(got, legacy_logits[step], rtol=1e-4, atol=1e-4)
+                else:
+                    assert torch.equal(got, legacy_logits[step]), f"step {step}"
+                nxt = got.argmax(-1, keepdim=True)
+        assert [cache.get_stats(i)["group_size"] for i in range(2)] == Gs
+        if fused:
+            assert cache.attention_calls["fused"] > 0
