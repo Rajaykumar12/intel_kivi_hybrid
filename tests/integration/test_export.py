@@ -1,6 +1,6 @@
-"""Exported prefill/decode programs with torch.ops.kivi.layer_attention
-(Phase 5 A.1): one op per layer in the graph, and running the programs
-against an engine registered as id 0 reproduces eager op mode bit for bit."""
+"""Exported program with torch.ops.kivi.layer_attention (Phase 5 A.1–A.2):
+one op per layer in the graph; the exported program (and its AOTInductor
+package) run against an engine registered as id 0 reproduce eager op mode."""
 
 import pytest
 
@@ -12,7 +12,7 @@ if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
 from transformers import LlamaConfig, LlamaForCausalLM, Qwen2Config, Qwen2ForCausalLM  # noqa: E402
 
 from kivi_sycl import KiviCache, _C  # noqa: E402
-from kivi_sycl.export import RUNTIME_ENGINE_ID, export_programs  # noqa: E402
+from kivi_sycl.export import RUNTIME_ENGINE_ID, compile_package, export_program  # noqa: E402
 from kivi_sycl.hf.compiled import enable_kivi_op  # noqa: E402
 
 G, R, PROMPT, STEPS = 8, 16, 13, 30
@@ -47,32 +47,47 @@ def _eager_op_mode(model, ids):
     return logits
 
 
-@pytest.mark.parametrize("kind", ["llama-gqa", "qwen2-gqa"])
-def test_exported_programs_reproduce_eager_op_mode(kind):
-    model = _tiny(kind)
-    ids = torch.randint(0, 97, (1, PROMPT))
-    prefill, decode = export_programs(model, max_prompt=64)
-    for ep in (prefill, decode):
-        ops = [n for n in ep.graph.nodes if "kivi.layer_attention" in str(n.target)]
-        assert len(ops) == 2, "one layer_attention per layer"
-
+def _run_program(fn, model, ids):
+    """Prefill + STEPS decode calls of `fn(ids, positions, state)` against a
+    fresh engine registered under the runtime id."""
     cache = KiviCache.from_model(model, group_size=G, residual_length=R)
     _C.register_engine(cache._native, RUNTIME_ENGINE_ID)
+    state = torch.zeros(1, dtype=torch.int64)
     try:
-        pre, dec = prefill.module(), decode.module()
-        state = torch.zeros(1, dtype=torch.int64)
         with torch.no_grad():
-            lg = pre(ids, torch.arange(PROMPT)[None], state)
-            nxt, pos, got = lg[:, -1].argmax(-1, keepdim=True), PROMPT, []
+            lg = fn(ids, torch.arange(ids.shape[1])[None], state)
+            nxt, pos, got = lg[:, -1].argmax(-1, keepdim=True), ids.shape[1], []
             for _ in range(STEPS):
-                lg = dec(nxt, torch.tensor([[pos]]), state)
+                lg = fn(nxt, torch.tensor([[pos]]), state)
                 got.append(lg[:, -1])
                 nxt, pos = lg[:, -1].argmax(-1, keepdim=True), pos + 1
     finally:
         _C.unregister_engine(RUNTIME_ENGINE_ID)
-    assert int(state.item()) == (STEPS + 1) * 2
+    assert int(state.item()) == (STEPS + 1) * 2       # one engine call per layer per call
     assert cache.quantized_tokens(0) >= 2 * G
+    return got
 
+
+@pytest.mark.parametrize("kind", ["llama-gqa", "qwen2-gqa"])
+def test_exported_program_reproduces_eager_op_mode(kind):
+    model = _tiny(kind)
+    ids = torch.randint(0, 97, (1, PROMPT))
+    ep = export_program(model, max_tokens=64)
+    ops = [n for n in ep.graph.nodes if "kivi.layer_attention" in str(n.target)]
+    assert len(ops) == 2, "one layer_attention per layer"
+    got = _run_program(ep.module(), model, ids)
     ref = _eager_op_mode(model, ids)
     for step, (a, b) in enumerate(zip(ref, got)):
         assert torch.equal(a, b), f"{kind}: step {step}"
+
+
+def test_aoti_package_matches_eager_op_mode(tmp_path):
+    model = _tiny("llama-gqa")
+    ids = torch.randint(0, 97, (1, PROMPT))
+    path = compile_package(export_program(model, max_tokens=64), str(tmp_path / "model.pt2"))
+    pkg = torch._inductor.aoti_load_package(path)
+    got = _run_program(pkg, model, ids)
+    ref = _eager_op_mode(model, ids)
+    for a, b in zip(ref, got):
+        torch.testing.assert_close(b, a, rtol=1e-4, atol=1e-5)   # Inductor reorders arithmetic
+        assert a.argmax() == b.argmax()

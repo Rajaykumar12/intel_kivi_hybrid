@@ -12,9 +12,9 @@ is a pure function of its inputs as far as tracing is concerned:
   * ``state`` is the op's mutated token tensor; it keeps the side-effecting
     calls in order through export and compilation.
 
-Measured on TinyLlama-1.1B (2026-11-10): decode and prefill (dynamic T)
-programs export in ~2–3 s, contain exactly one layer_attention per layer, and
-reproduce eager op mode bit for bit over 40 decode steps.
+Measured on TinyLlama-1.1B (2026-11-10): the program exports in a few
+seconds, contains exactly one layer_attention per layer, and reproduces
+eager op mode bit for bit over 40 decode steps.
 """
 
 import torch
@@ -23,7 +23,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..hf.compiled import OP_ATTN_NAME, kivi_op_attention
 
-__all__ = ["RUNTIME_ENGINE_ID", "KiviExportDecoder", "export_programs"]
+__all__ = ["RUNTIME_ENGINE_ID", "KiviExportDecoder", "export_program", "compile_package"]
 
 RUNTIME_ENGINE_ID = 0
 
@@ -75,21 +75,33 @@ class KiviExportDecoder(torch.nn.Module):
                           kivi_engine_id=self.engine_id, kivi_state=state).logits
 
 
-def export_programs(model, max_prompt: int, example_prompt: int = 16):
-    """Export (prefill, decode) ExportedPrograms for ``model``.
-
-    prefill: input_ids [1, T] with T in [2, max_prompt] (dynamic);
-    decode:  input_ids [1, 1].
-    """
+def export_program(model, max_tokens: int, example_tokens: int = 8):
+    """Export ONE ExportedProgram serving both prefill and decode for ``model``:
+    input_ids [1, T] with T dynamic in [1, max_tokens]. T == 1 is a decode
+    step; larger T a (chunked) prefill. A single program means a single
+    compiled package and a single copy of the weights for the runtime.
+    (Dim.DYNAMIC would let export assume T >= 2; the explicit min=1 keeps the
+    decode case inside the traced range.)"""
     dec = KiviExportDecoder(model).eval()
     state = torch.zeros(1, dtype=torch.int64)
+    n = max(2, min(example_tokens, max_tokens))
+    T = torch.export.Dim("T", min=1, max=max_tokens)
     with torch.no_grad():
-        decode = torch.export.export(
-            dec, (torch.zeros(1, 1, dtype=torch.long), torch.tensor([[example_prompt]]), state),
-            strict=False)
-        T = torch.export.Dim("T", min=2, max=max_prompt)
-        n = min(example_prompt, max_prompt)
-        prefill = torch.export.export(
+        return torch.export.export(
             dec, (torch.zeros(1, n, dtype=torch.long), torch.arange(n)[None], state),
             strict=False, dynamic_shapes=({1: T}, {1: T}, None))
-    return prefill, decode
+
+
+def compile_package(exported_program, package_path: str) -> str:
+    """AOTInductor-compile and package ``exported_program`` to ``package_path``
+    (.pt2). Weights are appended to the compiled shared object and memory-
+    mapped at load (``force_mmap_weights``), the mode AOTInductor documents as
+    needed for 1B+ parameter models — a 1.1B fp32 model is ~4.4 GB, too large
+    for the shared object's data section.
+
+    (Not ``package_constants_in_so=False``: without also choosing a
+    ``package_constants_on_disk_format`` that stores the weights nowhere, and
+    the compiled model reads garbage — it segfaulted here, 2026-11-10.)"""
+    return torch._inductor.aoti_compile_and_package(
+        exported_program, package_path=package_path,
+        inductor_configs={"aot_inductor.force_mmap_weights": True})
