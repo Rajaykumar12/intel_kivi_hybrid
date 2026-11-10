@@ -22,7 +22,7 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from kivi_sycl import KiviCache
+from kivi_sycl import KiviCache, enable_kivi
 
 
 def _make_prompt(tokenizer, num_tokens):
@@ -70,9 +70,12 @@ def run_fp_baseline(model, input_ids, num_gen_tokens):
     return elapsed, fp_bytes, num_layers
 
 
-def run_kivi(model, input_ids, num_gen_tokens, G, R, serving="rebuild"):
+def run_kivi(model, input_ids, num_gen_tokens, G, R, serving="rebuild",
+             metadata_dtype="auto"):
     cache = KiviCache.from_model(model, device="xpu", group_size=G,
-                                 residual_length=R, serving=serving)
+                                 residual_length=R, serving=serving,
+                                 metadata_dtype=metadata_dtype)
+    cache.reserve(input_ids.shape[1] + num_gen_tokens)
     with torch.no_grad():
         out = model(input_ids, use_cache=True)
     cache.add_tokens(out.past_key_values)
@@ -84,6 +87,28 @@ def run_kivi(model, input_ids, num_gen_tokens, G, R, serving="rebuild"):
             past = cache.get_full_cache()
             out = model(ids, past_key_values=past, use_cache=True)
             cache.add_tokens(out.past_key_values)
+            ids = out.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+    cache.harvest_pending()
+    elapsed = time.time() - start
+    return elapsed, cache.get_stats(layer=0)
+
+
+def run_kivi_hf(model, input_ids, num_gen_tokens, G, R, metadata_dtype="auto",
+                fused=True):
+    """Native transformers path: KIVI Cache + "kivi" attention. No full FP
+    cache is rebuilt between steps; with fused=True decode attention reads
+    the packed history directly."""
+    cache = enable_kivi(model, group_size=G, residual_length=R, fused=fused,
+                        metadata_dtype=metadata_dtype,
+                        max_tokens=input_ids.shape[1] + num_gen_tokens)
+    with torch.no_grad():
+        out = model(input_ids, past_key_values=cache, use_cache=True)
+    ids = out.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+
+    start = time.time()
+    with torch.no_grad():
+        for _ in range(1, num_gen_tokens):
+            out = model(ids, past_key_values=cache, use_cache=True)
             ids = out.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
     cache.harvest_pending()
     elapsed = time.time() - start
@@ -102,7 +127,15 @@ def main():
                         help="rebuild: dequantize history on every read (keeps the "
                              "memory win). cached: retain a persistent FP history copy "
                              "(faster reads, trades the memory back).")
+    parser.add_argument("--metadata", choices=["fp16", "fp32"], default="fp16",
+                        help="scale/zero dtype (fp16 = default 10.67x ceiling at G=32; "
+                             "fp32 = previous 8x ceiling)")
+    parser.add_argument("--path", choices=["legacy", "hf", "hf-reference"], default="legacy",
+                        help="legacy: add_tokens/get_full_cache loop. hf: native "
+                             "transformers Cache + fused decode attention. hf-reference: "
+                             "native Cache, dequantize-then-SDPA attention.")
     args = parser.parse_args()
+    meta = torch.float32 if args.metadata == "fp32" else "auto"
 
     if not torch.xpu.is_available():
         print("Error: XPU not found.")
@@ -134,9 +167,13 @@ def main():
     print(f"  {args.gen - 1} tokens in {fp_elapsed:.2f}s ({fp_toks:.1f} tok/s), prefill excluded")
     print(f"  Resident KV, all {num_layers} layers (analytical): {fp_bytes/1024/1024:.1f} MB")
 
-    print(f"\n--- KIVI 2-bit (serving={args.serving}) ---")
-    kivi_elapsed, stats = run_kivi(model, input_ids.clone(), args.gen, args.G,
-                                   args.R, args.serving)
+    print(f"\n--- KIVI 2-bit (path={args.path}, serving={args.serving}, metadata={args.metadata}) ---")
+    if args.path == "legacy":
+        kivi_elapsed, stats = run_kivi(model, input_ids.clone(), args.gen, args.G,
+                                       args.R, args.serving, meta)
+    else:
+        kivi_elapsed, stats = run_kivi_hf(model, input_ids.clone(), args.gen, args.G,
+                                          args.R, meta, fused=(args.path == "hf"))
     kivi_toks = (args.gen - 1) / kivi_elapsed
     print(f"  {args.gen - 1} tokens in {kivi_elapsed:.2f}s ({kivi_toks:.1f} tok/s)")
     print(f"  Layer 0, measured: packed {stats['packed_bytes']/1024:.1f} KB + "
@@ -155,7 +192,12 @@ def main():
 
     print(f"\n{'='*64}")
     print(f"Summary @ ctx={args.ctx}, gen={args.gen}, G={args.G}, R={args.R}, "
-          f"serving={args.serving}")
+          f"serving={args.serving}, metadata={args.metadata}, path={args.path}")
+    rho = stats["residual_tokens"] / stats["total_tokens"]
+    m = 2 if args.metadata == "fp16" else 4
+    ceiling = 8 / (0.5 + 4 * m / args.G)
+    print(f"  Model: ceiling C={ceiling:.2f}x, rho={rho:.4f} -> predicted "
+          f"{ceiling / (1 + rho * (ceiling - 1)):.2f}x (fp32 baseline)")
     print(f"  Throughput:  FP {fp_toks:.1f} tok/s  ->  KIVI {kivi_toks:.1f} tok/s "
           f"({(kivi_toks/fp_toks - 1) * 100:+.0f}%)")
     print(f"  Resident KV, all {num_layers} layers (measured):")

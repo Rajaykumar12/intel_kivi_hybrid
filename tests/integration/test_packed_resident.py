@@ -75,6 +75,33 @@ def test_fp_dtypes_roundtrip_error_bounded(dtype):
     assert err <= max_scale / 2 + 1e-2, f"value error {err} vs scale {max_scale}"
 
 
+@pytest.mark.parametrize("label,make", [
+    ("constant", lambda: torch.full((G,), 0.5)),
+    # range below fp16's smallest subnormal step once divided by 3
+    ("subnormal range", lambda: torch.arange(G) % 2 * 6e-8),
+    ("tiny range", lambda: 0.5 + 1e-4 * torch.arange(G)),
+])
+def test_fp16_degenerate_groups_store_nonzero_scale(label, make):
+    """fp16 metadata must never store scale == 0. With the old `+1e-10`
+    epsilon (below fp16's subnormal range) a constant group stored 0 and the
+    pack pass divided by it — correct bytes only because this GPU converts
+    NaN/inf to 0 on float->int, which is undefined behaviour."""
+    row = make().to(torch.float16)
+    x = row.expand(B, H, D, G).contiguous().to("xpu")
+    packed, scales, zeros = _quant_keys_xpu(x, torch.float16)
+    out = torch.empty_like(x)
+    kivi_native.dequantize_keys(packed, scales, zeros, out, G)
+    fused = torch.empty_like(x)
+    kivi_native.quant_dequant_roundtrip_keys(x, fused, G)
+
+    scales_c = scales.cpu().float()
+    assert (scales_c > 0).all(), f"{label}: zero scale stored"
+    out_c, x_c = out.cpu().float(), x.cpu().float()
+    assert torch.isfinite(out_c).all()
+    assert (out_c - x_c).abs().max().item() <= scales_c.max().item() / 2 + 1e-3
+    assert torch.equal(out.cpu(), fused.cpu())
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_fused_roundtrip_matches_quant_then_dequant(dtype):
     """The fused round-trip kernel must be bit-identical to quantize
@@ -131,17 +158,24 @@ def test_cpu_dequant_matches_xpu_kernel(dtype):
     assert torch.allclose(cpu_out, kernel_out.cpu(), atol=tol, rtol=tol)
 
 
-def _reference_roundtrip(inp, group_size):
+def _reference_roundtrip(inp, group_size, meta_dtype):
+    """Torch mirror of quantize->dequantize for the given metadata dtype
+    (see compute_scale<M> / saturate_zero<M> in quant_tile.hpp)."""
     flat = inp.reshape(-1, group_size)
     mn = flat.min(dim=1, keepdim=True).values
     mx = flat.max(dim=1, keepdim=True).values
-    scale = (mx - mn) / 3.0 + 1e-10
+    if meta_dtype == torch.float32:
+        scale = (mx - mn) / 3.0 + 1e-10
+    else:
+        scale = torch.clamp((mx - mn) / 3.0, 2.0 ** -14, 65504.0).half().float()
+        mn = torch.clamp(mn, -65504.0, 65504.0).half().float()
     q = torch.clamp(torch.round((flat - mn) / scale), 0.0, 3.0)
     return (q * scale + mn).reshape(inp.shape)
 
 
+@pytest.mark.parametrize("metadata_dtype", ["auto", torch.float32])
 @pytest.mark.parametrize("async_flush", [True, False])
-def test_manager_end_to_end_on_xpu(async_flush):
+def test_manager_end_to_end_on_xpu(async_flush, metadata_dtype):
     """Full KiviCache loop with the real kernels: packed store resident,
     serving matches the torch KIVI reference, stats measured."""
     torch.manual_seed(3)
@@ -149,7 +183,9 @@ def test_manager_end_to_end_on_xpu(async_flush):
     layers = 2
     cache = KiviCache(num_layers=layers, head_dim=D, num_kv_heads=H,
                       device="xpu", group_size=G, residual_length=R,
-                      serving="rebuild", async_flush=async_flush)
+                      serving="rebuild", async_flush=async_flush,
+                      metadata_dtype=metadata_dtype)
+    meta = torch.float16 if metadata_dtype == "auto" else torch.float32
 
     truth_k = [None] * layers
     truth_v = [None] * layers
@@ -176,6 +212,8 @@ def test_manager_end_to_end_on_xpu(async_flush):
 
     for i, (k, v) in enumerate(_iter_kv_layers(cache.get_full_cache())):
         assert k.shape[2] == total
+        assert k.dtype == v.dtype == torch.float32      # served in model dtype
+        assert cache._scales_k[i].dtype == meta
         n_hist = cache._quant_token_count[i]
         assert n_hist > 0 and n_hist % G == 0
         # Residual exact
@@ -185,11 +223,11 @@ def test_manager_end_to_end_on_xpu(async_flush):
         # groups, values per-token in G-channel groups)
         for c0 in range(0, n_hist, G):
             chunk = truth_k[i][:, :, c0:c0 + G, :].transpose(2, 3).contiguous()
-            expect = _reference_roundtrip(chunk, G).transpose(2, 3)
+            expect = _reference_roundtrip(chunk, G, meta).transpose(2, 3)
             assert torch.allclose(k[:, :, c0:c0 + G, :], expect,
                                   atol=1e-6, rtol=0)
         expect_v = _reference_roundtrip(
-            truth_v[i][:, :, :n_hist, :].contiguous(), G)
+            truth_v[i][:, :, :n_hist, :].contiguous(), G, meta)
         assert torch.allclose(v[:, :, :n_hist, :], expect_v, atol=1e-6, rtol=0)
 
     s = cache.get_stats(layer=0)
@@ -198,3 +236,98 @@ def test_manager_end_to_end_on_xpu(async_flush):
     assert s["quantized_tokens"] + s["residual_tokens"] == s["total_tokens"]
     # 2-bit payload + metadata + FP residual must actually compress
     assert s["compression"] > 2.0, s
+
+
+# ---------------------------------------------------------------------------
+# fp16 metadata on fp32 data (the 10.67x-ceiling configuration)
+# ---------------------------------------------------------------------------
+
+def _quant_keys_mixed(x_trans):
+    b, h, d, L = x_trans.shape
+    packed = torch.empty((b, h, d, L // 4), dtype=torch.uint8, device="xpu")
+    scales = torch.empty((b, h, d, L // G), dtype=torch.float16, device="xpu")
+    zeros = torch.empty_like(scales)
+    kivi_native.quantize_keys(x_trans, packed, scales, zeros, G)
+    return packed, scales, zeros
+
+
+def _quant_values_mixed(x):
+    b, h, L, d = x.shape
+    packed = torch.empty((b, h, L, d // 4), dtype=torch.uint8, device="xpu")
+    scales = torch.empty((b, h, L, d // G), dtype=torch.float16, device="xpu")
+    zeros = torch.empty_like(scales)
+    kivi_native.quantize_values(x, packed, scales, zeros, d, G)
+    return packed, scales, zeros
+
+
+def test_fp32_data_fp16_metadata_error_bounded():
+    """fp32 input, fp16 scales/zeros: the output stays fp32 and the error is
+    bounded by half a (fp16-rounded) step plus a few fp16 ULPs from rounding
+    the zero point and the step itself."""
+    torch.manual_seed(4)
+    L = 4 * G
+    x_k = torch.randn(B, H, D, L, device="xpu").contiguous()
+    packed, scales, zeros = _quant_keys_mixed(x_k)
+    out = torch.empty_like(x_k)
+    kivi_native.dequantize_keys(packed, scales, zeros, out, G)
+    assert out.dtype == torch.float32
+    err = (out.cpu() - x_k.cpu()).abs().max().item()
+    assert err <= scales.cpu().float().max().item() / 2 + 1e-2, err
+
+    x_v = torch.randn(B, H, L, D, device="xpu").contiguous()
+    packed, scales, zeros = _quant_values_mixed(x_v)
+    out = torch.empty_like(x_v)
+    kivi_native.dequantize_values(packed, scales, zeros, out, D, G)
+    err = (out.cpu() - x_v.cpu()).abs().max().item()
+    assert err <= scales.cpu().float().max().item() / 2 + 1e-2, err
+
+
+def test_fp32_data_fp16_metadata_halves_metadata_bytes():
+    torch.manual_seed(5)
+    x = torch.randn(B, H, D, 2 * G, device="xpu").contiguous()
+    _, scales16, zeros16 = _quant_keys_mixed(x)
+    _, scales32, zeros32 = _quant_keys_xpu(x, torch.float32)
+    nbytes = lambda *ts: sum(t.numel() * t.element_size() for t in ts)
+    assert nbytes(scales16, zeros16) * 2 == nbytes(scales32, zeros32)
+
+
+def test_fused_roundtrip_half_metadata_matches_pair():
+    """quant_dequant_roundtrip_*(half_metadata=True) must be bit-identical to
+    quantize_* with fp16 scales followed by dequantize_*."""
+    torch.manual_seed(6)
+    L = 2 * G
+    x = torch.randn(B, H, D, L, device="xpu").contiguous()
+    packed, scales, zeros = _quant_keys_mixed(x)
+    deq = torch.empty_like(x)
+    kivi_native.dequantize_keys(packed, scales, zeros, deq, G)
+    fused_k = torch.empty_like(x)
+    kivi_native.quant_dequant_roundtrip_keys(x, fused_k, G, half_metadata=True)
+    assert torch.equal(deq.cpu(), fused_k.cpu())
+
+    xv = torch.randn(B, H, L, D, device="xpu").contiguous()
+    packed, scales, zeros = _quant_values_mixed(xv)
+    deq = torch.empty_like(xv)
+    kivi_native.dequantize_values(packed, scales, zeros, deq, D, G)
+    fused = torch.empty_like(xv)
+    kivi_native.quant_dequant_roundtrip_values(xv, fused, D, G, half_metadata=True)
+    assert torch.equal(deq.cpu(), fused.cpu())
+
+    # and the fp16 rounding of the metadata is actually visible: the default
+    # (fp32-metadata) round-trip must differ from the half_metadata one
+    fused32 = torch.empty_like(x)
+    kivi_native.quant_dequant_roundtrip_keys(x, fused32, G)
+    assert not torch.equal(fused32.cpu(), fused_k.cpu())
+
+
+@pytest.mark.parametrize("elem,meta_s,meta_z", [
+    (torch.float16, torch.float32, torch.float32),   # metadata wider than data
+    (torch.float32, torch.float16, torch.float32),   # zeros != scales
+    (torch.float32, torch.bfloat16, torch.bfloat16),  # no bf16 instantiation
+])
+def test_unsupported_metadata_pairs_rejected(elem, meta_s, meta_z):
+    x = torch.randn(B, H, D, G, dtype=elem).to("xpu").contiguous()
+    packed = torch.empty((B, H, D, G // 4), dtype=torch.uint8, device="xpu")
+    scales = torch.empty((B, H, D, 1), dtype=meta_s, device="xpu")
+    zeros = torch.empty((B, H, D, 1), dtype=meta_z, device="xpu")
+    with pytest.raises(RuntimeError, match="dtype"):
+        kivi_native.quantize_keys(x, packed, scales, zeros, G)

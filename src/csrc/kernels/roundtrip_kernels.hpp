@@ -17,21 +17,21 @@
 // quantize_* and keeps the outputs. The round-trip kernels remain for
 // fidelity-simulation use cases and the direct kernel API.
 //
-// Templated on element type T (float / sycl::half — explicit
-// instantiations in roundtrip_kernels.cpp). The internally computed
-// scale/zero are rounded through T before reconstruction so the result is
-// bit-identical to quantize_*<T> followed by dequantize_*<T>.
+// Templated on element type T and metadata type M (same pairs as
+// quantize_kernels.hpp). The internally computed scale/zero are rounded
+// through M before reconstruction so the result is bit-identical to
+// quantize_*<T, M> followed by dequantize_*<T, M>.
 // --------------------------------------------------------------------------
 
 // Non-blocking variants — see quantize_kernels.hpp for the rationale.
-template <typename T>
+template <typename T, typename M>
 sycl::event quant_dequant_roundtrip_keys_submit(
     const T* input,
     T*       output,
     int num_channels,
     int group_size);
 
-template <typename T>
+template <typename T, typename M>
 sycl::event quant_dequant_roundtrip_values_submit(
     const T* input,
     T*       output,
@@ -39,18 +39,18 @@ sycl::event quant_dequant_roundtrip_values_submit(
     int head_dim,
     int group_size);
 
-template <typename T>
+template <typename T, typename M>
 inline void quant_dequant_roundtrip_keys(
     const T* input,
     T*       output,
     int num_channels,
     int group_size)
 {
-    quant_dequant_roundtrip_keys_submit<T>(input, output, num_channels, group_size)
+    quant_dequant_roundtrip_keys_submit<T, M>(input, output, num_channels, group_size)
         .wait_and_throw();
 }
 
-template <typename T>
+template <typename T, typename M>
 inline void quant_dequant_roundtrip_values(
     const T* input,
     T*       output,
@@ -58,7 +58,7 @@ inline void quant_dequant_roundtrip_values(
     int head_dim,
     int group_size)
 {
-    quant_dequant_roundtrip_values_submit<T>(input, output, num_tokens,
+    quant_dequant_roundtrip_values_submit<T, M>(input, output, num_tokens,
                                              head_dim, group_size)
         .wait_and_throw();
 }

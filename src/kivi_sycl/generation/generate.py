@@ -16,11 +16,12 @@ def generate(
     tokenizer,
     prompt: str,
     max_new_tokens: int = 200,
-    group_size: int = 32,
+    group_size=32,
     residual_length: int = 128,
     device: str = "xpu",
     serving: str = "rebuild",
     async_flush: bool = True,
+    metadata_dtype="auto",
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     do_sample: bool = False,
@@ -37,13 +38,14 @@ def generate(
         tokenizer:        Matching tokenizer.
         prompt:           Input text.
         max_new_tokens:   Number of tokens to generate.
-        group_size:       Quantization group size G (default 32).
+        group_size:       Quantization group size G (default 32), or one per layer.
         residual_length:  FP32 residual window R (default 128).
         device:           XPU device for quantization (default "xpu").
         serving:          "rebuild" (packed-resident, memory-honest) or
                           "cached" (FP serving copy kept, fastest) — see
                           KiviCache.
         async_flush:      Overlap flush kernels with the next forward pass.
+        metadata_dtype:   Scale/zero dtype: "auto" (fp16) or torch.float32.
         temperature:      Sampling temperature (1.0 = greedy with do_sample=False).
         top_k:            Top-k filtering (None = disabled).
         do_sample:        Whether to sample (False = greedy argmax).
@@ -59,10 +61,12 @@ def generate(
     cache = KiviCache.from_model(
         model, device=device, group_size=group_size,
         residual_length=residual_length, serving=serving,
-        async_flush=async_flush,
+        async_flush=async_flush, metadata_dtype=metadata_dtype,
     )
 
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+    # Final length is known: size the packed arenas once, with no spare tail.
+    cache.reserve(input_ids.shape[1] + max_new_tokens)
 
     # Prefill
     out = model(input_ids, use_cache=True)

@@ -61,12 +61,60 @@ inline float round_through_storage(float v)
     return static_cast<float>(sycl::bit_cast<T>(bits));
 }
 
+// Quantization step for one group, given its float min/max, for metadata
+// stored as M.
+//
+// fp32 metadata keeps the historical `range/3 + 1e-10f` exactly, so every
+// fp32 reference in the tests (and examples/cpu_sim.py) stays bit-identical.
+//
+// fp16 metadata cannot use that epsilon: 1e-10 is far below fp16's smallest
+// subnormal (~6e-8), so a constant (or near-constant) group stored scale = 0
+// and the pack pass then computed (x - min) / 0 — NaN for x == min, inf
+// otherwise — and fed it to a float->int conversion, which is undefined
+// behaviour. It only produced correct bytes because this GPU happens to
+// convert NaN/inf to 0. Flooring the step at fp16's smallest *normal* value
+// (2^-14) keeps the stored scale non-zero and exactly representable; the
+// cost is a reconstruction error of at most 2^-15 on groups whose true range
+// is below 3 * 2^-14, which is under fp16's own resolution for any value
+// above 0.5. The upper clamp keeps fp32-input ranges wider than fp16 can
+// express from storing inf.
+constexpr float kHalfMax = 65504.0f;
+constexpr float kHalfScaleFloor = 6.103515625e-05f;  // 2^-14, smallest normal fp16
+
+template <typename M>
+inline float compute_scale(float min_val, float max_val);
+
+template <>
+inline float compute_scale<float>(float min_val, float max_val)
+{
+    return (max_val - min_val) / 3.0f + 1e-10f;
+}
+
+template <>
+inline float compute_scale<sycl::half>(float min_val, float max_val)
+{
+    return sycl::clamp((max_val - min_val) / 3.0f, kHalfScaleFloor, kHalfMax);
+}
+
+// Zero-point (the group minimum) clamped to what M can hold. Identity for
+// float; for half it only bites on fp32 input with |min| > 65504, where the
+// alternative is storing +/-inf. Applied before round_through_storage so the
+// pack pass and a later dequantize use the same saturated value.
+template <typename M>
+inline float saturate_zero(float zero) { return zero; }
+
+template <>
+inline float saturate_zero<sycl::half>(float zero)
+{
+    return sycl::clamp(zero, -kHalfMax, kHalfMax);
+}
+
 // Vectorized (4-wide) min/max reduction over one channel's group_size
 // elements, done serially by a single work-item. group_size is guaranteed
 // (by kv_cache_ops.cpp validation) to be a multiple of 4.
 template <typename T>
 inline void reduce_min_max_vec(
-    const T* __restrict__ input, int base, int group_size,
+    const T* __restrict__ input, int64_t base, int group_size,
     float& min_val, float& max_val)
 {
     min_val = 1e30f;
@@ -85,28 +133,31 @@ inline void reduce_min_max_vec(
     }
 }
 
-// Round the freshly computed scale/zero through the storage dtype T before
+// Round the freshly computed scale/zero through the metadata dtype M before
 // using them, so quantize followed by dequantize (which reads them back as
-// T) is self-consistent. For T=float this is the identity.
-template <typename T>
+// M) is self-consistent. For M=float this is the identity. M is independent
+// of the element type: fp32 input with fp16 metadata narrows here, inside
+// the kernel, which never touches torch's XPU cast kernel (broken on this
+// Iris Xe stack — docs/status_and_roadmap.md §6.2).
+template <typename M>
 inline void store_scale_zero(
     float scale_f, float zero_f,
-    T* __restrict__ scales, T* __restrict__ zeros, int idx,
+    M* __restrict__ scales, M* __restrict__ zeros, int64_t idx,
     float& scale_out, float& zero_out)
 {
-    scales[idx] = static_cast<T>(scale_f);
-    zeros[idx]  = static_cast<T>(zero_f);
-    scale_out = round_through_storage<T>(scale_f);
-    zero_out  = round_through_storage<T>(zero_f);
+    scales[idx] = static_cast<M>(scale_f);
+    zeros[idx]  = static_cast<M>(zero_f);
+    scale_out = round_through_storage<M>(scale_f);
+    zero_out  = round_through_storage<M>(zero_f);
 }
 
 // Vectorized pack: reload the same group_size elements (4 at a time)
 // and write one packed byte per 4 values.
 template <typename T>
 inline void pack_vec(
-    const T* __restrict__ input, int base, int group_size,
+    const T* __restrict__ input, int64_t base, int group_size,
     float min_val, float scale,
-    uint8_t* __restrict__ output, int out_base)
+    uint8_t* __restrict__ output, int64_t out_base)
 {
     for (int i = 0; i < group_size; i += 4) {
         sycl::vec<T, 4> v;
@@ -127,9 +178,9 @@ inline void pack_vec(
 // reconstructed value straight back out. No packed byte is ever stored.
 template <typename T>
 inline void roundtrip_vec(
-    const T* __restrict__ input, int base, int group_size,
+    const T* __restrict__ input, int64_t base, int group_size,
     float min_val, float scale,
-    T* __restrict__ output, int out_base)
+    T* __restrict__ output, int64_t out_base)
 {
     for (int i = 0; i < group_size; i += 4) {
         sycl::vec<T, 4> v;

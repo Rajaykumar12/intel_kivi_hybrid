@@ -3,21 +3,55 @@
 Implementation of the **KIVI algorithm** ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)) targeting Intel XPU hardware via SYCL/oneAPI. Replaces the original CUDA kernels with DPC++ and provides a **plug-and-play** `kivi_sycl` module that works with **any** HuggingFace causal LM (GPT-2, LLaMA, Mistral, Phi, Qwen, Falcon, etc.).
 
 ```python
-from kivi_sycl import generate
-text = generate(model, tokenizer, "Once upon a time", max_new_tokens=200)
+from kivi_sycl import enable_kivi
+cache = enable_kivi(model)                 # native transformers Cache + "kivi" attention
+out = model.generate(input_ids, past_key_values=cache, max_new_tokens=200)
+print(cache.get_stats()["compression"])
 ```
 
 ## Results
+
+### Decode speed with the native integration (2026-11-08)
+
+`enable_kivi` plugs KIVI into transformers as a real `Cache` plus a registered `"kivi"`
+attention. Decode steps run a fused CPU kernel that attends directly over the packed 2-bit
+history — the dequantized history is never materialised. Same memory, most of the decode
+overhead gone. Three runs each; the percentage is KIVI vs the FP baseline measured in the
+same process (the FP baseline itself varies ~20% run to run on this laptop):
+
+| Model, context | Compression | Legacy loop (`get_full_cache`) | **Native + fused** |
+|---|---|---|---|
+| TinyLlama-1.1B, 1.9k + 64 | 6.99× | −1%, −18%, −28% (median **−18%**) | −6%, −2%, −2% (median **−2%**) |
+| Qwen2.5-0.5B-Instruct, 8k + 32 | 9.25× | −41%, −30%, −35% (median **−35%**) | +6%, +18%, −10% (≈ **parity**) |
+
+Per layer, the fused kernel is ~5× faster than dequantize-then-SDPA (Qwen2.5 shape, 8k:
+5.8 → 1.0 ms). Quality is unchanged: gpt2 WikiText-2 perplexity 38.794 (fused) vs 38.793
+(legacy). The native path's reference mode (`enable_kivi(model, fused=False)`) is
+bit-identical to the legacy loop on gpt2, TinyLlama, Qwen2, Qwen2.5 and OPT.
 
 The packed-2-bit representation (uint8 payload + scales + zeros) is the resident CPU
 store for flushed history — `KiviCache` no longer dequantizes-and-discards on flush, so
 `get_stats()` reports **measured** resident bytes (`packed_bytes`, `residual_bytes`,
 `kivi_bytes`, `fp_baseline_bytes`, `compression`), not a projected figure.
 
-All measured 2026-07-25/26 on Intel Iris Xe Graphics, fp32, G=32, via
-`get_stats()` — every byte count is read off live tensors, none are projected.
+All measured on Intel Iris Xe Graphics, fp32 models, G=32, via `get_stats()` — every
+byte count is read off live tensors, none are projected.
 
-### Measured across models and context lengths
+### fp16 metadata (default since 2026-11-07)
+
+Scales and zeros are now stored in fp16 for every model, which lifts the G=32 ceiling
+from 8× to 10.67× (see *Raising the ceiling*). Same inputs, A/B on `--metadata`:
+
+| Model | Context | fp32 metadata | **fp16 metadata** | Formula (fp16) |
+|---|---|---|---|---|
+| TinyLlama-1.1B | 1.9k + 32 | 83.0 → 14.4 MB, 5.76× | 83.0 → **11.9 MB, 6.95×** | 6.95× |
+| Qwen2.5-0.5B-Instruct | 8k + 32 | 192.7 → 26.7 MB, 7.22× | 192.7 → **20.8 MB, 9.28×** | 9.28× |
+
+The fp32-metadata column reproduces the July measurements below exactly. Pass
+`metadata_dtype=torch.float32` (or `--metadata fp32` to the eval scripts) for the old
+behaviour.
+
+### Measured across models and context lengths (fp32 metadata, 2026-07-25/26)
 
 | Model | KV heads × head_dim | Layers | Context | Resident KV cache | Compression | Decode cost |
 |---|---|---|---|---|---|---|
@@ -78,8 +112,10 @@ exactly for all three architectures.
 
 ### Raising the ceiling
 
-The 8× ceiling is set by `G` and the metadata dtype, not the model. Metadata is currently
-fp32 and, at G=32, costs exactly as much as the 2-bit payload itself:
+The ceiling is set by `G` and the metadata dtype, not the model:
+`C = 8 / (0.5 + 4m/G)` against an fp32 baseline, with m the metadata width in bytes
+(4 for fp32, 2 for fp16). At G=32, fp32 metadata costs exactly as much as the 2-bit
+payload itself:
 
 | Group size | fp32 scales/zeros | fp16 scales/zeros |
 |---|---|---|
@@ -88,11 +124,13 @@ fp32 and, at G=32, costs exactly as much as the 2-bit payload itself:
 | G=64 | 10.67× | 12.80× |
 | G=128 | 12.80× | 14.22× |
 
-Storing scales/zeros in fp16 would lift the ceiling from 8× to 10.67× — a ~33%
-improvement on the headline figure. The fp16 kernels already exist; see
-`docs/status_and_roadmap.md` §6.2 for why this is currently blocked on this hardware.
-Raising `G` costs quality (coarser quantization groups), so it is a real trade rather
-than free headroom.
+fp16 metadata is now the default (the table at the top). It was previously blocked on
+this hardware because torch's XPU dtype-cast kernel fails on Iris Xe
+(`docs/status_and_roadmap.md` §6.2); the quantize kernels now narrow the scale and zero to
+fp16 themselves, so fp32 data with fp16 metadata never goes through that cast. For fp16
+*models* the metadata was already fp16, and their ceiling against an fp16 baseline is
+5.33×. Raising `G` costs quality (coarser quantization groups), so it is a real trade
+rather than free headroom.
 
 ### Quality
 
@@ -275,21 +313,31 @@ pip install kivi_sycl-0.1.0-cp310-cp310-linux_x86_64.whl
 Needed only if you want to modify the SYCL kernels.
 
 ```bash
-# Prerequisites: Intel oneAPI DPC++ compiler
-source /opt/intel/oneapi/setvars.sh
-conda activate intel_xpu
-
-# Clone and install
 git clone https://github.com/Rajaykumar12/intel_kivi_hybrid.git
 cd intel_kivi_hybrid
-pip install . --no-build-isolation
+bash scripts/dev_build.sh        # clean in-place build
+bash scripts/dev_test.sh         # test suite
 ```
+
+The compiler must be compatible with the SYCL runtime bundled in your torch XPU wheel.
+`scripts/dev_build.sh` sources a specific oneAPI compiler (`KIVI_ICPX_VER`, default 2026.1)
+instead of `setvars.sh`, which resolves to the newest installed oneAPI and can break
+`import torch` (`undefined symbol: urKernelSetArgLocal`). `KIVI_ENV` selects the conda env.
+
+**Ahead-of-time GPU code (optional):** `KIVI_AOT_DEVICE=adl-p bash scripts/dev_build.sh`
+compiles native code for Alder Lake Iris Xe in addition to portable SPIR-V. Any `ocloc
+-device` value works (`tgllp`, `dg2`, a family such as `xe-lp`, or a PCI id). Measured on a
+cold driver cache, it removes the first-use JIT of the kernels (quantize 73 → 0.6 ms,
+dequantize 33 → 0.3 ms per process); with a warm driver cache JIT is already ~1 ms.
+
+`bash scripts/check_warnings.sh` audits the C++/SYCL sources with `-Wall -Wextra`
+(the regular build uses `-w` to keep torch's header warnings out of the log).
 
 ### Building a wheel (for maintainers)
 
 ```bash
-source /opt/intel/oneapi/setvars.sh
-bash scripts/build_wheel.sh
+bash scripts/build_wheel.sh                         # portable
+KIVI_AOT_DEVICE=adl-p bash scripts/build_wheel.sh   # + native Iris Xe code
 # Output: dist/kivi_sycl-0.1.0-cp310-cp310-linux_x86_64.whl
 ```
 
@@ -309,6 +357,26 @@ python examples/benchmark.py
 ```
 
 ## Usage
+
+### Native transformers integration (recommended)
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from kivi_sycl import enable_kivi
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype=torch.float32)
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+ids = tok("Once upon a time", return_tensors="pt").input_ids
+
+cache = enable_kivi(model, max_tokens=ids.shape[1] + 200)   # max_tokens is optional
+out = model.generate(ids, past_key_values=cache, max_new_tokens=200)
+print(tok.decode(out[0]), cache.get_stats()["compression"])
+```
+
+`enable_kivi` switches the model to the `"kivi"` attention and returns a fresh cache — use one
+per sequence. It accepts the same options as `KiviCache` (`group_size`, `residual_length`,
+`metadata_dtype`, `zero_copy`, …) plus `fused` (default `True`; `False` selects the
+dequantize-then-SDPA reference path). Beam search and cache cropping are not supported yet.
 
 ### Quick Start — One-liner Generation
 
@@ -442,8 +510,26 @@ kivi_sycl_native.quant_dequant_roundtrip_values(input, output, head_dim, group_s
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `group_size` (G) | 32 | Quantization granularity. Smaller = better quality, more metadata |
+| `group_size` (G) | 32 | Quantization granularity. Smaller = better quality, more metadata. Also accepts a list with one G per layer (see below) |
 | `residual_length` (R) | 128 | Recent FP32 tokens. Larger = better quality, less compression |
+| `metadata_dtype` | `"auto"` (fp16) | Scale/zero dtype. fp16 lifts the G=32 ceiling to 10.67×; `torch.float32` restores 8× (fp32 models only) |
+| `zero_copy` | `"auto"` | On XPU, keep the packed store in USM host memory that the kernels write directly — no host↔device copies. `False` stages through XPU tensors |
+| `cache.reserve(n)` | — | Optional: size the packed store once for an `n`-token sequence (`generate()` calls it), so it never grows and carries no spare capacity |
+
+**Per-layer group size.** Which layers get coarse groups matters far more than how many:
+on gpt2 (WikiText-2, 10×512, R=128), coarsening the middle layers to G=64 costs ~+5% perplexity,
+while coarsening the first two layers is nearly free:
+
+| `group_size` | Ceiling (vs fp32) | Perplexity Δ vs FP |
+|---|---|---|
+| `32` (default) | 10.67× | +1.88% |
+| `[64, 64] + [32] * 10` | 10.97× | +1.89% |
+| `[64, 64] + [32] * 8 + [64, 64]` | 11.29× | +2.02% |
+| `[16, 16] + [64] * 10` (wrong layers coarsened) | 11.64× | +5.14% |
+| `64` | 12.80× | +5.23% |
+
+That is one model on ~5k tokens — measure your own model with
+`examples/eval_perplexity.py --G 64,64,32,...` before relying on a schedule.
 
 For GPT-2 (short sequences), `R=64` is sufficient. For 7B+ models with long contexts, `R=128` is recommended per the paper.
 

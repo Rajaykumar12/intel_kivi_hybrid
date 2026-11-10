@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from kivi_sycl import KiviCache
+from kivi_sycl import KiviCache, enable_kivi
 
 
 def _load_text(dataset):
@@ -56,9 +56,11 @@ def ppl_fp(model, ids):
     return loss.item()
 
 
-def ppl_kivi(model, ids, G, R):
+def ppl_kivi(model, ids, G, R, metadata_dtype="auto"):
     """Token-by-token forward through KiviCache, accumulating NLL."""
-    cache = KiviCache.from_model(model, device="xpu", group_size=G, residual_length=R)
+    cache = KiviCache.from_model(model, device="xpu", group_size=G, residual_length=R,
+                                 metadata_dtype=metadata_dtype)
+    cache.reserve(ids.shape[1])
     total_nll = 0.0
     count = 0
     with torch.no_grad():
@@ -76,15 +78,40 @@ def ppl_kivi(model, ids, G, R):
     return total_nll / count
 
 
+def ppl_kivi_hf(model, ids, G, R, metadata_dtype="auto", fused=True):
+    """Token-by-token NLL through the native transformers Cache path."""
+    cache = enable_kivi(model, group_size=G, residual_length=R, fused=fused,
+                        metadata_dtype=metadata_dtype, max_tokens=ids.shape[1])
+    total_nll, count = 0.0, 0
+    with torch.no_grad():
+        out = model(ids[:, :1], past_key_values=cache, use_cache=True)
+        for t in range(1, ids.shape[1]):
+            total_nll += F.cross_entropy(out.logits[:, -1, :], ids[:, t], reduction="sum").item()
+            count += 1
+            out = model(ids[:, t:t + 1], past_key_values=cache, use_cache=True)
+    return total_nll / count
+
+
 def main():
     parser = argparse.ArgumentParser(description="KIVI perplexity eval vs FP baseline")
     parser.add_argument("model", nargs="?", default="gpt2", help="HuggingFace model")
     parser.add_argument("--dataset", choices=["wikitext2", "c4"], default="wikitext2")
     parser.add_argument("--windows", type=int, default=10, help="Number of eval windows")
     parser.add_argument("--window-len", type=int, default=256, help="Tokens per window")
-    parser.add_argument("--G", type=int, default=32, help="Quantization group size")
+    parser.add_argument("--G", type=str, default="32",
+                        help="Quantization group size, or a comma list with one G per layer "
+                             "(e.g. 16,16,64,...,64,16,16)")
     parser.add_argument("--R", type=int, default=64, help="Residual window size")
+    parser.add_argument("--metadata", choices=["fp16", "fp32"], default="fp16",
+                        help="scale/zero dtype (fp16 = default 10.67x ceiling at G=32; "
+                             "fp32 = previous 8x ceiling)")
+    parser.add_argument("--path", choices=["legacy", "hf", "hf-reference"], default="legacy",
+                        help="legacy: add_tokens/get_full_cache. hf: native Cache + fused "
+                             "decode attention. hf-reference: native Cache, dequantize+SDPA.")
     args = parser.parse_args()
+    meta = torch.float32 if args.metadata == "fp32" else "auto"
+    G = [int(g) for g in args.G.split(",")]
+    args.G = G[0] if len(G) == 1 else G
 
     if not torch.xpu.is_available():
         print("Error: XPU not found.")
@@ -106,13 +133,17 @@ def main():
     n_avail = all_ids.shape[1] // win
     n_windows = min(args.windows, n_avail)
     print(f"Dataset: {args.dataset}, {n_windows} windows of {win} tokens "
-          f"(G={args.G}, R={args.R})")
+          f"(G={args.G}, R={args.R}, metadata={args.metadata}, path={args.path})")
 
     fp_losses, kivi_losses = [], []
     for i in range(n_windows):
         window = all_ids[:, i * win:(i + 1) * win]
         fp_loss = ppl_fp(model, window)
-        kivi_loss = ppl_kivi(model, window, args.G, args.R)
+        if args.path == "legacy":
+            kivi_loss = ppl_kivi(model, window, args.G, args.R, meta)
+        else:
+            kivi_loss = ppl_kivi_hf(model, window, args.G, args.R, meta,
+                                    fused=(args.path == "hf"))
         fp_losses.append(fp_loss)
         kivi_losses.append(kivi_loss)
         print(f"  window {i+1}/{n_windows}: FP nll={fp_loss:.4f}  "

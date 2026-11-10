@@ -8,13 +8,16 @@
 // identical checks instead of duplicating TORCH_CHECK blocks.
 //
 // Element dtype: every op accepts float32 or float16 tensors (bfloat16
-// callers must upcast — there is no bf16 kernel instantiation). The float
-// dtype is taken from the op's float-typed input tensor; scales, zeros,
-// and the float output must all match it exactly.
+// callers must upcast — there is no bf16 kernel instantiation). The element
+// dtype is taken from the op's float-typed data tensor, and the float output
+// must match it. Metadata dtype (scales/zeros) is taken from the scales
+// tensor and may be the element dtype or float16 (fp16 metadata on fp32 data
+// is the 10.67x-ceiling configuration). Round-trip ops take it as a flag.
 // ==========================================================================
 
 #include "kv_cache_ops.hpp"
 #include "kivi/common.hpp"
+#include "kivi/layout.hpp"
 #include "kernels/quantize_kernels.hpp"
 #include "kernels/dequantize_kernels.hpp"
 #include "kernels/roundtrip_kernels.hpp"
@@ -47,15 +50,121 @@ torch::ScalarType float_dtype_of(const torch::Tensor& t, const char* op) {
     return dt;
 }
 
+// Metadata (scales/zeros) dtype for an op whose element dtype is `dt`:
+// taken from the caller's scales tensor. Allowed pairs mirror the kernel
+// instantiations — metadata equal to the element dtype, or fp16 metadata on
+// fp32 data. zeros must match scales; the per-tensor dtype checks in the
+// validators then confirm both.
+torch::ScalarType meta_dtype_of(const torch::Tensor& scales,
+                                const torch::Tensor& zeros,
+                                torch::ScalarType dt, const char* op) {
+    auto mdt = scales.scalar_type();
+    TORCH_CHECK(mdt == dt || mdt == torch::kHalf,
+                op, ": scales dtype must be ", torch::toString(dt),
+                " or float16, got ", torch::toString(mdt));
+    TORCH_CHECK(zeros.scalar_type() == mdt,
+                op, ": zeros dtype (", torch::toString(zeros.scalar_type()),
+                ") must match scales dtype (", torch::toString(mdt), ")");
+    return mdt;
+}
+
+// ---------------------------------------------------------------------------
+// Output layout for the quantize ops (see kivi/layout.hpp).
+//
+// Contiguous outputs keep the original flat addressing and any shape whose
+// numel matches. Non-contiguous outputs are views into a preallocated arena:
+// each must be `rows` equally spaced rows whose trailing `inner_dims` dims are
+// contiguous (keys: the token-group axis, inner_dims=1; values: the token and
+// channel-group axes, inner_dims=2). packed, scales and zeros must agree on
+// the row count, and zeros must have exactly the scales' strides.
+// ---------------------------------------------------------------------------
+
+struct RowView {
+    int64_t rows;
+    int64_t row_len;     // elements per row (product of the inner dims)
+    int64_t row_stride;  // elements between consecutive rows
+};
+
+RowView row_view(const torch::Tensor& t, int inner_dims, const char* name)
+{
+    const int64_t nd = t.dim();
+    TORCH_CHECK(nd > inner_dims, name, ": a strided output needs more than ",
+                inner_dims, " dims, got shape ", t.sizes());
+    auto sz = t.sizes();
+    auto st = t.strides();
+
+    // Inner dims: dense, row-major. Size-1 dims carry no stride information.
+    int64_t expect = 1;
+    for (int64_t d = nd - 1; d >= nd - inner_dims; --d) {
+        TORCH_CHECK(sz[d] == 1 || st[d] == expect, name,
+                    ": the trailing ", inner_dims, " dim(s) must be contiguous; "
+                    "shape ", sz, " strides ", st);
+        expect *= sz[d];
+    }
+    const int64_t row_len = expect;
+
+    // Outer dims: collapse into one evenly strided row axis.
+    int64_t rows = 1, row_stride = 0, next = -1;
+    for (int64_t d = nd - inner_dims - 1; d >= 0; --d) {
+        if (sz[d] == 1) continue;
+        if (next < 0) {
+            row_stride = st[d];
+        } else {
+            TORCH_CHECK(st[d] == next, name,
+                        ": leading dims must collapse into evenly spaced rows; "
+                        "shape ", sz, " strides ", st);
+        }
+        rows *= sz[d];
+        next = st[d] * sz[d];
+    }
+    TORCH_CHECK(rows == 1 || row_stride >= row_len, name,
+                ": rows overlap (row stride ", row_stride, " < row length ",
+                row_len, ")");
+    return RowView{rows, row_len, row_stride};
+}
+
+kivi::KiviLayout derive_quant_layout(
+    const torch::Tensor& output, const torch::Tensor& scales,
+    const torch::Tensor& zeros, int inner_dims, int group_size,
+    int64_t num_groups)
+{
+    if (output.is_contiguous() && scales.is_contiguous() && zeros.is_contiguous())
+        return kivi::KiviLayout::contiguous(num_groups);
+
+    TORCH_CHECK(zeros.sizes() == scales.sizes() && zeros.strides() == scales.strides(),
+                "zeros must have the same shape and strides as scales");
+    RowView p = row_view(output, inner_dims, "output");
+    RowView m = row_view(scales, inner_dims, "scales");
+    TORCH_CHECK(p.rows == m.rows, "output and scales disagree on the row count (",
+                p.rows, " vs ", m.rows, ")");
+    TORCH_CHECK(p.row_len == m.row_len * (group_size / 4),
+                "output row length (", p.row_len, ") must be scales row length (",
+                m.row_len, ") * group_size/4");
+    TORCH_CHECK(m.rows * m.row_len == num_groups,
+                "strided outputs cover ", m.rows * m.row_len,
+                " groups but the input has ", num_groups);
+    return kivi::KiviLayout{m.row_len, p.row_stride, m.row_stride};
+}
+
+// dtype + kernel accessibility, without the contiguity requirement — for
+// quantize outputs, which may be arena views (validated by derive_quant_layout).
+void check_output_tensor(const torch::Tensor& t, const char* name,
+                         torch::ScalarType dtype)
+{
+    TORCH_CHECK(t.scalar_type() == dtype, name, " must be ", torch::toString(dtype),
+                " but got ", torch::toString(t.scalar_type()));
+    kivi::check_kernel_accessible(t, name);
+}
+
 int64_t validate_quant_keys_args(
     const torch::Tensor& input, const torch::Tensor& output,
     const torch::Tensor& scales, const torch::Tensor& zeros,
-    int group_size, torch::ScalarType dt)
+    int group_size, torch::ScalarType dt, torch::ScalarType mdt)
 {
     kivi::check_tensor(input,  "input",  dt);
-    kivi::check_tensor(output, "output", torch::kUInt8);
-    kivi::check_tensor(scales, "scales", dt);
-    kivi::check_tensor(zeros,  "zeros",  dt);
+    check_output_tensor(output, "output", torch::kUInt8);
+    check_output_tensor(scales, "scales", mdt);
+    check_output_tensor(zeros,  "zeros",  mdt);
     TORCH_CHECK(group_size > 0 && group_size % 4 == 0,
                 "group_size must be positive and divisible by 4, got ", group_size);
 
@@ -78,12 +187,12 @@ int64_t validate_quant_keys_args(
 int64_t validate_quant_values_args(
     const torch::Tensor& input, const torch::Tensor& output,
     const torch::Tensor& scales, const torch::Tensor& zeros,
-    int head_dim, int group_size, torch::ScalarType dt)
+    int head_dim, int group_size, torch::ScalarType dt, torch::ScalarType mdt)
 {
     kivi::check_tensor(input,  "input",  dt);
-    kivi::check_tensor(output, "output", torch::kUInt8);
-    kivi::check_tensor(scales, "scales", dt);
-    kivi::check_tensor(zeros,  "zeros",  dt);
+    check_output_tensor(output, "output", torch::kUInt8);
+    check_output_tensor(scales, "scales", mdt);
+    check_output_tensor(zeros,  "zeros",  mdt);
     TORCH_CHECK(group_size > 0 && group_size % 4 == 0,
                 "group_size must be positive and divisible by 4");
     TORCH_CHECK(head_dim > 0 && head_dim % group_size == 0,
@@ -110,11 +219,11 @@ int64_t validate_quant_values_args(
 int64_t validate_dequant_keys_args(
     const torch::Tensor& input, const torch::Tensor& scales,
     const torch::Tensor& zeros, const torch::Tensor& output,
-    int group_size, torch::ScalarType dt)
+    int group_size, torch::ScalarType dt, torch::ScalarType mdt)
 {
     kivi::check_tensor(input,  "input",  torch::kUInt8);
-    kivi::check_tensor(scales, "scales", dt);
-    kivi::check_tensor(zeros,  "zeros",  dt);
+    kivi::check_tensor(scales, "scales", mdt);
+    kivi::check_tensor(zeros,  "zeros",  mdt);
     kivi::check_tensor(output, "output", dt);
     TORCH_CHECK(group_size > 0 && group_size % 4 == 0,
                 "group_size must be positive and divisible by 4, got ", group_size);
@@ -137,11 +246,11 @@ int64_t validate_dequant_keys_args(
 int64_t validate_dequant_values_args(
     const torch::Tensor& input, const torch::Tensor& scales,
     const torch::Tensor& zeros, const torch::Tensor& output,
-    int head_dim, int group_size, torch::ScalarType dt)
+    int head_dim, int group_size, torch::ScalarType dt, torch::ScalarType mdt)
 {
     kivi::check_tensor(input,  "input",  torch::kUInt8);
-    kivi::check_tensor(scales, "scales", dt);
-    kivi::check_tensor(zeros,  "zeros",  dt);
+    kivi::check_tensor(scales, "scales", mdt);
+    kivi::check_tensor(zeros,  "zeros",  mdt);
     kivi::check_tensor(output, "output", dt);
     TORCH_CHECK(group_size > 0 && group_size % 4 == 0,
                 "group_size must be positive and divisible by 4, got ", group_size);
@@ -206,72 +315,195 @@ int64_t validate_roundtrip_values_args(
 
 // --- Typed submit helpers: one per op, shared by blocking/async paths ---
 
-template <typename T>
+template <typename T, typename M>
 sycl::event submit_quant_keys(
     torch::Tensor& input, torch::Tensor& output,
     torch::Tensor& scales, torch::Tensor& zeros,
-    int64_t num_channels, int group_size)
+    int64_t num_channels, int group_size, kivi::KiviLayout layout)
 {
-    return quantize_keys_per_channel_submit<T>(
+    return quantize_keys_per_channel_submit<T, M>(
         const_elem_ptr<T>(input), output.data_ptr<uint8_t>(),
-        elem_ptr<T>(scales), elem_ptr<T>(zeros),
-        static_cast<int>(num_channels), group_size);
+        elem_ptr<M>(scales), elem_ptr<M>(zeros),
+        static_cast<int>(num_channels), group_size, layout);
 }
 
-template <typename T>
+template <typename T, typename M>
 sycl::event submit_quant_values(
     torch::Tensor& input, torch::Tensor& output,
     torch::Tensor& scales, torch::Tensor& zeros,
-    int64_t num_tokens, int head_dim, int group_size)
+    int64_t num_tokens, int head_dim, int group_size, kivi::KiviLayout layout)
 {
-    return quantize_values_per_token_submit<T>(
+    return quantize_values_per_token_submit<T, M>(
         const_elem_ptr<T>(input), output.data_ptr<uint8_t>(),
-        elem_ptr<T>(scales), elem_ptr<T>(zeros),
-        static_cast<int>(num_tokens), head_dim, group_size);
+        elem_ptr<M>(scales), elem_ptr<M>(zeros),
+        static_cast<int>(num_tokens), head_dim, group_size, layout);
 }
 
-template <typename T>
+template <typename T, typename M>
 sycl::event submit_dequant_keys(
     torch::Tensor& input, torch::Tensor& scales,
     torch::Tensor& zeros, torch::Tensor& output,
     int64_t num_channels, int group_size)
 {
-    return dequantize_keys_per_channel_submit<T>(
+    return dequantize_keys_per_channel_submit<T, M>(
         input.data_ptr<uint8_t>(),
-        const_elem_ptr<T>(scales), const_elem_ptr<T>(zeros),
+        const_elem_ptr<M>(scales), const_elem_ptr<M>(zeros),
         elem_ptr<T>(output), static_cast<int>(num_channels), group_size);
 }
 
-template <typename T>
+template <typename T, typename M>
 sycl::event submit_dequant_values(
     torch::Tensor& input, torch::Tensor& scales,
     torch::Tensor& zeros, torch::Tensor& output,
     int64_t num_groups, int group_size)
 {
-    return dequantize_values_per_token_submit<T>(
+    return dequantize_values_per_token_submit<T, M>(
         input.data_ptr<uint8_t>(),
-        const_elem_ptr<T>(scales), const_elem_ptr<T>(zeros),
+        const_elem_ptr<M>(scales), const_elem_ptr<M>(zeros),
         elem_ptr<T>(output), static_cast<int>(num_groups), group_size);
 }
 
-template <typename T>
+template <typename T, typename M>
 sycl::event submit_roundtrip_keys(
     torch::Tensor& input, torch::Tensor& output,
     int64_t num_channels, int group_size)
 {
-    return quant_dequant_roundtrip_keys_submit<T>(
+    return quant_dequant_roundtrip_keys_submit<T, M>(
         const_elem_ptr<T>(input), elem_ptr<T>(output),
         static_cast<int>(num_channels), group_size);
 }
 
-template <typename T>
+template <typename T, typename M>
 sycl::event submit_roundtrip_values(
     torch::Tensor& input, torch::Tensor& output,
     int64_t num_tokens, int head_dim, int group_size)
 {
-    return quant_dequant_roundtrip_values_submit<T>(
+    return quant_dequant_roundtrip_values_submit<T, M>(
         const_elem_ptr<T>(input), elem_ptr<T>(output),
         static_cast<int>(num_tokens), head_dim, group_size);
+}
+
+// --- (element, metadata) dtype dispatch ---
+//
+// Maps the runtime dtype pair onto one of the instantiated kernel pairs and
+// calls `f` with a tag carrying both types. The pairs here must match the
+// explicit instantiations in kernels/*.cpp. Tag dispatch rather than a C++20
+// template lambda because the extension builds as -std=c++17.
+
+template <typename T, typename M>
+struct TypePair { using elem = T; using meta = M; };
+
+template <typename F>
+sycl::event dispatch_types(torch::ScalarType dt, torch::ScalarType mdt, F&& f)
+{
+    if (dt == torch::kFloat32 && mdt == torch::kFloat32)
+        return f(TypePair<float, float>{});
+    if (dt == torch::kFloat32 && mdt == torch::kHalf)
+        return f(TypePair<float, sycl::half>{});
+    if (dt == torch::kHalf && mdt == torch::kHalf)
+        return f(TypePair<sycl::half, sycl::half>{});
+    TORCH_CHECK(false, "unsupported (element, metadata) dtype pair (",
+                torch::toString(dt), ", ", torch::toString(mdt), ")");
+}
+
+// --- Op bodies: validate, then submit. Shared by blocking/async entry points.
+
+sycl::event run_quant_keys(
+    torch::Tensor& input, torch::Tensor& output,
+    torch::Tensor& scales, torch::Tensor& zeros, int group_size, const char* op)
+{
+    auto dt = float_dtype_of(input, op);
+    auto mdt = meta_dtype_of(scales, zeros, dt, op);
+    int64_t nc = validate_quant_keys_args(input, output, scales, zeros, group_size, dt, mdt);
+    auto layout = derive_quant_layout(output, scales, zeros, /*inner_dims=*/1,
+                                      group_size, nc);
+    return dispatch_types(dt, mdt, [&](auto p) {
+        using P = decltype(p);
+        return submit_quant_keys<typename P::elem, typename P::meta>(
+            input, output, scales, zeros, nc, group_size, layout);
+    });
+}
+
+sycl::event run_quant_values(
+    torch::Tensor& input, torch::Tensor& output,
+    torch::Tensor& scales, torch::Tensor& zeros,
+    int head_dim, int group_size, const char* op)
+{
+    auto dt = float_dtype_of(input, op);
+    auto mdt = meta_dtype_of(scales, zeros, dt, op);
+    int64_t nt = validate_quant_values_args(input, output, scales, zeros,
+                                            head_dim, group_size, dt, mdt);
+    auto layout = derive_quant_layout(output, scales, zeros, /*inner_dims=*/2,
+                                      group_size, nt * (head_dim / group_size));
+    return dispatch_types(dt, mdt, [&](auto p) {
+        using P = decltype(p);
+        return submit_quant_values<typename P::elem, typename P::meta>(
+            input, output, scales, zeros, nt, head_dim, group_size, layout);
+    });
+}
+
+sycl::event run_dequant_keys(
+    torch::Tensor& input, torch::Tensor& scales,
+    torch::Tensor& zeros, torch::Tensor& output, int group_size, const char* op)
+{
+    auto dt = float_dtype_of(output, op);
+    auto mdt = meta_dtype_of(scales, zeros, dt, op);
+    int64_t nc = validate_dequant_keys_args(input, scales, zeros, output, group_size, dt, mdt);
+    return dispatch_types(dt, mdt, [&](auto p) {
+        using P = decltype(p);
+        return submit_dequant_keys<typename P::elem, typename P::meta>(
+            input, scales, zeros, output, nc, group_size);
+    });
+}
+
+sycl::event run_dequant_values(
+    torch::Tensor& input, torch::Tensor& scales,
+    torch::Tensor& zeros, torch::Tensor& output,
+    int head_dim, int group_size, const char* op)
+{
+    auto dt = float_dtype_of(output, op);
+    auto mdt = meta_dtype_of(scales, zeros, dt, op);
+    int64_t ng = validate_dequant_values_args(input, scales, zeros, output,
+                                              head_dim, group_size, dt, mdt);
+    return dispatch_types(dt, mdt, [&](auto p) {
+        using P = decltype(p);
+        return submit_dequant_values<typename P::elem, typename P::meta>(
+            input, scales, zeros, output, ng, group_size);
+    });
+}
+
+// Round-trip ops have no metadata tensor to infer from; the caller states
+// whether the (discarded) scale/zero should be rounded through fp16.
+torch::ScalarType roundtrip_meta_dtype(torch::ScalarType dt, bool half_metadata) {
+    return half_metadata ? torch::kHalf : dt;
+}
+
+sycl::event run_roundtrip_keys(
+    torch::Tensor& input, torch::Tensor& output, int group_size,
+    bool half_metadata, const char* op)
+{
+    auto dt = float_dtype_of(input, op);
+    auto mdt = roundtrip_meta_dtype(dt, half_metadata);
+    int64_t nc = validate_roundtrip_keys_args(input, output, group_size, dt);
+    return dispatch_types(dt, mdt, [&](auto p) {
+        using P = decltype(p);
+        return submit_roundtrip_keys<typename P::elem, typename P::meta>(
+            input, output, nc, group_size);
+    });
+}
+
+sycl::event run_roundtrip_values(
+    torch::Tensor& input, torch::Tensor& output, int head_dim, int group_size,
+    bool half_metadata, const char* op)
+{
+    auto dt = float_dtype_of(input, op);
+    auto mdt = roundtrip_meta_dtype(dt, half_metadata);
+    int64_t nt = validate_roundtrip_values_args(input, output, head_dim, group_size, dt);
+    return dispatch_types(dt, mdt, [&](auto p) {
+        using P = decltype(p);
+        return submit_roundtrip_values<typename P::elem, typename P::meta>(
+            input, output, nt, head_dim, group_size);
+    });
 }
 
 }  // namespace
@@ -284,72 +516,47 @@ void kivi_quant_keys(
     torch::Tensor input, torch::Tensor output,
     torch::Tensor scales, torch::Tensor zeros, int group_size)
 {
-    auto dt = float_dtype_of(input, "quantize_keys");
-    int64_t nc = validate_quant_keys_args(input, output, scales, zeros, group_size, dt);
-    auto ev = (dt == torch::kFloat32)
-        ? submit_quant_keys<float>(input, output, scales, zeros, nc, group_size)
-        : submit_quant_keys<sycl::half>(input, output, scales, zeros, nc, group_size);
-    ev.wait_and_throw();
+    run_quant_keys(input, output, scales, zeros, group_size, "quantize_keys")
+        .wait_and_throw();
 }
 
 void kivi_quant_values(
     torch::Tensor input, torch::Tensor output,
     torch::Tensor scales, torch::Tensor zeros, int head_dim, int group_size)
 {
-    auto dt = float_dtype_of(input, "quantize_values");
-    int64_t nt = validate_quant_values_args(input, output, scales, zeros,
-                                            head_dim, group_size, dt);
-    auto ev = (dt == torch::kFloat32)
-        ? submit_quant_values<float>(input, output, scales, zeros, nt, head_dim, group_size)
-        : submit_quant_values<sycl::half>(input, output, scales, zeros, nt, head_dim, group_size);
-    ev.wait_and_throw();
+    run_quant_values(input, output, scales, zeros, head_dim, group_size,
+                     "quantize_values").wait_and_throw();
 }
 
 void kivi_dequant_keys(
     torch::Tensor input, torch::Tensor scales,
     torch::Tensor zeros, torch::Tensor output, int group_size)
 {
-    auto dt = float_dtype_of(output, "dequantize_keys");
-    int64_t nc = validate_dequant_keys_args(input, scales, zeros, output, group_size, dt);
-    auto ev = (dt == torch::kFloat32)
-        ? submit_dequant_keys<float>(input, scales, zeros, output, nc, group_size)
-        : submit_dequant_keys<sycl::half>(input, scales, zeros, output, nc, group_size);
-    ev.wait_and_throw();
+    run_dequant_keys(input, scales, zeros, output, group_size, "dequantize_keys")
+        .wait_and_throw();
 }
 
 void kivi_dequant_values(
     torch::Tensor input, torch::Tensor scales,
     torch::Tensor zeros, torch::Tensor output, int head_dim, int group_size)
 {
-    auto dt = float_dtype_of(output, "dequantize_values");
-    int64_t ng = validate_dequant_values_args(input, scales, zeros, output,
-                                              head_dim, group_size, dt);
-    auto ev = (dt == torch::kFloat32)
-        ? submit_dequant_values<float>(input, scales, zeros, output, ng, group_size)
-        : submit_dequant_values<sycl::half>(input, scales, zeros, output, ng, group_size);
-    ev.wait_and_throw();
+    run_dequant_values(input, scales, zeros, output, head_dim, group_size,
+                       "dequantize_values").wait_and_throw();
 }
 
 void kivi_quant_dequant_roundtrip_keys(
-    torch::Tensor input, torch::Tensor output, int group_size)
+    torch::Tensor input, torch::Tensor output, int group_size, bool half_metadata)
 {
-    auto dt = float_dtype_of(input, "quant_dequant_roundtrip_keys");
-    int64_t nc = validate_roundtrip_keys_args(input, output, group_size, dt);
-    auto ev = (dt == torch::kFloat32)
-        ? submit_roundtrip_keys<float>(input, output, nc, group_size)
-        : submit_roundtrip_keys<sycl::half>(input, output, nc, group_size);
-    ev.wait_and_throw();
+    run_roundtrip_keys(input, output, group_size, half_metadata,
+                       "quant_dequant_roundtrip_keys").wait_and_throw();
 }
 
 void kivi_quant_dequant_roundtrip_values(
-    torch::Tensor input, torch::Tensor output, int head_dim, int group_size)
+    torch::Tensor input, torch::Tensor output, int head_dim, int group_size,
+    bool half_metadata)
 {
-    auto dt = float_dtype_of(input, "quant_dequant_roundtrip_values");
-    int64_t nt = validate_roundtrip_values_args(input, output, head_dim, group_size, dt);
-    auto ev = (dt == torch::kFloat32)
-        ? submit_roundtrip_values<float>(input, output, nt, head_dim, group_size)
-        : submit_roundtrip_values<sycl::half>(input, output, nt, head_dim, group_size);
-    ev.wait_and_throw();
+    run_roundtrip_values(input, output, head_dim, group_size, half_metadata,
+                         "quant_dequant_roundtrip_values").wait_and_throw();
 }
 
 // -------------------------------------------------------------------------
@@ -362,64 +569,48 @@ kivi::KiviEvent kivi_quant_keys_async(
     torch::Tensor input, torch::Tensor output,
     torch::Tensor scales, torch::Tensor zeros, int group_size)
 {
-    auto dt = float_dtype_of(input, "quantize_keys_async");
-    int64_t nc = validate_quant_keys_args(input, output, scales, zeros, group_size, dt);
-    return kivi::KiviEvent((dt == torch::kFloat32)
-        ? submit_quant_keys<float>(input, output, scales, zeros, nc, group_size)
-        : submit_quant_keys<sycl::half>(input, output, scales, zeros, nc, group_size));
+    return kivi::KiviEvent(run_quant_keys(input, output, scales, zeros,
+                                          group_size, "quantize_keys_async"));
 }
 
 kivi::KiviEvent kivi_quant_values_async(
     torch::Tensor input, torch::Tensor output,
     torch::Tensor scales, torch::Tensor zeros, int head_dim, int group_size)
 {
-    auto dt = float_dtype_of(input, "quantize_values_async");
-    int64_t nt = validate_quant_values_args(input, output, scales, zeros,
-                                            head_dim, group_size, dt);
-    return kivi::KiviEvent((dt == torch::kFloat32)
-        ? submit_quant_values<float>(input, output, scales, zeros, nt, head_dim, group_size)
-        : submit_quant_values<sycl::half>(input, output, scales, zeros, nt, head_dim, group_size));
+    return kivi::KiviEvent(run_quant_values(input, output, scales, zeros,
+                                            head_dim, group_size,
+                                            "quantize_values_async"));
 }
 
 kivi::KiviEvent kivi_dequant_keys_async(
     torch::Tensor input, torch::Tensor scales,
     torch::Tensor zeros, torch::Tensor output, int group_size)
 {
-    auto dt = float_dtype_of(output, "dequantize_keys_async");
-    int64_t nc = validate_dequant_keys_args(input, scales, zeros, output, group_size, dt);
-    return kivi::KiviEvent((dt == torch::kFloat32)
-        ? submit_dequant_keys<float>(input, scales, zeros, output, nc, group_size)
-        : submit_dequant_keys<sycl::half>(input, scales, zeros, output, nc, group_size));
+    return kivi::KiviEvent(run_dequant_keys(input, scales, zeros, output,
+                                            group_size, "dequantize_keys_async"));
 }
 
 kivi::KiviEvent kivi_dequant_values_async(
     torch::Tensor input, torch::Tensor scales,
     torch::Tensor zeros, torch::Tensor output, int head_dim, int group_size)
 {
-    auto dt = float_dtype_of(output, "dequantize_values_async");
-    int64_t ng = validate_dequant_values_args(input, scales, zeros, output,
-                                              head_dim, group_size, dt);
-    return kivi::KiviEvent((dt == torch::kFloat32)
-        ? submit_dequant_values<float>(input, scales, zeros, output, ng, group_size)
-        : submit_dequant_values<sycl::half>(input, scales, zeros, output, ng, group_size));
+    return kivi::KiviEvent(run_dequant_values(input, scales, zeros, output,
+                                              head_dim, group_size,
+                                              "dequantize_values_async"));
 }
 
 kivi::KiviEvent kivi_quant_dequant_roundtrip_keys_async(
-    torch::Tensor input, torch::Tensor output, int group_size)
+    torch::Tensor input, torch::Tensor output, int group_size, bool half_metadata)
 {
-    auto dt = float_dtype_of(input, "quant_dequant_roundtrip_keys_async");
-    int64_t nc = validate_roundtrip_keys_args(input, output, group_size, dt);
-    return kivi::KiviEvent((dt == torch::kFloat32)
-        ? submit_roundtrip_keys<float>(input, output, nc, group_size)
-        : submit_roundtrip_keys<sycl::half>(input, output, nc, group_size));
+    return kivi::KiviEvent(run_roundtrip_keys(input, output, group_size, half_metadata,
+                                              "quant_dequant_roundtrip_keys_async"));
 }
 
 kivi::KiviEvent kivi_quant_dequant_roundtrip_values_async(
-    torch::Tensor input, torch::Tensor output, int head_dim, int group_size)
+    torch::Tensor input, torch::Tensor output, int head_dim, int group_size,
+    bool half_metadata)
 {
-    auto dt = float_dtype_of(input, "quant_dequant_roundtrip_values_async");
-    int64_t nt = validate_roundtrip_values_args(input, output, head_dim, group_size, dt);
-    return kivi::KiviEvent((dt == torch::kFloat32)
-        ? submit_roundtrip_values<float>(input, output, nt, head_dim, group_size)
-        : submit_roundtrip_values<sycl::half>(input, output, nt, head_dim, group_size));
+    return kivi::KiviEvent(run_roundtrip_values(input, output, head_dim, group_size,
+                                                half_metadata,
+                                                "quant_dequant_roundtrip_values_async"));
 }

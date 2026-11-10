@@ -26,74 +26,73 @@ inline void round_scale_zero(float& scale, float& zero)
 
 }  // namespace
 
-template <typename T>
+namespace {
+
+// One work-item per group; group `gid` is the contiguous run
+// input[gid*G .. gid*G+G) for both keys and values (see quantize_kernels.cpp),
+// and the round-trip writes it back in place, so both ops share this kernel.
+template <typename T, typename M>
+sycl::event roundtrip_groups_submit(
+    const T* __restrict__ input,
+    T*       __restrict__ output,
+    int64_t num_groups,
+    int group_size)
+{
+    sycl::queue& q = kivi::get_queue();
+    const int64_t global_size =
+        ((num_groups + kLocalSize - 1) / kLocalSize) * kLocalSize;
+
+    return q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(global_size), kLocalSize),
+            [=](sycl::nd_item<1> item) {
+                const int64_t gid = static_cast<int64_t>(item.get_global_id(0));
+                if (gid >= num_groups) return;
+
+                const int64_t base = gid * group_size;
+                float min_val, max_val;
+                reduce_min_max_vec(input, base, group_size, min_val, max_val);
+                float scale = compute_scale<M>(min_val, max_val);
+                min_val = saturate_zero<M>(min_val);
+                round_scale_zero<M>(scale, min_val);
+
+                roundtrip_vec(input, base, group_size, min_val, scale, output, base);
+            });
+    });
+}
+
+}  // namespace
+
+template <typename T, typename M>
 sycl::event quant_dequant_roundtrip_keys_submit(
-    const T* __restrict__ input,
-    T*       __restrict__ output,
-    int num_channels,
-    int group_size)
+    const T* input, T* output, int num_channels, int group_size)
 {
-    sycl::queue& q = kivi::get_queue();
-    const int global_size = ((num_channels + kLocalSize - 1) / kLocalSize) * kLocalSize;
-
-    return q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<1>(global_size, kLocalSize),
-            [=](sycl::nd_item<1> item) {
-                int ch = item.get_global_id(0);
-                if (ch >= num_channels) return;
-
-                int base = ch * group_size;
-                float min_val, max_val;
-                reduce_min_max_vec(input, base, group_size, min_val, max_val);
-                float scale = (max_val - min_val) / 3.0f + 1e-10f;
-                round_scale_zero<T>(scale, min_val);
-
-                roundtrip_vec(input, base, group_size, min_val, scale, output, base);
-            });
-    });
+    return roundtrip_groups_submit<T, M>(input, output, num_channels, group_size);
 }
 
-template <typename T>
+template <typename T, typename M>
 sycl::event quant_dequant_roundtrip_values_submit(
-    const T* __restrict__ input,
-    T*       __restrict__ output,
-    int num_tokens,
-    int head_dim,
-    int group_size)
+    const T* input, T* output, int num_tokens, int head_dim, int group_size)
 {
-    sycl::queue& q = kivi::get_queue();
-    int groups_per_token = head_dim / group_size;
-    int total_groups     = num_tokens * groups_per_token;
-    const int global_size = ((total_groups + kLocalSize - 1) / kLocalSize) * kLocalSize;
-
-    return q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<1>(global_size, kLocalSize),
-            [=](sycl::nd_item<1> item) {
-                int gid = item.get_global_id(0);
-                if (gid >= total_groups) return;
-
-                int token_idx    = gid / groups_per_token;
-                int group_in_tok = gid % groups_per_token;
-                int base = token_idx * head_dim + group_in_tok * group_size;
-
-                float min_val, max_val;
-                reduce_min_max_vec(input, base, group_size, min_val, max_val);
-                float scale = (max_val - min_val) / 3.0f + 1e-10f;
-                round_scale_zero<T>(scale, min_val);
-
-                roundtrip_vec(input, base, group_size, min_val, scale, output, base);
-            });
-    });
+    return roundtrip_groups_submit<T, M>(
+        input, output,
+        static_cast<int64_t>(num_tokens) * (head_dim / group_size), group_size);
 }
 
-// Explicit instantiations — the only element types the ops layer dispatches.
-template sycl::event quant_dequant_roundtrip_keys_submit<float>(
+// Explicit instantiations — the (element, metadata) pairs the ops layer
+// dispatches: fp32 with fp32 or fp16 metadata, and fp16 with fp16 metadata.
+// <half, float> is deliberately absent: widening metadata past the element
+// precision buys nothing and doubles its footprint.
+template sycl::event quant_dequant_roundtrip_keys_submit<float, float>(
     const float*, float*, int, int);
-template sycl::event quant_dequant_roundtrip_keys_submit<sycl::half>(
+template sycl::event quant_dequant_roundtrip_keys_submit<float, sycl::half>(
+    const float*, float*, int, int);
+template sycl::event quant_dequant_roundtrip_keys_submit<sycl::half, sycl::half>(
     const sycl::half*, sycl::half*, int, int);
-template sycl::event quant_dequant_roundtrip_values_submit<float>(
+
+template sycl::event quant_dequant_roundtrip_values_submit<float, float>(
     const float*, float*, int, int, int);
-template sycl::event quant_dequant_roundtrip_values_submit<sycl::half>(
+template sycl::event quant_dequant_roundtrip_values_submit<float, sycl::half>(
+    const float*, float*, int, int, int);
+template sycl::event quant_dequant_roundtrip_values_submit<sycl::half, sycl::half>(
     const sycl::half*, sycl::half*, int, int, int);
