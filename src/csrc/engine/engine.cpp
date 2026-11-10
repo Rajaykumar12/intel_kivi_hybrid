@@ -372,10 +372,24 @@ std::optional<std::pair<at::Tensor, at::Tensor>> Engine::full_kv(int64_t i) cons
         if (!l.res_k.defined()) return std::nullopt;
         return std::make_pair(l.res_k, l.res_v);
     }
-    at::Tensor hk = dequant_keys((*h)[0], (*h)[1], (*h)[2], *cache_dtype_);
-    at::Tensor hv = dequant_values((*h)[3], (*h)[4], (*h)[5], *cache_dtype_);
-    if (!l.res_k.defined()) return std::make_pair(hk, hv);
-    return std::make_pair(at::cat({hk, l.res_k}, 2), at::cat({hv, l.res_v}, 2));
+    // One allocation per tensor: dequantize the history straight into the
+    // head of the output and copy the residual into the tail (the Python
+    // _serve_layer layout) — a dequantize-then-cat would write the whole FP
+    // history twice.
+    const int64_t n_hist = l.quant_tokens;
+    const int64_t n_res = l.res_k.defined() ? l.res_k.size(2) : 0;
+    const auto& pk = (*h)[0];
+    const int64_t B = pk.size(0), H = pk.size(1), D = pk.size(2);
+    auto opts = at::TensorOptions().dtype(*cache_dtype_);
+    at::Tensor out_k = at::empty({B, H, n_hist + n_res, D}, opts);
+    at::Tensor out_v = at::empty({B, H, n_hist + n_res, D}, opts);
+    dequant_keys_into(out_k.narrow(2, 0, n_hist), (*h)[0], (*h)[1], (*h)[2]);
+    dequant_values_into(out_v.narrow(2, 0, n_hist), (*h)[3], (*h)[4], (*h)[5]);
+    if (n_res) {
+        out_k.narrow(2, n_hist, n_res).copy_(l.res_k);
+        out_v.narrow(2, n_hist, n_res).copy_(l.res_v);
+    }
+    return std::make_pair(out_k, out_v);
 }
 
 at::Tensor Engine::attend(int64_t i, const at::Tensor& query, std::optional<double> scaling,
