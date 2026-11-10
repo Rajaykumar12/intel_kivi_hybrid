@@ -21,6 +21,7 @@
 #include <torch/torch.h>
 
 #include "cpu/fused_attention.hpp"
+#include "engine/registry.hpp"
 #include "ops/kv_cache_ops.hpp"
 
 namespace {
@@ -46,6 +47,20 @@ at::Tensor fused_decode_attention(
                                        packed_v, scales_v, zeros_v, scaling, group_size);
 }
 
+// Stateful: append this step's k/v to engine `engine`'s layer, then attend
+// over its packed history + residual (kivi::Engine::update + attend). The
+// engine is opaque to the graph; `state` is a token tensor declared mutated
+// (and incremented) so graph capture neither drops nor reorders the calls.
+at::Tensor layer_attention(int64_t engine, int64_t layer, const at::Tensor& query,
+                           const at::Tensor& k_new, const at::Tensor& v_new,
+                           double scaling, const at::Tensor& state) {
+    auto e = kivi::get_engine(engine);
+    e->update(layer, k_new, v_new);
+    at::Tensor out = e->attend(layer, query, scaling);
+    const_cast<at::Tensor&>(state).add_(1);
+    return out;
+}
+
 // --- Meta kernels: shapes only ---------------------------------------------
 
 void quantize_keys_meta(const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -65,6 +80,15 @@ at::Tensor fused_decode_attention_meta(
                      query.options());
 }
 
+at::Tensor layer_attention_meta(int64_t, int64_t, const at::Tensor& query,
+                                const at::Tensor&, const at::Tensor&, double,
+                                const at::Tensor&) {
+    TORCH_CHECK(query.dim() == 4, "layer_attention: query must be [B, Hq, T, D]");
+    // [B, T, Hq, D] — query is [B, Hq, T, D].
+    return at::empty({query.size(0), query.size(2), query.size(1), query.size(3)},
+                     query.options());
+}
+
 }  // namespace
 
 TORCH_LIBRARY(kivi, m) {
@@ -76,12 +100,15 @@ TORCH_LIBRARY(kivi, m) {
           "Tensor packed_k, Tensor scales_k, Tensor zeros_k, "
           "Tensor packed_v, Tensor scales_v, Tensor zeros_v, "
           "float scaling, int group_size) -> Tensor");
+    m.def("layer_attention(int engine, int layer, Tensor query, Tensor k_new, "
+          "Tensor v_new, float scaling, Tensor(a!) state) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(kivi, CPU, m) {
     m.impl("quantize_keys", &quantize_keys);
     m.impl("quantize_values", &quantize_values);
     m.impl("fused_decode_attention", &fused_decode_attention);
+    m.impl("layer_attention", &layer_attention);
 }
 
 TORCH_LIBRARY_IMPL(kivi, XPU, m) {
@@ -93,4 +120,5 @@ TORCH_LIBRARY_IMPL(kivi, Meta, m) {
     m.impl("quantize_keys", &quantize_keys_meta);
     m.impl("quantize_values", &quantize_values_meta);
     m.impl("fused_decode_attention", &fused_decode_attention_meta);
+    m.impl("layer_attention", &layer_attention_meta);
 }

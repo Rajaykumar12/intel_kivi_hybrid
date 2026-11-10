@@ -65,6 +65,7 @@ add_library(kivi_core SHARED
   ${KIVI_CSRC}/engine/arena.cpp
   ${KIVI_CSRC}/engine/dequant_cpu.cpp
   ${KIVI_CSRC}/engine/engine.cpp
+  ${KIVI_CSRC}/engine/registry.cpp
 )
 target_include_directories(kivi_core PUBLIC ${KIVI_CSRC} ${KIVI_CSRC}/include)
 # Flags mirror setup.py (fp model rationale is documented there).

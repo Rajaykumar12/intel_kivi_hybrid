@@ -11,6 +11,7 @@
 #include "cpu/fused_attention.hpp"
 #include "engine/dequant_cpu.hpp"
 #include "engine/engine.hpp"
+#include "engine/registry.hpp"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "KIVI: Asymmetric 2-bit KV Cache Quantization for Intel XPU (SYCL)";
@@ -51,7 +52,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("scaling"), py::arg("group_size"),
           py::call_guard<py::gil_scoped_release>());
     // --- kivi::Engine — the cache engine in C++ (Phase 5 S1.4) -------------
-    py::class_<kivi::Engine>(m, "Engine",
+    py::class_<kivi::Engine, std::shared_ptr<kivi::Engine>>(m, "Engine",
         "KIVI cache engine (C++ port of KiviCache's state machine). update() is "
         "the HF-native order, append() the legacy add_tokens order.")
         .def(py::init([](int64_t num_layers, int64_t head_dim, int64_t num_kv_heads,
@@ -68,7 +69,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                  c.zero_copy = zero_copy == "on" ? kivi::ZeroCopy::On
                              : zero_copy == "off" ? kivi::ZeroCopy::Off : kivi::ZeroCopy::Auto;
                  c.async_flush = async_flush; c.device = device; c.row_align = row_align;
-                 return std::make_unique<kivi::Engine>(std::move(c));
+                 return std::make_shared<kivi::Engine>(std::move(c));
              }),
              py::arg("num_layers"), py::arg("head_dim"), py::arg("num_kv_heads") = 0,
              py::arg("residual_length") = 128, py::arg("group_size") = std::vector<int64_t>{32},
@@ -120,6 +121,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                  d["fp_baseline_bytes"] = s.fp_baseline_bytes; d["compression"] = s.compression;
                  return d;
              }, py::arg("layer") = 0);
+
+    m.def("register_engine", &kivi::register_engine,
+          "Register an Engine for torch.ops.kivi.layer_attention; returns its id. "
+          "id=-1 picks a free id (>= 1); id 0 is reserved for the C++ runtime.",
+          py::arg("engine"), py::arg("id") = -1);
+    m.def("unregister_engine", &kivi::unregister_engine, py::arg("id"));
 
     // --- C++ dequantize-on-read (Phase 5 S1.3; port of KiviCache._dequant_*)
     m.def("dequant_keys_cpu", &kivi::dequant_keys,
