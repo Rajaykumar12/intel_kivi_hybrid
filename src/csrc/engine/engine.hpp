@@ -2,12 +2,13 @@
 // ==========================================================================
 // kivi::Engine — the KIVI cache engine in C++ (Phase 5 S1.4).
 //
-// A port of the state machine in src/kivi_sycl/cache/manager.py (KiviCache):
+// The KIVI cache state machine (formerly the Python KiviCache internals,
+// replaced by this engine in Phase 5 S1.8):
 // FP residual per layer, flush of the residual's excess into the packed
 // arena (2-bit payload + per-group scales/zeros), asynchronous harvest,
 // reserve(), per-layer group size, measured stats. The numerics are the
-// existing kernels; this file is bookkeeping, and must reproduce the Python
-// engine step for step (tests/unit/test_native_engine.py).
+// existing kernels; this file is bookkeeping. It reproduced the former
+// Python engine step for step before replacing it.
 //
 // Two update orders, both from the Python engine:
 //   update(i, k, v)  HF-native path (KiviLayer.update): harvest layer i →

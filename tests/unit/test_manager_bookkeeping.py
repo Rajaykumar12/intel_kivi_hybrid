@@ -17,7 +17,6 @@ token's KV was silently dropped, degrading generation into gibberish.
 
 import os
 import sys
-import types
 
 import pytest
 
@@ -26,9 +25,7 @@ transformers = pytest.importorskip("transformers")
 
 from transformers.cache_utils import DynamicCache
 
-# Make the src-layout package importable when running from the repo, and
-# stub the compiled extension BEFORE importing kivi_sycl so the import
-# seam in extension/loader.py doesn't fail on machines without the build.
+# Make the src-layout package importable when running from the repo.
 _SRC = os.path.join(os.path.dirname(__file__), "..", "..", "src")
 if os.path.isdir(_SRC) and _SRC not in sys.path:
     sys.path.insert(0, _SRC)
@@ -57,27 +54,6 @@ def _scale_zero_reference(flat, meta_dtype):
     return scale.half().to(flat.dtype), zero.half().to(flat.dtype)
 
 
-def _quantize_2bit_reference(inp, packed_out, scales_out, zeros_out, group_size):
-    """Exact torch mirror of the SYCL quantize kernels.
-
-    Both kernels reduce over contiguous runs of `group_size` elements, so
-    a flat [-1, group_size] view reproduces their grouping for keys
-    ([B,H,D,L] input, groups along tokens) and values ([B,H,L,D] input,
-    groups along channels) alike. Packing is LSB-first:
-    byte = q0 | q1<<2 | q2<<4 | q3<<6. The metadata dtype is taken from
-    `scales_out`, as the real ops do.
-    """
-    flat = inp.reshape(-1, group_size)
-    scale, mn = _scale_zero_reference(flat, scales_out.dtype)
-    q = torch.clamp(torch.round((flat - mn) / scale), 0.0, 3.0).to(torch.uint8)
-    qb = q.reshape(-1, group_size // 4, 4)
-    byte = (qb[..., 0] | (qb[..., 1] << 2) | (qb[..., 2] << 4)
-            | (qb[..., 3] << 6))
-    packed_out.copy_(byte.reshape(packed_out.shape))
-    scales_out.copy_(scale.reshape(scales_out.shape))
-    zeros_out.copy_(mn.reshape(zeros_out.shape))
-
-
 def _roundtrip_2bit_reference(inp, group_size, meta_dtype=torch.float16):
     """Quantize + dequantize in one go — the expected served value of a
     flushed chunk. Defaults to fp16 metadata, KiviCache's default."""
@@ -87,58 +63,14 @@ def _roundtrip_2bit_reference(inp, group_size, meta_dtype=torch.float16):
     return (q * scale + mn).reshape(inp.shape)
 
 
-class _FakeEvent:
-    def wait(self):
-        pass
-
-
-class _FakeNative(types.ModuleType):
-    """Stand-in for kivi_sycl._C 's async quantize entry points."""
-
-    def __init__(self):
-        super().__init__("kivi_sycl._C")
-
-    def quantize_keys_async(self, inp, out, scales, zeros, group_size):
-        _quantize_2bit_reference(inp, out, scales, zeros, group_size)
-        return _FakeEvent()
-
-    def quantize_values_async(self, inp, out, scales, zeros, head_dim, group_size):
-        _quantize_2bit_reference(inp, out, scales, zeros, group_size)
-        return _FakeEvent()
-
-    def alloc_usm_host(self, sizes, dtype, align=64):
-        # Plain CPU memory stands in for USM host memory: the fake "kernels"
-        # above are torch ops, which can write strided arena views directly.
-        return torch.empty(sizes, dtype=dtype)
-
-
-_fake_native = _FakeNative()
-
-# Only claim the `kivi_sycl._C` slot on machines with no compiled build —
-# otherwise a combined `pytest tests/` run would hand the fake to
-# tests/integration/, whose `from kivi_sycl import _C` is meant to get the
-# real kernels. (setdefault alone is not enough: whether the real extension
-# has been imported yet depends on test collection order.)
 try:
-    import kivi_sycl._C  # noqa: F401
+    from kivi_sycl import _C as _ext  # noqa: E402
 except ImportError:
-    sys.modules["kivi_sycl._C"] = _fake_native
+    pytest.skip("compiled extension not built", allow_module_level=True)
+if not hasattr(_ext, "Engine"):
+    pytest.skip("extension built without the native engine", allow_module_level=True)
 
-import kivi_sycl.cache.manager as manager_module  # noqa: E402
 from kivi_sycl.cache.manager import KiviCache, _iter_kv_layers  # noqa: E402
-
-
-@pytest.fixture(autouse=True)
-def _use_fake_native(monkeypatch):
-    """Point the manager's native seam at the torch stand-in for the
-    duration of each test, and put the real one back afterwards.
-
-    This must be a fixture, not a module-level assignment: pytest imports
-    every test module up front, so a plain `manager_module.kivi_native =
-    _fake_native` at import time also silently rebinds the seam for
-    tests/integration/, which then "passes" against the fake instead of the
-    real kernels it exists to exercise."""
-    monkeypatch.setattr(manager_module, "kivi_native", _fake_native)
 
 
 class FakeModel:
@@ -528,18 +460,6 @@ def test_reset_clears_arena_and_reserve():
     cache.reset()
     assert all(cache.arena_info(i) is None for i in range(cache.num_layers))
     assert cache.reserved_tokens == 0
-
-
-def test_row_padding_aligns_key_rows():
-    """row_align pads each key row (one per channel) to a byte multiple; the
-    used views and the served cache are unchanged by it."""
-    from kivi_sycl.cache.arena import LayerArena
-    a = LayerArena(1, 2, 8, 4, 12, torch.float16, lambda sh, dt: torch.empty(sh, dtype=dt),
-                   row_align=64)
-    assert a.packed_k.shape == (1, 2, 8, 3) and a.packed_k.stride(-2) == 64
-    assert a.scales_k.shape == (1, 2, 8, 3) and a.scales_k.stride(-2) * 2 == 64
-    b = LayerArena(1, 2, 8, 4, 12, torch.float16, lambda sh, dt: torch.empty(sh, dtype=dt))
-    assert a.allocated_bytes > b.allocated_bytes
 
 
 # ---------------------------------------------------------------------------

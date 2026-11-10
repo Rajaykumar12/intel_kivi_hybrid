@@ -50,26 +50,16 @@ class KiviLayer(CacheLayerMixin):
             self.lazy_initialization(key_states, value_states)
         e, i = self.engine, self.layer_idx
         e._init_session(key_states, i)
-        if e._native is not None:
-            # kivi::Engine::update runs the same harvest → flush → append order.
-            e._native.update(i, key_states, value_states)
-            keys, values = e._native.residual(i)
-            setattr(keys, LAYER_TAG, self)
-            self.keys, self.values = keys, values
-            return keys, values
-        # Same flush timing as KiviCache.add_tokens(), which runs after each
-        # forward pass: (1) collect the flush submitted on the previous step
-        # (it had a whole forward pass to run, so the wait is ~free); (2)
-        # submit a flush for the residual as it stood *before* this step's
-        # tokens; (3) append them. Flushed tokens stay in the residual, served
-        # in FP, until harvested — so this step attends to them in FP and the
-        # next step to their 2-bit form, exactly as on the add_tokens path.
-        e._harvest_layer(i)
-        e._maybe_flush(i)
-        if not e.async_flush:
-            e._harvest_layer(i)
-        e._append_residual(i, key_states.to(e._cache_dtype), value_states.to(e._cache_dtype))
-        keys, values = e.res_keys[i], e.res_values[i]
+        # kivi::Engine::update, with the same flush timing as add_tokens()
+        # (which runs after each forward pass): (1) collect the flush
+        # submitted on the previous step — it had a whole forward pass to
+        # run, so the wait is ~free; (2) flush the residual as it stood
+        # *before* this step's tokens; (3) append them. Flushed tokens stay in
+        # the residual, served in FP, until harvested — so this step attends
+        # to them in FP and the next to their 2-bit form, exactly as on the
+        # add_tokens path.
+        e._native.update(i, key_states, value_states)
+        keys, values = e._native.residual(i)
         setattr(keys, LAYER_TAG, self)
         self.keys, self.values = keys, values
         return keys, values

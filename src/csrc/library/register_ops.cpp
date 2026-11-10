@@ -91,6 +91,12 @@ at::Tensor layer_attention_meta(int64_t, int64_t, const at::Tensor& query,
 
 }  // namespace
 
+// TORCH_LIBRARY / TORCH_LIBRARY_IMPL expand to file-static registration
+// objects that run at load time and are never referenced again by design;
+// clang reports each as an unused const variable.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-const-variable"
+
 TORCH_LIBRARY(kivi, m) {
     m.def("quantize_keys(Tensor input, Tensor(a!) packed, Tensor(b!) scales, "
           "Tensor(c!) zeros, int group_size) -> ()");
@@ -122,3 +128,5 @@ TORCH_LIBRARY_IMPL(kivi, Meta, m) {
     m.impl("fused_decode_attention", &fused_decode_attention_meta);
     m.impl("layer_attention", &layer_attention_meta);
 }
+
+#pragma clang diagnostic pop

@@ -1,14 +1,14 @@
 #pragma once
 // ==========================================================================
-// KIVI packed-KV arena for one layer — C++ port of src/kivi_sycl/cache/arena.py
-// (Phase 5 S1.3). Names and behaviour mirror the Python version one for one,
-// so the two can be diffed while the Python engine still exists.
+// KIVI packed-KV arena for one layer. Ported in Phase 5 (S1.3) from the
+// former Python cache/arena.py, which was removed once the C++ engine
+// became the only engine (S1.8); names and behaviour are unchanged.
 //
 // Layout:
 //   keys,   channel-major: packed [B,H,D,cap/4] u8,  scales/zeros [B,H,D,cap/G]
 //   values, token-major:   packed [B,H,cap,D/4] u8,  scales/zeros [B,H,cap,D/G]
 // Key rows may be padded to `row_align` bytes (off by default — measured to
-// cost more resident memory than it is worth; see arena.py). Capacity is in
+// cost more resident memory than it is worth, Phase 1 step 10). Capacity is in
 // tokens and always a multiple of G; the first `used` tokens are valid.
 // allocated_bytes() counts every base allocation, padding included.
 // ==========================================================================

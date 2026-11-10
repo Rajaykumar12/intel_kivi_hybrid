@@ -201,41 +201,37 @@ Token stream: [t₀, t₁, ..., t_{n-R}, ..., tₙ]
 ## Architecture
 
 ```
-┌──────────────────────────────────────────┐
-│        Transformer Model (CPU)           │
-│   Any HuggingFace CausalLM (GPT-2,      │
-│   LLaMA, Mistral, Phi, Qwen, etc.)      │
-└──────────────────┬───────────────────────┘
-                   │ past_key_values (CPU tensors)
-                   ▼
-         ┌──────────────────┐
-         │    KiviCache     │
-         │  (kivi_sycl)     │
-         └────────┬─────────┘
-                  │
-    ┌─────────────┴──────────────────┐
-    │                                │
-    ▼                                ▼
-┌──────────────┐          ┌──────────────────┐
-│  Residual    │          │  Packed Store    │
-│  Buffer      │          │  (CPU-resident)  │
-│  (FP, CPU)   │          │                  │
-│              │          │ packed: uint8    │
-│ Last R tokens│          │ scales: fp32/16  │
-│ No device    │          │ zeros:  fp32/16  │
-│ transfers    │          │ dequant on read  │
-└──────────────┘          └────────┬─────────┘
-                                   │
-                         ┌─────────┴─────────┐
-                         │  SYCL Kernels     │
-                         │  (kivi_sycl._C)   │
-                         │                   │
-                         │ quantize_keys()   │
-                         │ quantize_values() │
-                         │ dequantize_keys() │
-                         │ dequantize_values()│
-                         └───────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│ Transformer model (CPU) — any HuggingFace CausalLM        │
+└───────────────┬──────────────────────────────────────────┘
+                │ enable_kivi(model)            KiviCache.add_tokens /
+                │ (transformers Cache +         get_full_cache (legacy loop)
+                │  "kivi" / "kivi_op" attention)        │
+                ▼                                       ▼
+┌──────────────────────────────────────────────────────────┐
+│ kivi_sycl (Python, thin)   hf/  cache/manager.py          │
+│   adapts transformers objects; holds no cache state       │
+└───────────────┬──────────────────────────────────────────┘
+                │ _C.Engine  /  torch.ops.kivi.*
+                ▼
+┌──────────────────────────────────────────────────────────┐
+│ libkivi_core (C++, no Python)              src/csrc/      │
+│   kivi::Engine   residual · flush/harvest · reserve ·     │
+│                  per-layer G · stats · attend()           │
+│   LayerArena     packed 2-bit store (USM host on XPU)     │
+│   ops            torch.ops.kivi.{quantize_keys,           │
+│                  quantize_values, fused_decode_attention, │
+│                  layer_attention}                         │
+│   SYCL kernels   quantize on the iGPU, zero-copy          │
+│   CPU kernel     fused decode attention (AVX2/FMA)        │
+└──────────────────────────────────────────────────────────┘
 ```
+
+Since Phase 5 all cache state and work lives in the C++ engine; the Python package only
+adapts it to transformers. The same `libkivi_core.so` builds without Python (CMake), which is
+the base for a Python-free runtime (`docs/optimization_roadmap/phase5_python_free_runtime.md`).
+With `device="cpu"` the engine uses a reference quantize instead of the SYCL kernels, so KIVI
+also runs on machines without an Intel GPU (slowly).
 
 ### Supported Models
 
@@ -377,6 +373,31 @@ print(tok.decode(out[0]), cache.get_stats()["compression"])
 per sequence. It accepts the same options as `KiviCache` (`group_size`, `residual_length`,
 `metadata_dtype`, `zero_copy`, …) plus `fused` (default `True`; `False` selects the
 dequantize-then-SDPA reference path). Beam search and cache cropping are not supported yet.
+
+### Compiled decode (`torch.compile`, op mode)
+
+`enable_kivi_op` turns each attention layer's KIVI work into a single
+`torch.ops.kivi.layer_attention` call, so `torch.compile` captures a whole decode step with
+**no graph breaks** (the default path breaks twice per layer). Pass `position_ids` and the
+cache's `model_kwargs` on every call:
+
+```python
+from kivi_sycl.hf.compiled import enable_kivi_op
+
+cache = enable_kivi_op(model, max_tokens=ids.shape[1] + 200)
+step = torch.compile(model.forward, dynamic=False)
+out = model(ids, past_key_values=cache, position_ids=torch.arange(ids.shape[1])[None],
+            **cache.model_kwargs)
+pos = ids.shape[1]
+nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+for _ in range(200):
+    out = step(input_ids=nxt, past_key_values=cache, position_ids=torch.tensor([[pos]]),
+               **cache.model_kwargs)
+    nxt, pos = out.logits[:, -1].argmax(-1, keepdim=True), pos + 1
+```
+
+Measured (2026-11-10): compiled decode **1.20×** on Qwen2.5-0.5B @ 2k and **1.11×** on
+TinyLlama-1.1B @ 1.9k over eager, greedy tokens unchanged. Batch size 1, no padding masks.
 
 ### Quick Start — One-liner Generation
 
@@ -535,22 +556,25 @@ For GPT-2 (short sequences), `R=64` is sufficient. For 7B+ models with long cont
 
 ## Project Layout
 
-The project uses a modular `src/`-layout: a pure-Python package (`src/kivi_sycl/`) and its native SYCL sources (`src/csrc/`) are kept fully separate, each broken down by single responsibility. See [`docs/architecture_and_state.md`](docs/architecture_and_state.md) for the full design rationale.
-
 ```
 src/
-├── kivi_sycl/            # Python package (src-layout)
-│   ├── __init__.py       # public API: KiviCache, generate
-│   ├── backend/ipex.py   # IPEX/XPU detection
-│   ├── config/           # HuggingFace model config auto-detection
-│   ├── cache/manager.py  # KiviCache — the KV cache state manager
-│   ├── generation/       # generate() loop + sampling strategies
-│   └── extension/        # single import seam for the compiled kivi_sycl._C
-└── csrc/                 # native C++/SYCL sources (not a Python package)
-    ├── include/kivi/     # shared headers
-    ├── kernels/           # SYCL quantize/dequantize kernels
-    ├── ops/               # Torch tensor validation + kernel dispatch
-    └── bindings/          # pybind11 module (kivi_sycl._C)
+├── kivi_sycl/              # Python package (thin front end)
+│   ├── __init__.py         # public API: KiviCache, enable_kivi, generate
+│   ├── cache/manager.py    # KiviCache — legacy loop API over the C++ engine
+│   ├── hf/                 # transformers integration: Cache, "kivi" attention, op mode
+│   ├── config/             # HuggingFace model config auto-detection
+│   ├── generation/         # generate() loop + sampling strategies
+│   └── extension/          # import seam for the compiled kivi_sycl._C
+└── csrc/                   # native C++/SYCL (builds into _C and libkivi_core.so)
+    ├── engine/             # kivi::Engine, LayerArena, CPU dequant, engine registry
+    ├── library/            # TORCH_LIBRARY(kivi): torch.ops.kivi.*
+    ├── cpu/                # fused decode attention (AVX2/FMA + generic)
+    ├── kernels/            # SYCL quantize/dequantize kernels
+    ├── ops/                # tensor validation + kernel dispatch
+    ├── include/kivi/       # shared headers (queue, USM, layout, events)
+    └── bindings/           # pybind11 module (kivi_sycl._C)
+CMakeLists.txt              # Python-free libkivi_core.so + C++ tests
+tests/{unit,integration,native}/
 ```
 
 ## Files
@@ -577,37 +601,20 @@ src/
 
 ## Testing
 
-Run the full test suite:
-
 ```bash
-python tests/integration/test_kivi.py
-python tests/integration/test_quantize_simple.py
-python tests/integration/test_attention_fix.py
+bash scripts/dev_test.sh            # pytest: unit (CPU) + integration (XPU)
+bash scripts/build_native.sh        # C++ build of libkivi_core.so + ctest (no Python)
+bash scripts/check_warnings.sh      # -Wall -Wextra audit of src/csrc
+python examples/verify_hf_equivalence.py   # 5 real models: legacy vs native path bit-identical
 ```
 
-### test_kivi.py — 15 checks
-
-| Test | What it verifies |
-|------|------------------|
-| Key round-trip | Per-channel quantize→dequantize error ≤ 0.5× scale |
-| Value round-trip | Per-token quantize→dequantize error within tolerance |
-| Known values | `[1,2,3,4]` → scale=1.0, zero=1.0, packed=228, lossless round-trip |
-| Multi-batch/head | Correct behavior with B=2, H=4 |
-| Constant input | No NaN/Inf for constant values, reconstructs exactly |
-
-### test_quantize_simple.py
-
-Deterministic bit-level verification with `[1,2,3,4]` across 4 channels:
-- Confirms `packed = 0|(1<<2)|(2<<4)|(3<<6) = 228 = 11100100₂`
-- Verifies scale=1.0, zero=1.0 across all channels
-- Full round-trip: `[1,2,3,4] → quantize → dequantize → [1,2,3,4]` with 0.0 error
-
-### test_attention_fix.py
-
-End-to-end pipeline: quantize KV → dequantize → compute attention → compare with FP32:
-- Key/value dequantization error ~1.0 (expected for 2-bit with random data)
-- Cosine similarity between KIVI and FP32 attention output: **0.898** (> 0.85 threshold)
-- No NaN/Inf in output
+- `tests/unit/` run on the CPU (the engine's reference quantize); integration tests need an
+  Intel GPU and skip cleanly without one.
+- `tests/native/` are C++ programs: the arena, the fused attention, the dispatcher ops, and an
+  assertion that no libpython is loaded.
+- Equivalence chain kept in the suite: legacy loop ≡ HF reference path (bit-exact);
+  fused kernel ≈ reference (1e-4); op mode ≡ default fused path (bit-exact); compiled op mode
+  ≈ eager (same greedy tokens).
 
 ## References
 

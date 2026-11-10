@@ -22,6 +22,7 @@ from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..extension.loader import kivi_native  # noqa: F401  (registers torch.ops.kivi)
+from ..cache.manager import dequantize_keys_cpu, dequantize_values_cpu
 from .cache import LAYER_TAG
 
 __all__ = ["ATTN_NAME", "kivi_attention_forward", "register_kivi_attention",
@@ -36,9 +37,9 @@ def dequantized_history(layer):
     hist = layer.history()
     if hist is None:
         return None, None
-    e = layer.engine
-    k = e._dequant_keys_cpu(*hist[:3])
-    v = e._dequant_values_cpu(*hist[3:])
+    dtype = layer.engine._cache_dtype
+    k = dequantize_keys_cpu(*hist[:3], dtype)
+    v = dequantize_values_cpu(*hist[3:], dtype)
     return k, v
 
 

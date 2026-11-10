@@ -1,5 +1,5 @@
-// kivi::Engine — see engine.hpp. Comments reference the Python method each
-// block ports (src/kivi_sycl/cache/manager.py).
+// kivi::Engine — see engine.hpp. Section comments name the method of the
+// former Python engine (KiviCache, removed in Phase 5 S1.8) each block ports.
 #include "engine/engine.hpp"
 
 #include "cpu/fused_attention.hpp"
@@ -87,6 +87,9 @@ const Engine::Layer& Engine::L(int64_t i) const {
 }
 
 bool Engine::zero_copy_enabled() const {
+    // Zero-copy means GPU kernels write a USM host arena; on the CPU device
+    // (reference quantize) there is no GPU queue, so it never applies.
+    if (device_.is_cpu()) return false;
     if (cfg_.zero_copy == ZeroCopy::Auto) return device_.is_xpu();
     return cfg_.zero_copy == ZeroCopy::On;
 }

@@ -1,4 +1,4 @@
-// KIVI packed-KV arena — see arena.hpp (port of src/kivi_sycl/cache/arena.py).
+// KIVI packed-KV arena — see arena.hpp.
 #include "engine/arena.hpp"
 
 #include "kivi/usm.hpp"

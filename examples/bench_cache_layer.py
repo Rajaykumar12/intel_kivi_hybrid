@@ -26,12 +26,22 @@ LAYERS, H, D, G, R = 24, 2, 64, 32, 128
 
 
 def load_baseline(commit):
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     src = subprocess.check_output(
-        ["git", "-C", os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "show",
+        ["git", "-C", repo, "show",
          f"{commit}:src/kivi_sycl/cache/manager.py"], text=True)
     src = src.replace("from ..config.model_config import", "from kivi_sycl.config.model_config import")
     src = src.replace("from ..extension.loader import", "from kivi_sycl.extension.loader import")
     mod = types.ModuleType("baseline_manager")
+    if "from .arena import" in src:
+        # Revisions with the Python engine (before Phase 5 S1.8) import its
+        # arena module; load that file from the same revision.
+        arena_src = subprocess.check_output(
+            ["git", "-C", repo, "show", f"{commit}:src/kivi_sycl/cache/arena.py"], text=True)
+        arena = types.ModuleType("baseline_arena")
+        exec(compile(arena_src, "baseline_arena.py", "exec"), arena.__dict__)
+        mod.__dict__.update({k: v for k, v in arena.__dict__.items() if not k.startswith("__")})
+        src = src.replace("from .arena import LayerArena, ensure_capacity\n", "")
     exec(compile(src, "baseline_manager.py", "exec"), mod.__dict__)
     return mod.KiviCache
 
