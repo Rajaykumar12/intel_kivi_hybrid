@@ -10,6 +10,7 @@
 #include "kivi/usm.hpp"
 #include "cpu/fused_attention.hpp"
 #include "engine/dequant_cpu.hpp"
+#include "engine/engine.hpp"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "KIVI: Asymmetric 2-bit KV Cache Quantization for Intel XPU (SYCL)";
@@ -49,6 +50,66 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("packed_v"), py::arg("scales_v"), py::arg("zeros_v"),
           py::arg("scaling"), py::arg("group_size"),
           py::call_guard<py::gil_scoped_release>());
+    // --- kivi::Engine — the cache engine in C++ (Phase 5 S1.4) -------------
+    py::class_<kivi::Engine>(m, "Engine",
+        "KIVI cache engine (C++ port of KiviCache's state machine). update() is "
+        "the HF-native order, append() the legacy add_tokens order.")
+        .def(py::init([](int64_t num_layers, int64_t head_dim, int64_t num_kv_heads,
+                         int64_t residual_length, std::vector<int64_t> group_size,
+                         const std::string& metadata_dtype, const std::string& zero_copy,
+                         bool async_flush, const std::string& device, int64_t row_align) {
+                 kivi::EngineConfig c;
+                 c.num_layers = num_layers; c.head_dim = head_dim;
+                 c.num_kv_heads = num_kv_heads; c.residual_length = residual_length;
+                 c.group_size = std::move(group_size);
+                 if (metadata_dtype == "float16") c.metadata_dtype = at::kHalf;
+                 else if (metadata_dtype == "float32") c.metadata_dtype = at::kFloat;
+                 else TORCH_CHECK(metadata_dtype == "auto", "metadata_dtype must be auto/float16/float32");
+                 c.zero_copy = zero_copy == "on" ? kivi::ZeroCopy::On
+                             : zero_copy == "off" ? kivi::ZeroCopy::Off : kivi::ZeroCopy::Auto;
+                 c.async_flush = async_flush; c.device = device; c.row_align = row_align;
+                 return std::make_unique<kivi::Engine>(std::move(c));
+             }),
+             py::arg("num_layers"), py::arg("head_dim"), py::arg("num_kv_heads") = 0,
+             py::arg("residual_length") = 128, py::arg("group_size") = std::vector<int64_t>{32},
+             py::arg("metadata_dtype") = "auto", py::arg("zero_copy") = "auto",
+             py::arg("async_flush") = true, py::arg("device") = "xpu", py::arg("row_align") = 1)
+        .def("update", &kivi::Engine::update, py::arg("layer"), py::arg("k"), py::arg("v"))
+        .def("append", &kivi::Engine::append, py::arg("layer"), py::arg("k"), py::arg("v"))
+        .def("harvest", &kivi::Engine::harvest, py::arg("layer"))
+        .def("harvest_all", &kivi::Engine::harvest_all)
+        .def("reserve", &kivi::Engine::reserve, py::arg("total_tokens"))
+        .def("reset", &kivi::Engine::reset)
+        .def("residual", [](const kivi::Engine& e, int64_t i) -> py::object {
+                 auto r = e.residual(i);
+                 if (!r) return py::none();
+                 return py::make_tuple(r->first, r->second);
+             }, py::arg("layer"))
+        .def("history", [](const kivi::Engine& e, int64_t i) -> py::object {
+                 auto h = e.history(i);
+                 if (!h) return py::none();
+                 return py::make_tuple((*h)[0], (*h)[1], (*h)[2], (*h)[3], (*h)[4], (*h)[5]);
+             }, py::arg("layer"))
+        .def("quant_tokens", &kivi::Engine::quant_tokens, py::arg("layer"))
+        .def("flushes", &kivi::Engine::flushes, py::arg("layer"))
+        .def("pending_tokens", &kivi::Engine::pending_tokens, py::arg("layer"))
+        .def("arena_capacity", &kivi::Engine::arena_capacity, py::arg("layer"))
+        .def("seq_length", &kivi::Engine::seq_length, py::arg("layer"))
+        .def_property_readonly("total_flushes", &kivi::Engine::total_flushes)
+        .def_property_readonly("zero_copy_enabled", &kivi::Engine::zero_copy_enabled)
+        .def("stats", [](const kivi::Engine& e, int64_t i) {
+                 auto s = e.stats(i);
+                 py::dict d;
+                 d["group_size"] = s.group_size; d["total_tokens"] = s.total_tokens;
+                 d["quantized_tokens"] = s.quantized_tokens; d["residual_tokens"] = s.residual_tokens;
+                 d["pending_tokens"] = s.pending_tokens; d["packed_bytes"] = s.packed_bytes;
+                 d["packed_used_bytes"] = s.packed_used_bytes;
+                 d["packed_capacity_tokens"] = s.packed_capacity_tokens;
+                 d["residual_bytes"] = s.residual_bytes; d["kivi_bytes"] = s.kivi_bytes;
+                 d["fp_baseline_bytes"] = s.fp_baseline_bytes; d["compression"] = s.compression;
+                 return d;
+             }, py::arg("layer") = 0);
+
     // --- C++ dequantize-on-read (Phase 5 S1.3; port of KiviCache._dequant_*)
     m.def("dequant_keys_cpu", &kivi::dequant_keys,
           "Dequantize packed per-channel keys [B,H,D,T/4] -> [B,H,T,D] on the CPU.",

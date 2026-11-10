@@ -88,6 +88,7 @@ setup(
                 os.path.join(CSRC, "library", "register_ops.cpp"),
                 os.path.join(CSRC, "engine", "arena.cpp"),
                 os.path.join(CSRC, "engine", "dequant_cpu.cpp"),
+                os.path.join(CSRC, "engine", "engine.cpp"),
             ],
             include_dirs=[CSRC, os.path.join(CSRC, "include")],
             libraries=extra_libraries,
