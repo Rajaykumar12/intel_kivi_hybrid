@@ -93,3 +93,43 @@ def test_aoti_package_matches_eager_op_mode(tmp_path):
     for a, b in zip(ref, got):
         torch.testing.assert_close(b, a, rtol=1e-4, atol=1e-5)   # Inductor reorders arithmetic
         assert a.argmax() == b.argmax()
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_artifact_directory_roundtrip(tmp_path, tied):
+    """write_artifacts -> load_artifacts (the C++ runtime's procedure in
+    Python) reproduces eager op mode; tied embeddings resolve to the stored
+    tensor and buffers absent from the weights land in extra_constants."""
+    import json
+    from kivi_sycl.export import load_artifacts, write_artifacts
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(num_hidden_layers=2, num_attention_heads=4,
+                                         num_key_value_heads=2, hidden_size=128,
+                                         intermediate_size=256, vocab_size=97,
+                                         max_position_embeddings=256,
+                                         tie_word_embeddings=tied)).eval()
+    snap = tmp_path / "snapshot"
+    model.save_pretrained(snap)
+    out = tmp_path / "artifacts"
+    write_artifacts(str(snap), str(out), max_tokens=64, group_size=G, residual_length=R)
+    manifest = json.loads((out / "constants.json").read_text())
+    assert manifest["model.lm_head.weight"]["tensor"] == (
+        "model.embed_tokens.weight" if tied else "lm_head.weight")
+    assert any(m["file"] == "extra_constants.safetensors" for m in manifest.values())
+
+    ids = torch.randint(0, 97, (1, PROMPT))
+    run = load_artifacts(str(out))
+    try:
+        with torch.no_grad():
+            lg = run(ids, torch.arange(PROMPT)[None])
+            nxt, pos, got = lg[:, -1].argmax(-1, keepdim=True), PROMPT, []
+            for _ in range(STEPS):
+                lg = run(nxt, torch.tensor([[pos]]))
+                got.append(lg[:, -1])
+                nxt, pos = lg[:, -1].argmax(-1, keepdim=True), pos + 1
+    finally:
+        run.close()
+    ref = _eager_op_mode(model, ids)
+    for a, b in zip(ref, got):
+        torch.testing.assert_close(b, a, rtol=1e-4, atol=1e-5)
+        assert a.argmax() == b.argmax()
