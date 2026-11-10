@@ -88,6 +88,20 @@ endif()
 # Find the torch libraries next to the binary's recorded torch location.
 set_target_properties(kivi_core PROPERTIES BUILD_RPATH "${KIVI_RPATH}")
 
+# kivi-run: the Python-free runtime (Phase 5 Route A). Links libkivi_core,
+# which registers the kivi:: ops the AOTInductor package calls, and holds the
+# engine registry the package's layer_attention calls resolve id 0 against.
+add_executable(kivi-run
+  src/runtime/main.cpp
+  src/runtime/model.cpp
+  src/runtime/safetensors.cpp
+)
+target_include_directories(kivi-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
+                           ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_link_libraries(kivi-run PRIVATE kivi_core)
+set_target_properties(kivi-run PROPERTIES
+  BUILD_RPATH "${KIVI_RPATH};$<TARGET_FILE_DIR:kivi_core>")
+
 enable_testing()
 add_executable(kivi_native_tests tests/native/test_core.cpp)
 target_link_libraries(kivi_native_tests PRIVATE kivi_core)
