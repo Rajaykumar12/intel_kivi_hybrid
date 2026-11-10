@@ -95,6 +95,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("pending_tokens", &kivi::Engine::pending_tokens, py::arg("layer"))
         .def("arena_capacity", &kivi::Engine::arena_capacity, py::arg("layer"))
         .def("seq_length", &kivi::Engine::seq_length, py::arg("layer"))
+        .def("attend", &kivi::Engine::attend, py::arg("layer"), py::arg("query"),
+             py::arg("scaling") = py::none(), py::arg("attn_mask") = py::none(),
+             py::arg("fused") = true,
+             "Attention over the layer's packed history + residual -> [B, T, Hq, D].")
+        .def("full_kv", [](const kivi::Engine& e, int64_t i) -> py::object {
+                 auto kv = e.full_kv(i);
+                 if (!kv) return py::none();
+                 return py::make_tuple(kv->first, kv->second);
+             }, py::arg("layer"))
+        .def_property_readonly("fused_calls", &kivi::Engine::fused_calls)
+        .def_property_readonly("reference_calls", &kivi::Engine::reference_calls)
         .def_property_readonly("total_flushes", &kivi::Engine::total_flushes)
         .def_property_readonly("zero_copy_enabled", &kivi::Engine::zero_copy_enabled)
         .def("stats", [](const kivi::Engine& e, int64_t i) {

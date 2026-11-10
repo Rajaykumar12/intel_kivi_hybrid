@@ -70,6 +70,29 @@ public:
     void update(int64_t layer, const at::Tensor& k_new, const at::Tensor& v_new);
     void append(int64_t layer, const at::Tensor& k_new, const at::Tensor& v_new);
     void harvest(int64_t layer);
+
+    // -- attention (Phase 5 S1.5) -------------------------------------------
+    // Attention for `layer` over its packed history + FP residual, for a
+    // query whose keys/values were already added with update(). Returns
+    // [B, T, Hq, D] — the layout transformers attention functions return.
+    //   decode (T == 1, no mask hiding anything, history present, fused):
+    //       fused kernel over the 2-bit codes; history never dequantized.
+    //   otherwise: dequantize history, append residual, then exactly the
+    //       SDPA call transformers' sdpa_attention_forward makes (GQA via
+    //       enable_gqa, is_causal when T > 1 and no mask). If no mask is given
+    //       and earlier tokens exist (kv_len > T > 1, e.g. chunked prefill), a
+    //       bottom-right causal mask is built: new tokens see all earlier
+    //       tokens and each other causally. (HF instead truncates keys to T
+    //       in that case and relies on always passing a mask.)
+    at::Tensor attend(int64_t layer, const at::Tensor& query,
+                      std::optional<double> scaling = std::nullopt,
+                      const std::optional<at::Tensor>& attn_mask = std::nullopt,
+                      bool fused = true);
+    // Full-precision [B, H, T, D] keys and values for a layer: dequantized
+    // history followed by the residual (the legacy get_full_cache() view).
+    std::optional<std::pair<at::Tensor, at::Tensor>> full_kv(int64_t layer) const;
+    int64_t fused_calls() const { return fused_calls_; }
+    int64_t reference_calls() const { return reference_calls_; }
     void harvest_all();
     void reserve(int64_t total_tokens);
     void reset();
@@ -123,6 +146,7 @@ private:
     std::optional<int64_t> batch_size_;
     std::optional<at::ScalarType> cache_dtype_, meta_dtype_;
     int64_t reserve_tokens_ = 0;
+    int64_t fused_calls_ = 0, reference_calls_ = 0;
 };
 
 // CPU reference of the quantize kernels' math, writing (packed, scales,

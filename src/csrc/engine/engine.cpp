@@ -2,6 +2,8 @@
 // block ports (src/kivi_sycl/cache/manager.py).
 #include "engine/engine.hpp"
 
+#include "cpu/fused_attention.hpp"
+#include "engine/dequant_cpu.hpp"
 #include "kivi/usm.hpp"
 #include "ops/kv_cache_ops.hpp"
 
@@ -348,4 +350,72 @@ EngineStats Engine::stats(int64_t i) const {
     return s;
 }
 
+// ---------------------------------------------------------------------------
+// attention
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Mirrors hf/attention.py::_mask_is_trivial — True if the mask hides nothing.
+bool mask_is_trivial(const std::optional<at::Tensor>& mask) {
+    if (!mask || !mask->defined()) return true;
+    if (mask->scalar_type() == at::kBool) return mask->all().item<bool>();
+    return mask->eq(0).all().item<bool>();
+}
+
+}  // namespace
+
+std::optional<std::pair<at::Tensor, at::Tensor>> Engine::full_kv(int64_t i) const {
+    const Layer& l = L(i);
+    auto h = history(i);
+    if (!h) {
+        if (!l.res_k.defined()) return std::nullopt;
+        return std::make_pair(l.res_k, l.res_v);
+    }
+    at::Tensor hk = dequant_keys((*h)[0], (*h)[1], (*h)[2], *cache_dtype_);
+    at::Tensor hv = dequant_values((*h)[3], (*h)[4], (*h)[5], *cache_dtype_);
+    if (!l.res_k.defined()) return std::make_pair(hk, hv);
+    return std::make_pair(at::cat({hk, l.res_k}, 2), at::cat({hv, l.res_v}, 2));
+}
+
+at::Tensor Engine::attend(int64_t i, const at::Tensor& query, std::optional<double> scaling,
+                          const std::optional<at::Tensor>& attn_mask, bool fused) {
+    const Layer& l = L(i);
+    TORCH_CHECK(l.res_k.defined() || history(i), "attend: layer ", i, " has no keys yet");
+    TORCH_CHECK(query.dim() == 4, "attend: query must be [B, Hq, T, D]");
+    const int64_t T = query.size(2);
+    const double scale = scaling.value_or(1.0 / std::sqrt(static_cast<double>(query.size(-1))));
+    auto h = history(i);
+
+    if (fused && T == 1 && h && query.device().is_cpu() && mask_is_trivial(attn_mask)) {
+        ++fused_calls_;
+        at::Tensor kr = l.res_k.defined() ? l.res_k
+                                          : at::empty({query.size(0), (*h)[0].size(1), 0, query.size(3)},
+                                                      query.options());
+        at::Tensor vr = l.res_v.defined() ? l.res_v : kr;
+        return kivi_fused_decode_attention(query, kr, vr, (*h)[0], (*h)[1], (*h)[2],
+                                           (*h)[3], (*h)[4], (*h)[5], scale, cfg_.group_size[i]);
+    }
+
+    ++reference_calls_;
+    auto kv = full_kv(i);
+    at::Tensor k = kv->first, v = kv->second;
+    const int64_t kv_len = k.size(2);
+    const bool gqa = query.size(1) != k.size(1);
+    std::optional<at::Tensor> mask;
+    if (attn_mask && attn_mask->defined()) mask = *attn_mask;
+    bool is_causal = T > 1 && !mask;
+    if (is_causal && kv_len > T) {
+        // Bottom-right causal: query t (of T new tokens) sees keys [0, kv_len - T + t].
+        at::Tensor rows = at::arange(T, at::TensorOptions().dtype(at::kLong)).unsqueeze(1);
+        at::Tensor cols = at::arange(kv_len, at::TensorOptions().dtype(at::kLong)).unsqueeze(0);
+        mask = cols.le(rows + (kv_len - T));
+        is_causal = false;
+    }
+    at::Tensor out = at::scaled_dot_product_attention(query, k, v, mask, 0.0, is_causal,
+                                                      scale, gqa);
+    return out.transpose(1, 2).contiguous();
+}
+
 }  // namespace kivi
+
