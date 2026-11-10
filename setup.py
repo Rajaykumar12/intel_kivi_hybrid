@@ -86,6 +86,8 @@ setup(
                 os.path.join(CSRC, "ops", "kv_cache_ops.cpp"),
                 os.path.join(CSRC, "cpu", "fused_attention.cpp"),
                 os.path.join(CSRC, "library", "register_ops.cpp"),
+                os.path.join(CSRC, "engine", "arena.cpp"),
+                os.path.join(CSRC, "engine", "dequant_cpu.cpp"),
             ],
             include_dirs=[CSRC, os.path.join(CSRC, "include")],
             libraries=extra_libraries,

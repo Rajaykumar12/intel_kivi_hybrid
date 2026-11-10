@@ -20,6 +20,31 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# SYCL runtime: use the one torch itself loads (the torch XPU wheel resolves
+# libsycl.so.9 / libur_loader.so.0 via RPATH $ORIGIN/../../../..), not the
+# compiler's newer copy. torch's FindSYCLToolkit.cmake would otherwise cache
+# the compiler's libsycl.so as SYCL_LIBRARY and link it into every target via
+# torch::xpurt — which then fails to link executables (the compiler's libsycl
+# needs Unified Runtime symbols such as urGraphGetIdExp that torch's bundled
+# loader does not export) and would put two SYCL runtimes in one process.
+# Seeding SYCL_LIBRARY before find_package(Torch) makes torch's own find step
+# keep this value. Override with -DKIVI_SYCL_RUNTIME_DIR=<dir>.
+if(NOT KIVI_SYCL_RUNTIME_DIR)
+  foreach(_p ${CMAKE_PREFIX_PATH})
+    if(EXISTS "${_p}/../../lib/libtorch.so")
+      get_filename_component(KIVI_SYCL_RUNTIME_DIR "${_p}/../../lib/../../../.." ABSOLUTE)
+    endif()
+  endforeach()
+endif()
+if(NOT EXISTS "${KIVI_SYCL_RUNTIME_DIR}/libsycl.so")
+  message(FATAL_ERROR "kivi: no libsycl.so in KIVI_SYCL_RUNTIME_DIR=${KIVI_SYCL_RUNTIME_DIR} "
+                      "(pass -DKIVI_SYCL_RUNTIME_DIR=<dir of the libsycl torch loads>)")
+endif()
+set(KIVI_SYCL_RUNTIME_DIR "${KIVI_SYCL_RUNTIME_DIR}" CACHE PATH "directory with the libsycl.so torch uses")
+set(SYCL_LIBRARY "${KIVI_SYCL_RUNTIME_DIR}/libsycl.so" CACHE FILEPATH "SYCL runtime torch uses" FORCE)
+set(SYCL_LIBRARY_DIR "${KIVI_SYCL_RUNTIME_DIR}" CACHE FILEPATH "SYCL runtime dir torch uses" FORCE)
+message(STATUS "kivi: SYCL runtime from ${KIVI_SYCL_RUNTIME_DIR}")
+
 find_package(Torch REQUIRED)
 
 # Same queue policy as setup.py: submit on torch's XPU stream when the torch
@@ -27,18 +52,6 @@ find_package(Torch REQUIRED)
 get_filename_component(KIVI_TORCH_LIB_DIR "${TORCH_LIBRARY}" DIRECTORY)
 find_library(KIVI_C10_XPU c10_xpu PATHS "${KIVI_TORCH_LIB_DIR}" NO_DEFAULT_PATH)
 
-# SYCL runtime: link against the one torch itself loads (the torch XPU wheel
-# resolves libsycl.so.9 / libur_loader.so.0 via RPATH $ORIGIN/../../../..),
-# not the compiler's newer copy. Otherwise an executable fails to link —
-# the compiler's libsycl needs Unified Runtime symbols (urGraphGetIdExp, …)
-# that torch's bundled loader does not export — and at run time two SYCL
-# runtimes would meet in one process. Override with -DKIVI_SYCL_RUNTIME_DIR.
-get_filename_component(_kivi_default_rt "${KIVI_TORCH_LIB_DIR}/../../../.." ABSOLUTE)
-set(KIVI_SYCL_RUNTIME_DIR "${_kivi_default_rt}" CACHE PATH "directory with the libsycl.so torch uses")
-if(NOT EXISTS "${KIVI_SYCL_RUNTIME_DIR}/libsycl.so")
-  message(FATAL_ERROR "kivi: no libsycl.so in KIVI_SYCL_RUNTIME_DIR=${KIVI_SYCL_RUNTIME_DIR}")
-endif()
-message(STATUS "kivi: SYCL runtime from ${KIVI_SYCL_RUNTIME_DIR}")
 set(KIVI_RPATH "${KIVI_TORCH_LIB_DIR};${KIVI_SYCL_RUNTIME_DIR}")
 
 set(KIVI_CSRC ${CMAKE_CURRENT_SOURCE_DIR}/src/csrc)
@@ -49,6 +62,8 @@ add_library(kivi_core SHARED
   ${KIVI_CSRC}/ops/kv_cache_ops.cpp
   ${KIVI_CSRC}/cpu/fused_attention.cpp
   ${KIVI_CSRC}/library/register_ops.cpp
+  ${KIVI_CSRC}/engine/arena.cpp
+  ${KIVI_CSRC}/engine/dequant_cpu.cpp
 )
 target_include_directories(kivi_core PUBLIC ${KIVI_CSRC} ${KIVI_CSRC}/include)
 # Flags mirror setup.py (fp model rationale is documented there).
@@ -77,3 +92,9 @@ target_link_libraries(kivi_native_tests PRIVATE kivi_core)
 set_target_properties(kivi_native_tests PROPERTIES
   BUILD_RPATH "${KIVI_RPATH};$<TARGET_FILE_DIR:kivi_core>")
 add_test(NAME kivi_native_tests COMMAND kivi_native_tests)
+
+add_executable(kivi_arena_tests tests/native/test_arena.cpp)
+target_link_libraries(kivi_arena_tests PRIVATE kivi_core)
+set_target_properties(kivi_arena_tests PROPERTIES
+  BUILD_RPATH "${KIVI_RPATH};$<TARGET_FILE_DIR:kivi_core>")
+add_test(NAME kivi_arena_tests COMMAND kivi_arena_tests)

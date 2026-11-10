@@ -9,6 +9,7 @@
 #include "kivi/event.hpp"
 #include "kivi/usm.hpp"
 #include "cpu/fused_attention.hpp"
+#include "engine/dequant_cpu.hpp"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "KIVI: Asymmetric 2-bit KV Cache Quantization for Intel XPU (SYCL)";
@@ -48,6 +49,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("packed_v"), py::arg("scales_v"), py::arg("zeros_v"),
           py::arg("scaling"), py::arg("group_size"),
           py::call_guard<py::gil_scoped_release>());
+    // --- C++ dequantize-on-read (Phase 5 S1.3; port of KiviCache._dequant_*)
+    m.def("dequant_keys_cpu", &kivi::dequant_keys,
+          "Dequantize packed per-channel keys [B,H,D,T/4] -> [B,H,T,D] on the CPU.",
+          py::arg("packed"), py::arg("scales"), py::arg("zeros"), py::arg("dtype"));
+    m.def("dequant_values_cpu", &kivi::dequant_values,
+          "Dequantize packed per-token values [B,H,T,D/4] -> [B,H,T,D] on the CPU.",
+          py::arg("packed"), py::arg("scales"), py::arg("zeros"), py::arg("dtype"));
+
     m.def("fused_attention_uses_avx2", &kivi_fused_attention_uses_avx2,
           "Whether the fused attention runs its AVX2/FMA code path on this CPU.");
 
