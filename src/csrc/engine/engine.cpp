@@ -142,8 +142,12 @@ void Engine::append(int64_t i, const at::Tensor& k_new, const at::Tensor& v_new)
 void Engine::append_residual(int64_t i, const at::Tensor& k_new, const at::Tensor& v_new) {
     Layer& l = L(i);
     if (!l.res_k.defined()) {
-        l.res_k = k_new;
-        l.res_v = v_new;
+        // Own the storage: never keep the caller's tensor. A compiled caller
+        // (AOTInductor) reuses an op input's buffer as soon as the op returns —
+        // the schema does not say we retain it — so an aliased residual gets
+        // silently overwritten (it broke every decode step after prefill).
+        l.res_k = k_new.clone(at::MemoryFormat::Contiguous);
+        l.res_v = v_new.clone(at::MemoryFormat::Contiguous);
     } else {
         l.res_k = at::cat({l.res_k, k_new}, 2);
         l.res_v = at::cat({l.res_v, v_new}, 2);

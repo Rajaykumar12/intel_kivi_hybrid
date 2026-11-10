@@ -61,3 +61,17 @@ def test_residual_window_and_counts():
     s = e.stats(0)
     assert s["quantized_tokens"] == q and s["residual_tokens"] == r
     assert s["packed_bytes"] >= s["packed_used_bytes"] > 0
+
+
+def test_engine_owns_appended_tensors():
+    """The engine must copy what it appends: compiled callers (AOTInductor)
+    reuse an op input's buffer right after the op returns. An aliased first
+    residual was overwritten that way, corrupting every later decode step."""
+    for method in ("update", "append"):
+        e = _C.Engine(num_layers=1, head_dim=8, residual_length=8, group_size=[4], device="cpu")
+        k, v = torch.randn(1, 2, 3, 8), torch.randn(1, 2, 3, 8)
+        k0, v0 = k.clone(), v.clone()
+        getattr(e, method)(0, k, v)
+        k.fill_(123.0); v.fill_(-7.0)            # caller reuses its buffers
+        rk, rv = e.residual(0)
+        assert torch.equal(rk, k0) and torch.equal(rv, v0), method
