@@ -4,7 +4,10 @@
 #pragma once
 
 #include <sycl/sycl.hpp>
-#include <torch/extension.h>
+// LibTorch C++ API only — no pybind/Python, so this also builds into the
+// Python-free libkivi_core.so (CMakeLists.txt). The pybind module adds
+// <torch/extension.h> itself.
+#include <torch/torch.h>
 
 #ifdef KIVI_USE_TORCH_XPU_QUEUE
 #include <c10/xpu/XPUStream.h>

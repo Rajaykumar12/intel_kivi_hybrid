@@ -3,6 +3,8 @@
 // Installed as the kivi_sycl._C submodule (see setup.py).
 // ==========================================================================
 
+#include <torch/extension.h>
+
 #include "ops/kv_cache_ops.hpp"
 #include "kivi/event.hpp"
 #include "kivi/usm.hpp"

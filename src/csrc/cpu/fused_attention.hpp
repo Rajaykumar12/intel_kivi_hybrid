@@ -1,6 +1,9 @@
 #pragma once
 // KIVI fused decode attention on the CPU — see fused_attention.cpp.
-#include <torch/extension.h>
+// LibTorch C++ API only — no pybind/Python, so this also builds into the
+// Python-free libkivi_core.so (CMakeLists.txt). The pybind module adds
+// <torch/extension.h> itself.
+#include <torch/torch.h>
 
 // One decode step (query length 1) of attention for all heads, computed
 // directly from the packed 2-bit history and the FP residual.
