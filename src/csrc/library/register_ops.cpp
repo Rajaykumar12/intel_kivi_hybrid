@@ -73,20 +73,22 @@ at::Tensor fused_decode_attention_meta(
     const at::Tensor& query, const at::Tensor&, const at::Tensor&,
     const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const at::Tensor&, const at::Tensor&, const at::Tensor&, double, int64_t) {
-    TORCH_CHECK(query.dim() == 4 && query.size(2) == 1,
-                "fused_decode_attention: query must be [B, Hq, 1, D]");
+    TORCH_CHECK(query.dim() == 4, "fused_decode_attention: query must be [B, Hq, 1, D]");
     // [B, 1, Hq, D] — the layout transformers attention functions return.
-    return at::empty({query.size(0), 1, query.size(1), query.size(3)},
-                     query.options());
+    // sym_size/empty_symint keep symbolic dims symbolic under torch.export;
+    // size() would specialize them to the example input's values.
+    return at::empty_symint({query.sym_size(0), 1, query.sym_size(1), query.sym_size(3)},
+                            query.options());
 }
 
 at::Tensor layer_attention_meta(int64_t, int64_t, const at::Tensor& query,
                                 const at::Tensor&, const at::Tensor&, double,
                                 const at::Tensor&) {
     TORCH_CHECK(query.dim() == 4, "layer_attention: query must be [B, Hq, T, D]");
-    // [B, T, Hq, D] — query is [B, Hq, T, D].
-    return at::empty({query.size(0), query.size(2), query.size(1), query.size(3)},
-                     query.options());
+    // [B, T, Hq, D] — query is [B, Hq, T, D]. Symbolic-safe (see above): the
+    // prefill program is exported with a dynamic T.
+    return at::empty_symint({query.sym_size(0), query.sym_size(2), query.sym_size(1),
+                             query.sym_size(3)}, query.options());
 }
 
 }  // namespace
