@@ -39,7 +39,10 @@ def _snapshot_dir(model_id_or_dir: str) -> str:
     if os.path.isdir(model_id_or_dir):
         return model_id_or_dir
     from huggingface_hub import snapshot_download
-    return snapshot_download(model_id_or_dir)
+    # Only what the artifacts need: an offline cache often lacks README.md /
+    # .gitattributes, which an unrestricted snapshot_download insists on.
+    return snapshot_download(model_id_or_dir,
+                             allow_patterns=["*.safetensors", "*.json", "tokenizer.model"])
 
 
 def _safetensors_index(snapshot: str) -> dict:
