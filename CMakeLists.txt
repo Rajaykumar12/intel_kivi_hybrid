@@ -48,6 +48,7 @@ add_library(kivi_core SHARED
   ${KIVI_CSRC}/kernels/roundtrip_kernels.cpp
   ${KIVI_CSRC}/ops/kv_cache_ops.cpp
   ${KIVI_CSRC}/cpu/fused_attention.cpp
+  ${KIVI_CSRC}/library/register_ops.cpp
 )
 target_include_directories(kivi_core PUBLIC ${KIVI_CSRC} ${KIVI_CSRC}/include)
 # Flags mirror setup.py (fp model rationale is documented there).

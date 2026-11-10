@@ -85,6 +85,7 @@ setup(
                 os.path.join(CSRC, "kernels", "roundtrip_kernels.cpp"),
                 os.path.join(CSRC, "ops", "kv_cache_ops.cpp"),
                 os.path.join(CSRC, "cpu", "fused_attention.cpp"),
+                os.path.join(CSRC, "library", "register_ops.cpp"),
             ],
             include_dirs=[CSRC, os.path.join(CSRC, "include")],
             libraries=extra_libraries,

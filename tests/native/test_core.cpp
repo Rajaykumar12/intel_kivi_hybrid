@@ -9,6 +9,7 @@
 //
 // Exit code 0 on success; each failure is printed.
 // ==========================================================================
+#include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/torch.h>
 
 #include <fstream>
@@ -59,6 +60,17 @@ void test_fused_attention(int64_t Hq, int64_t Hkv, int64_t T, int64_t NR) {
     const double scaling = 1.0 / std::sqrt(static_cast<double>(D));
 
     auto out = kivi_fused_decode_attention(q, kr, vr, pk, sk, zk, pv, sv, zv, scaling, G);
+
+    // Same op through the dispatcher by name: libkivi_core registered
+    // kivi::fused_decode_attention on its own (no Python involved).
+    static auto op = c10::Dispatcher::singleton()
+        .findSchemaOrThrow("kivi::fused_decode_attention", "")
+        .typed<at::Tensor(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                          const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                          const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                          double, int64_t)>();
+    auto via_op = op.call(q, kr, vr, pk, sk, zk, pv, sv, zv, scaling, G);
+    check(torch::equal(out, via_op), "dispatcher op kivi::fused_decode_attention == direct call");
 
     // Reference: dequantize history, append residual, plain softmax attention.
     auto hk = (unpack(pk) * sk.to(torch::kFloat32).repeat_interleave(G, -1)
