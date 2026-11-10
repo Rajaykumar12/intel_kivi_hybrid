@@ -12,7 +12,8 @@ if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
 from transformers import LlamaConfig, LlamaForCausalLM, Qwen2Config, Qwen2ForCausalLM  # noqa: E402
 
 from kivi_sycl import KiviCache, _C  # noqa: E402
-from kivi_sycl.export import RUNTIME_ENGINE_ID, compile_package, export_program  # noqa: E402
+from kivi_sycl.export import (RUNTIME_ENGINE_ID, compile_package, export_program,  # noqa: E402
+                              exported_constants, load_package)
 from kivi_sycl.hf.compiled import enable_kivi_op  # noqa: E402
 
 G, R, PROMPT, STEPS = 8, 16, 13, 30
@@ -84,8 +85,9 @@ def test_exported_program_reproduces_eager_op_mode(kind):
 def test_aoti_package_matches_eager_op_mode(tmp_path):
     model = _tiny("llama-gqa")
     ids = torch.randint(0, 97, (1, PROMPT))
-    path = compile_package(export_program(model, max_tokens=64), str(tmp_path / "model.pt2"))
-    pkg = torch._inductor.aoti_load_package(path)
+    ep = export_program(model, max_tokens=64)
+    path = compile_package(ep, str(tmp_path / "model.pt2"))
+    pkg = load_package(path, exported_constants(ep))
     got = _run_program(pkg, model, ids)
     ref = _eager_op_mode(model, ids)
     for a, b in zip(ref, got):

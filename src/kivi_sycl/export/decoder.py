@@ -23,7 +23,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..hf.compiled import OP_ATTN_NAME, kivi_op_attention
 
-__all__ = ["RUNTIME_ENGINE_ID", "KiviExportDecoder", "export_program", "compile_package"]
+__all__ = ["RUNTIME_ENGINE_ID", "KiviExportDecoder", "export_program", "compile_package",
+           "exported_constants", "load_package"]
 
 RUNTIME_ENGINE_ID = 0
 
@@ -93,15 +94,34 @@ def export_program(model, max_tokens: int, example_tokens: int = 8):
 
 
 def compile_package(exported_program, package_path: str) -> str:
-    """AOTInductor-compile and package ``exported_program`` to ``package_path``
-    (.pt2). Weights are appended to the compiled shared object and memory-
-    mapped at load (``force_mmap_weights``), the mode AOTInductor documents as
-    needed for 1B+ parameter models — a 1.1B fp32 model is ~4.4 GB, too large
-    for the shared object's data section.
+    """AOTInductor-compile ``exported_program`` into a *code-only* package
+    (.pt2, a few MB): the weights are not serialized into it. Supply them at
+    load time with ``load_constants(..., user_managed=True)`` — the runtime
+    reads them from the model's own safetensors (see ``constant_sources``).
 
-    (Not ``package_constants_in_so=False``: without also choosing a
-    ``package_constants_on_disk_format`` that stores the weights nowhere, and
-    the compiled model reads garbage — it segfaulted here, 2026-11-10.)"""
+    Why code-only: serializing the weights into the package holds an extra
+    full copy during compilation — on this 15 GB laptop that ran TinyLlama-
+    1.1B (4.4 GB fp32) into a system OOM and even Qwen2.5-0.5B to the limit.
+    (Inductor stages builds in TORCHINDUCTOR_CACHE_DIR, default /tmp — a RAM
+    tmpfs here; point it at a disk path *without spaces*, Inductor does not
+    quote paths in its g++ command.)"""
     return torch._inductor.aoti_compile_and_package(
         exported_program, package_path=package_path,
-        inductor_configs={"aot_inductor.force_mmap_weights": True})
+        inductor_configs={"aot_inductor.package_constants_in_so": False})
+
+
+def exported_constants(exported_program) -> dict:
+    """{fqn: tensor} for every constant a compiled package expects."""
+    return {**exported_program.state_dict, **exported_program.constants}
+
+
+def load_package(package_path: str, constants: dict):
+    """Load a code-only package and hand it its weights (no copy)."""
+    pkg = torch._inductor.aoti_load_package(package_path)
+    need = pkg.get_constant_fqns()
+    missing = [f for f in need if f not in constants]
+    if missing:
+        raise KeyError(f"constants missing for package: {missing[:5]}")
+    pkg.load_constants({f: constants[f] for f in need}, check_full_update=True,
+                       user_managed=True)
+    return pkg
