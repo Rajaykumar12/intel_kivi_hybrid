@@ -1,5 +1,7 @@
 """KiviCache: the KIVI 2-bit asymmetric KV cache state manager."""
 
+import importlib
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -9,7 +11,7 @@ from ..config.model_config import detect_model_config
 from .arena import LayerArena, ensure_capacity
 from ..extension.loader import kivi_native
 
-__all__ = ["KiviCache"]
+__all__ = ["KiviCache", "dequantize_keys_cpu", "dequantize_values_cpu"]
 
 # Unpack shift table for the LSB-first 2-bit packing
 # (byte = q0 | q1<<2 | q2<<4 | q3<<6) — see the SYCL pack_vec kernel.
@@ -142,6 +144,7 @@ class KiviCache:
         async_flush: bool = True,
         metadata_dtype="auto",
         zero_copy="auto",
+        engine="auto",
     ):
         if isinstance(group_size, int):
             group_sizes = [group_size] * num_layers
@@ -166,6 +169,10 @@ class KiviCache:
         assert metadata_dtype in ("auto", torch.float16, torch.float32), (
             f"metadata_dtype must be 'auto', torch.float16 or torch.float32, "
             f"got {metadata_dtype!r}")
+        assert engine in ("auto", "python", "native"), \
+            f"engine must be 'auto', 'python' or 'native', got {engine!r}"
+        if engine == "auto":
+            engine = "native" if os.environ.get("KIVI_NATIVE_ENGINE") == "1" else "python"
 
         self.device = device
         # Per-layer group sizes; self.G is the shared value when uniform (the
@@ -213,6 +220,20 @@ class KiviCache:
         self._deq_serving: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = \
             [None] * num_layers
 
+        # Native engine (kivi::Engine, C++): owns residual, flush, arena and
+        # stats; this class keeps only the Python-side serving features
+        # (persistent cache view, serving="cached" FP copy) on top of it.
+        self.engine = engine
+        self._native = None
+        if engine == "native":
+            self._native = _make_native_engine(
+                num_layers=num_layers, head_dim=head_dim, num_kv_heads=num_kv_heads,
+                residual_length=residual_length, group_sizes=group_sizes,
+                metadata_dtype=metadata_dtype, zero_copy=zero_copy,
+                async_flush=async_flush, device=device)
+        self._deq_upto: List[int] = [0] * num_layers   # cached-mode dequant progress
+        self._flushes_seen = 0
+
         self._quant_token_count: List[int] = [0] * num_layers
         self._flush_count: List[int] = [0] * num_layers
 
@@ -240,6 +261,7 @@ class KiviCache:
         async_flush: bool = True,
         metadata_dtype="auto",
         zero_copy="auto",
+        engine="auto",
     ) -> "KiviCache":
         """
         Create a KiviCache auto-configured for a HuggingFace model.
@@ -258,6 +280,7 @@ class KiviCache:
             async_flush=async_flush,
             metadata_dtype=metadata_dtype,
             zero_copy=zero_copy,
+            engine=engine,
         )
 
     # ------------------------------------------------------------------ #
@@ -273,6 +296,8 @@ class KiviCache:
         ``add_tokens`` of a sequence; ``reset()`` clears it."""
         assert total_tokens >= 0
         self._reserve_tokens = total_tokens
+        if self._native is not None:
+            self._native.reserve(total_tokens)
 
     def add_tokens(self, past_key_values):
         """
@@ -303,6 +328,9 @@ class KiviCache:
         # exact test for "did the model grow our view in place".
         if past_key_values is not self._cache_view:
             self._cache_view_valid = False
+
+        if self._native is not None:
+            return self._native_add_tokens(past_key_values)
 
         # Collect any flush submitted on the previous step. The XPU had the
         # entire forward pass to finish, so the event waits below are
@@ -449,7 +477,8 @@ class KiviCache:
             # tensor. The residual it appends includes any tokens covered by
             # a pending (not yet harvested) flush — those are still served
             # in full precision until harvest.
-            full_k, full_v = self._serve_layer(i)
+            full_k, full_v = (self._native_serve_layer(i) if self._native is not None
+                              else self._serve_layer(i))
             if full_k is None:
                 full_k = full_v = torch.empty(0)
             full_past.append((full_k, full_v))
@@ -466,6 +495,10 @@ class KiviCache:
         manually before reading ``get_stats()`` if you need the packed
         store fully up to date at an arbitrary point.
         """
+        if self._native is not None:
+            self._native.harvest_all()
+            self._native_sync()
+            return
         for i in range(self.num_layers):
             self._harvest_layer(i)
 
@@ -519,6 +552,10 @@ class KiviCache:
 
     def reset(self):
         """Clear all cached data. Reuse the same KiviCache for a new sequence."""
+        if self._native is not None:
+            self._native.reset()
+            self._deq_upto = [0] * self.num_layers
+            self._flushes_seen = 0
         for i in range(self.num_layers):
             p = self._pending[i]
             if p is not None:
@@ -700,7 +737,8 @@ class KiviCache:
     # bit-identical output — `x = q*s; x += z` rounds exactly like
     # `x = q*s + z`.
 
-    def _dequant_keys_into(self, out, packed, scales, zeros):
+    @staticmethod
+    def _dequant_keys_into(out, packed, scales, zeros):
         """Unpack per-channel-quantized keys directly into ``out``.
 
         packed [B,H,D,T/4] u8, scales/zeros [B,H,D,T/G], out [B,H,T,D].
@@ -715,7 +753,8 @@ class KiviCache:
         q.mul_(scales.unsqueeze(-1)).add_(zeros.unsqueeze(-1))
         out.copy_(q.reshape(B, H, D, T).transpose(2, 3))
 
-    def _dequant_values_into(self, out, packed, scales, zeros):
+    @staticmethod
+    def _dequant_values_into(out, packed, scales, zeros):
         """Unpack per-token-quantized values directly into ``out``.
 
         packed [B,H,T,D/4] u8, scales/zeros [B,H,T,D/G], out [B,H,T,D].
@@ -818,6 +857,8 @@ class KiviCache:
 
     @property
     def total_flushes(self) -> int:
+        if self._native is not None:
+            return self._native.total_flushes
         return sum(self._flush_count)
 
     def get_stats(self, layer: int = 0) -> dict:
@@ -848,6 +889,18 @@ class KiviCache:
         Peak-during-forward therefore still includes one FP copy — the
         sustained/resident footprint is what this method reports.
         """
+        if self._native is not None:
+            s = self._native.stats(layer)
+            serving_copy_bytes = 0
+            if self._deq_serving[layer] is not None:
+                serving_copy_bytes = sum(t.numel() * t.element_size()
+                                         for t in self._deq_serving[layer])
+            denom = s["kivi_bytes"] + serving_copy_bytes
+            s.update(serving_copy_bytes=serving_copy_bytes,
+                     fp32_bytes=s["fp_baseline_bytes"],
+                     compression=s["fp_baseline_bytes"] / denom if denom > 0 else 0)
+            return s
+
         B = self.batch_size or 1
         H = self.num_kv_heads or 1
         i = layer
@@ -894,8 +947,201 @@ class KiviCache:
             "compression": fp_baseline_bytes / denom if denom > 0 else 0,
         }
 
+    # ------------------------------------------------------------------ #
+    #  Native engine paths                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _native_add_tokens(self, past_key_values):
+        """add_tokens() on the native engine: same order as the Python path —
+        harvest everything, append each layer's new tokens (the engine flushes
+        the excess), harvest again in sync mode."""
+        e = self._native
+        e.harvest_all()
+        self._native_sync()
+        for i, (k, v) in enumerate(_iter_kv_layers(past_key_values)):
+            self._init_session(k, i)
+            res = e.residual(i)
+            if res is not None:
+                new_start = e.quant_tokens(i) + res[0].shape[2]
+                assert k.shape[2] >= new_start, (
+                    f"KiviCache desync at layer {i}: expected past length "
+                    f"{new_start} but got {k.shape[2]}. add_tokens() must be "
+                    f"called exactly once per forward pass, seeded by "
+                    f"get_full_cache()."
+                )
+                new_k, new_v = k[:, :, new_start:, :], v[:, :, new_start:, :]
+            else:
+                new_start, new_k, new_v = 0, k, v
+            assert new_k.shape[2] > 0, (
+                f"KiviCache desync at layer {i}: the forward pass produced "
+                f"no tokens beyond the {new_start} already tracked. "
+                f"add_tokens() was called twice on the same forward output, "
+                f"or the model was fed a past_key_values not obtained from "
+                f"get_full_cache(). Silently skipping here would drop this "
+                f"step's KV and corrupt all subsequent attention."
+            )
+            e.append(i, new_k, new_v)
+        if not self.async_flush:
+            e.harvest_all()
+            self._native_sync()
+        if self.serving == "rebuild":
+            self._cache_view = None
+            self._cache_view_valid = False
+
+    def _native_sync(self):
+        """After a native harvest: invalidate the persistent view if the
+        history changed, and extend the serving="cached" FP copy."""
+        flushes = self._native.total_flushes
+        if flushes != self._flushes_seen:
+            self._flushes_seen = flushes
+            self._cache_view_valid = False
+        if self.serving != "cached":
+            return
+        for i in range(self.num_layers):
+            q = self._native.quant_tokens(i)
+            t0 = self._deq_upto[i]
+            if q <= t0:
+                continue
+            pk, sk, zk, pv, sv, zv = self._native.history(i)
+            G = self._G[i]
+            new_k = dequantize_keys_cpu(pk[..., t0 // 4:q // 4], sk[..., t0 // G:q // G],
+                                        zk[..., t0 // G:q // G], self._cache_dtype)
+            new_v = dequantize_values_cpu(pv[:, :, t0:q], sv[:, :, t0:q], zv[:, :, t0:q],
+                                          self._cache_dtype)
+            cur = self._deq_serving[i]
+            self._deq_serving[i] = (new_k, new_v) if cur is None else (
+                torch.cat([cur[0], new_k], dim=2), torch.cat([cur[1], new_v], dim=2))
+            self._deq_upto[i] = q
+
+    def _native_serve_layer(self, i: int):
+        """_serve_layer() on the native engine (same tensors, same values)."""
+        res = self._native.residual(i)
+        n_res = res[0].shape[2] if res is not None else 0
+        if self._native.quant_tokens(i) == 0:
+            return (None, None) if n_res == 0 else res
+        if self.serving == "cached" and self._deq_serving[i] is not None:
+            hk, hv = self._deq_serving[i]
+            if n_res == 0:
+                return hk, hv
+            return torch.cat([hk, res[0]], dim=2), torch.cat([hv, res[1]], dim=2)
+        return self._native.full_kv(i)
+
+    # ------------------------------------------------------------------ #
+    #  Introspection (public, read-only; same answers on both engines)     #
+    # ------------------------------------------------------------------ #
+
+    def residual(self, layer: int):
+        """(keys, values) FP residual [B,H,n,D] of a layer, or None."""
+        if self._native is not None:
+            return self._native.residual(layer)
+        if self.res_keys[layer] is None:
+            return None
+        return self.res_keys[layer], self.res_values[layer]
+
+    def history(self, layer: int):
+        """(packed_k, scales_k, zeros_k, packed_v, scales_v, zeros_v) views of
+        the quantized prefix, or None before the first harvest."""
+        if self._native is not None:
+            return self._native.history(layer)
+        a = self._arena[layer]
+        if a is None or a.used == 0:
+            return None
+        return a.used_keys() + a.used_values()
+
+    def quantized_tokens(self, layer: int) -> int:
+        if self._native is not None:
+            return self._native.quant_tokens(layer)
+        return self._quant_token_count[layer]
+
+    def flush_count(self, layer: int) -> int:
+        if self._native is not None:
+            return self._native.flushes(layer)
+        return self._flush_count[layer]
+
+    def pending_tokens(self, layer: int) -> int:
+        if self._native is not None:
+            return self._native.pending_tokens(layer)
+        p = self._pending[layer]
+        return p["n"] if p is not None else 0
+
+    def arena_info(self, layer: int):
+        """{capacity, used, allocated_bytes, storage_ptr} of a layer's packed
+        arena, or None before the first flush. storage_ptr identifies the
+        allocation, so callers can tell whether a flush reallocated it."""
+        if self._native is not None:
+            cap = self._native.arena_capacity(layer)
+            if cap == 0:
+                return None
+            h = self._native.history(layer)
+            return {"capacity": cap, "used": self._native.quant_tokens(layer),
+                    "allocated_bytes": self._native.stats(layer)["packed_bytes"],
+                    "storage_ptr": h[0].data_ptr() if h is not None else None}
+        a = self._arena[layer]
+        if a is None:
+            return None
+        return {"capacity": a.cap, "used": a.used, "allocated_bytes": a.allocated_bytes,
+                "storage_ptr": a.packed_k.data_ptr()}
+
+    @property
+    def group_sizes(self) -> List[int]:
+        return list(self._G)
+
+    @property
+    def reserved_tokens(self) -> int:
+        return self._reserve_tokens
+
+    @property
+    def resolved_metadata_dtype(self) -> Optional[torch.dtype]:
+        """Scale/zero dtype in use (None until the first tokens arrive)."""
+        return self._meta_dtype
+
+    @property
+    def has_serving_view(self) -> bool:
+        """Whether a full-precision copy of the history is retained between
+        steps (persistent view or serving="cached" copy)."""
+        return self._cache_view is not None or any(d is not None for d in self._deq_serving)
+
     def __repr__(self):
         return (f"KiviCache(layers={self.num_layers}, head_dim={self.head_dim}, "
                 f"G={self.G if self.G is not None else self._G}, R={self.R}, device='{self.device}', "
                 f"serving='{self.serving}', async_flush={self.async_flush}, "
-                f"metadata_dtype={self.metadata_dtype}, zero_copy={self.zero_copy})")
+                f"metadata_dtype={self.metadata_dtype}, zero_copy={self.zero_copy}, "
+                f"engine={self.engine!r})")
+
+
+def dequantize_keys_cpu(packed, scales, zeros, dtype=None):
+    """Packed per-channel keys [B,H,D,T/4] -> [B,H,T,D] on the CPU, in `dtype`
+    (default: the scales' dtype). Same math as the engine's serving path."""
+    B, H, D, _ = packed.shape
+    T = (packed.numel() // (B * H * D)) * 4
+    out = torch.empty((B, H, T, D), dtype=dtype or scales.dtype)
+    KiviCache._dequant_keys_into(out, packed, scales, zeros)
+    return out
+
+
+def dequantize_values_cpu(packed, scales, zeros, dtype=None):
+    """Packed per-token values [B,H,T,D/4] -> [B,H,T,D] on the CPU."""
+    B, H, T, _ = packed.shape
+    D = (packed.numel() // (B * H * T)) * 4
+    out = torch.empty((B, H, T, D), dtype=dtype or scales.dtype)
+    KiviCache._dequant_values_into(out, packed, scales, zeros)
+    return out
+
+
+def _make_native_engine(*, num_layers, head_dim, num_kv_heads, residual_length,
+                        group_sizes, metadata_dtype, zero_copy, async_flush, device):
+    """kivi::Engine from the compiled extension. Imported directly (not via
+    the kivi_native seam, which tests may point at torch stand-ins)."""
+    try:
+        ext = importlib.import_module("kivi_sycl._C")
+    except ImportError as exc:
+        raise RuntimeError("engine='native' needs the compiled extension") from exc
+    if not hasattr(ext, "Engine"):
+        raise RuntimeError("engine='native': this build of kivi_sycl._C has no Engine")
+    return ext.Engine(
+        num_layers=num_layers, head_dim=head_dim, num_kv_heads=num_kv_heads or 0,
+        residual_length=residual_length, group_size=list(group_sizes),
+        metadata_dtype={"auto": "auto", torch.float16: "float16",
+                        torch.float32: "float32"}[metadata_dtype],
+        zero_copy={"auto": "auto", True: "on", False: "off"}[zero_copy],
+        async_flush=async_flush, device=str(device))

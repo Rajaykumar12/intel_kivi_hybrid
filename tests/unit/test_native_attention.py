@@ -23,7 +23,7 @@ if not hasattr(_C, "Engine") or not hasattr(_C.Engine, "attend"):
 
 from transformers.integrations.sdpa_attention import sdpa_attention_forward  # noqa: E402
 
-from kivi_sycl.cache.manager import KiviCache  # noqa: E402
+from kivi_sycl.cache.manager import dequantize_keys_cpu, dequantize_values_cpu  # noqa: E402
 
 D, G, R = 64, 32, 64
 
@@ -46,14 +46,11 @@ def _engine(Hkv, steps, prefill=70, seed=0):
 
 def _python_reference(e, q, mask=None):
     """The Python "kivi" attention's reference computation on the same state."""
-    py = KiviCache(num_layers=1, head_dim=D, num_kv_heads=q.shape[1], device="cpu",
-                   group_size=G, residual_length=R)
-    py._cache_dtype = torch.float32
     k, v = e.residual(0)
     h = e.history(0)
     if h is not None:
-        k = torch.cat([py._dequant_keys_cpu(*h[:3]), k], 2)
-        v = torch.cat([py._dequant_values_cpu(*h[3:]), v], 2)
+        k = torch.cat([dequantize_keys_cpu(*h[:3], torch.float32), k], 2)
+        v = torch.cat([dequantize_values_cpu(*h[3:], torch.float32), v], 2)
     out, _ = sdpa_attention_forward(_Module(q.shape[1] // k.shape[1]), q, k, v, mask,
                                     scaling=D ** -0.5)
     return out

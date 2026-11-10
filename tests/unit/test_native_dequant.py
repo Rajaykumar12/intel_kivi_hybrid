@@ -15,7 +15,7 @@ except ImportError:
 if not hasattr(_C, "dequant_keys_cpu"):
     pytest.skip("extension built without the native dequant", allow_module_level=True)
 
-from kivi_sycl.cache.manager import KiviCache  # noqa: E402
+from kivi_sycl.cache.manager import dequantize_keys_cpu, dequantize_values_cpu  # noqa: E402
 
 
 @pytest.mark.parametrize("B,H,D,T,G,meta,out,cap", [
@@ -33,9 +33,7 @@ def test_native_dequant_bit_identical_to_python(B, H, D, T, G, meta, out, cap):
     sv = (torch.rand(B, H, cap, D // G) + 0.01).to(meta)[:, :, :T]
     zv = torch.randn(B, H, cap, D // G).to(meta)[:, :, :T]
 
-    cache = KiviCache(num_layers=1, head_dim=D, num_kv_heads=H, device="cpu",
-                      group_size=G, residual_length=max(G, 32))
     assert torch.equal(_C.dequant_keys_cpu(pk, sk, zk, out),
-                       cache._dequant_keys_cpu(pk, sk, zk, dtype=out))
+                       dequantize_keys_cpu(pk, sk, zk, dtype=out))
     assert torch.equal(_C.dequant_values_cpu(pv, sv, zv, out),
-                       cache._dequant_values_cpu(pv, sv, zv, dtype=out))
+                       dequantize_values_cpu(pv, sv, zv, dtype=out))

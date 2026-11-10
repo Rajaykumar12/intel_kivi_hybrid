@@ -242,7 +242,7 @@ def _check_against_reference(cache, model, G, meta_dtype=torch.float16):
     of G)."""
     cache.harvest_pending()
     for i, (k, v) in enumerate(_iter_kv_layers(cache.get_full_cache())):
-        n_hist = cache._quant_token_count[i]
+        n_hist = cache.quantized_tokens(i)
         assert n_hist > 0, "test must run long enough to trigger flushes"
         assert k.shape[2] == model.total_tokens
         # Residual tail is served in full precision.
@@ -281,22 +281,22 @@ def test_packed_store_is_resident_and_measured():
     cache, model = _run_generation("in_place", G=4, R=8)
     cache.harvest_pending()
     i = 0
-    n_hist = cache._quant_token_count[i]
+    n_hist = cache.quantized_tokens(i)
     B, H, D = cache.batch_size, cache.num_kv_heads, cache.head_dim
-    assert cache._packed_k[i].shape == (B, H, D, n_hist // 4)
-    assert cache._packed_k[i].dtype == torch.uint8
-    assert cache._packed_v[i].shape == (B, H, n_hist, D // 4)
-    assert cache._scales_k[i].shape == (B, H, D, n_hist // cache.G)
-    assert cache._scales_v[i].shape == (B, H, n_hist, D // cache.G)
+    assert cache.history(i)[0].shape == (B, H, D, n_hist // 4)
+    assert cache.history(i)[0].dtype == torch.uint8
+    assert cache.history(i)[3].shape == (B, H, n_hist, D // 4)
+    assert cache.history(i)[1].shape == (B, H, D, n_hist // cache.G)
+    assert cache.history(i)[4].shape == (B, H, n_hist, D // cache.G)
 
     s = cache.get_stats(layer=i)
     used_packed = sum(
         t.numel() * t.element_size()
-        for t in (cache._packed_k[i], cache._scales_k[i], cache._zeros_k[i],
-                  cache._packed_v[i], cache._scales_v[i], cache._zeros_v[i]))
+        for t in (cache.history(i)[0], cache.history(i)[1], cache.history(i)[2],
+                  cache.history(i)[3], cache.history(i)[4], cache.history(i)[5]))
     assert s["packed_used_bytes"] == used_packed
     # Resident = the whole arena allocation, never less than what is used.
-    assert s["packed_bytes"] == cache._arena[i].allocated_bytes >= used_packed
+    assert s["packed_bytes"] == cache.arena_info(i)["allocated_bytes"] >= used_packed
     assert s["serving_copy_bytes"] == 0          # rebuild mode
     assert s["kivi_bytes"] == s["packed_bytes"] + s["residual_bytes"]
     assert s["quantized_tokens"] == n_hist
@@ -306,8 +306,7 @@ def test_rebuild_mode_retains_no_fp_history():
     """serving='rebuild': after add_tokens, no FP copy of the quantized
     history may stay resident (no serving copy, no persistent view)."""
     cache, _ = _run_generation("in_place", serving="rebuild")
-    assert cache._cache_view is None
-    assert all(d is None for d in cache._deq_serving)
+    assert not cache.has_serving_view
 
 
 def test_cached_mode_serves_identically_to_rebuild():
@@ -345,11 +344,11 @@ def test_bulk_prefill_single_flush():
     prompt_len = 50
     cache.add_tokens(model.forward(prompt_len))
     # One flush, sized to drain the residual to R-G..R-1.
-    assert cache._flush_count[0] == 1
-    res = cache.res_keys[0].shape[2]
+    assert cache.flush_count(0) == 1
+    res = cache.residual(0)[0].shape[2]
     assert R - G <= res < R
-    assert cache._quant_token_count[0] == prompt_len - res
-    assert cache._quant_token_count[0] % G == 0
+    assert cache.quantized_tokens(0) == prompt_len - res
+    assert cache.quantized_tokens(0) % G == 0
 
 
 def test_async_flush_defers_trim_until_next_add():
@@ -362,8 +361,8 @@ def test_async_flush_defers_trim_until_next_add():
                       serving="rebuild", async_flush=True)
     model = FakeModel(1, 2, 8, "in_place")
     cache.add_tokens(model.forward(R))          # triggers a flush submission
-    assert cache._pending[0] is not None
-    assert cache.res_keys[0].shape[2] == R      # not trimmed yet
+    assert cache.pending_tokens(0) > 0
+    assert cache.residual(0)[0].shape[2] == R      # not trimmed yet
     # Serving still covers all tokens, from the FP residual.
     served = next(iter(_iter_kv_layers(cache.get_full_cache())))[0]
     assert served.shape[2] == R
@@ -371,9 +370,9 @@ def test_async_flush_defers_trim_until_next_add():
 
     past = cache.get_full_cache()
     cache.add_tokens(model.forward(1, past))    # harvest happens here
-    assert cache._pending[0] is None
-    assert cache._quant_token_count[0] == G
-    assert cache.res_keys[0].shape[2] == R + 1 - G
+    assert cache.pending_tokens(0) == 0
+    assert cache.quantized_tokens(0) == G
+    assert cache.residual(0)[0].shape[2] == R + 1 - G
 
 
 def test_double_add_tokens_fails_loudly():
@@ -393,12 +392,11 @@ def test_reset_clears_packed_store():
     cache.reset()
     assert cache.batch_size is None
     for i in range(cache.num_layers):
-        assert cache._packed_k[i] is None
-        assert cache._packed_v[i] is None
-        assert cache._pending[i] is None
-        assert cache.res_keys[i] is None
-        assert cache._deq_serving[i] is None
-        assert cache._quant_token_count[i] == 0
+        assert cache.history(i) is None
+        assert cache.history(i) is None
+        assert cache.pending_tokens(i) == 0
+        assert cache.residual(i) is None
+        assert cache.quantized_tokens(i) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -411,8 +409,8 @@ def test_default_metadata_is_fp16_and_served_dtype_is_model_dtype():
     silently run the model's attention in fp16)."""
     cache, model = _run_generation("in_place", G=4, R=8)
     cache.harvest_pending()
-    assert cache._scales_k[0].dtype == torch.float16
-    assert cache._zeros_v[0].dtype == torch.float16
+    assert cache.history(0)[1].dtype == torch.float16
+    assert cache.history(0)[5].dtype == torch.float16
     for k, v in _iter_kv_layers(cache.get_full_cache()):
         assert k.dtype == v.dtype == torch.float32
     _check_against_reference(cache, model, 4, torch.float16)
@@ -422,7 +420,7 @@ def test_fp32_metadata_reproduces_previous_behaviour():
     cache, model = _run_generation("in_place", G=4, R=8,
                                    metadata_dtype=torch.float32)
     cache.harvest_pending()
-    assert cache._scales_k[0].dtype == torch.float32
+    assert cache.history(0)[1].dtype == torch.float32
     _check_against_reference(cache, model, 4, torch.float32)
 
 
@@ -434,8 +432,8 @@ def test_fp16_metadata_shrinks_packed_store_by_metadata_half():
                            metadata_dtype=torch.float32)
     a.harvest_pending(); b.harvest_pending()
     nbytes = lambda *ts: sum(t.numel() * t.element_size() for t in ts)
-    meta = lambda c: nbytes(c._scales_k[0], c._zeros_k[0], c._scales_v[0], c._zeros_v[0])
-    payload = lambda c: nbytes(c._packed_k[0], c._packed_v[0])
+    meta = lambda c: nbytes(c.history(0)[1], c.history(0)[2], c.history(0)[4], c.history(0)[5])
+    payload = lambda c: nbytes(c.history(0)[0], c.history(0)[3])
     assert payload(a) == payload(b)
     assert meta(a) * 2 == meta(b)
     sa, sb = a.get_stats(0), b.get_stats(0)
@@ -471,12 +469,12 @@ def test_reserve_sizes_arena_exactly_and_never_grows():
     cache, model = _run_generation("in_place", num_steps=steps, prefill=prefill,
                                    G=G, R=R, reserve=total)
     cache.harvest_pending()
-    arena = cache._arena[0]
-    assert arena.used == cache._quant_token_count[0]
-    assert arena.cap == arena.used, (arena.cap, arena.used)
+    arena = cache.arena_info(0)
+    assert arena["used"] == cache.quantized_tokens(0)
+    assert arena["capacity"] == arena["used"], arena
     s = cache.get_stats(0)
     # Row padding is the only allocation beyond the used bytes.
-    assert s["packed_capacity_tokens"] == arena.used
+    assert s["packed_capacity_tokens"] == arena["used"]
     _check_against_reference(cache, model, G)
 
 
@@ -487,10 +485,10 @@ def test_arena_grows_on_demand_and_history_stays_exact():
     G = 4
     cache, model = _run_generation("in_place", num_steps=300, prefill=6, G=G, R=8)
     cache.harvest_pending()
-    arena = cache._arena[0]
-    assert arena.used > 256 and arena.cap >= arena.used
-    assert arena.cap - arena.used <= max(4 * G, arena.cap // 4)
-    assert arena.cap % G == 0
+    arena = cache.arena_info(0)
+    assert arena["used"] > 256 and arena["capacity"] >= arena["used"]
+    assert arena["capacity"] - arena["used"] <= max(4 * G, arena["capacity"] // 4)
+    assert arena["capacity"] % G == 0
     _check_against_reference(cache, model, G)
 
 
@@ -500,13 +498,14 @@ def test_flush_reuses_arena_until_capacity_runs_out():
     cache, model = _run_generation("in_place", num_steps=10, prefill=6, G=4, R=8,
                                    reserve=6 + 10 + 40)
     cache.harvest_pending()
-    arena = cache._arena[0]
-    assert arena.cap > arena.used          # spare capacity to append into
-    ptr = arena.packed_k.data_ptr()
+    arena = cache.arena_info(0)
+    assert arena["capacity"] > arena["used"]          # spare capacity to append into
     for _ in range(40):
         cache.add_tokens(model.forward(1, cache.get_full_cache()))
     cache.harvest_pending()
-    assert cache._arena[0] is arena and arena.packed_k.data_ptr() == ptr
+    after = cache.arena_info(0)
+    assert after["storage_ptr"] == arena["storage_ptr"]       # no reallocation
+    assert after["capacity"] == arena["capacity"] and after["used"] > arena["used"]
 
 
 @pytest.mark.parametrize("serving", ["rebuild", "cached"])
@@ -516,10 +515,9 @@ def test_direct_and_staged_paths_store_identical_bytes(serving):
     a, _ = _run_generation("in_place", seed=11, serving=serving, zero_copy=True)
     b, _ = _run_generation("in_place", seed=11, serving=serving, zero_copy=False)
     a.harvest_pending(); b.harvest_pending()
-    for name in ("_packed_k", "_scales_k", "_zeros_k",
-                 "_packed_v", "_scales_v", "_zeros_v"):
-        for ta, tb in zip(getattr(a, name), getattr(b, name)):
-            assert torch.equal(ta, tb), name
+    for i in range(a.num_layers):
+        for j, (ta, tb) in enumerate(zip(a.history(i), b.history(i))):
+            assert torch.equal(ta, tb), (i, j)
     for (ka, va), (kb, vb) in zip(_iter_kv_layers(a.get_full_cache()),
                                   _iter_kv_layers(b.get_full_cache())):
         assert torch.equal(ka, kb) and torch.equal(va, vb)
@@ -528,8 +526,8 @@ def test_direct_and_staged_paths_store_identical_bytes(serving):
 def test_reset_clears_arena_and_reserve():
     cache, _ = _run_generation("in_place", reserve=30)
     cache.reset()
-    assert all(a is None for a in cache._arena)
-    assert cache._reserve_tokens == 0
+    assert all(cache.arena_info(i) is None for i in range(cache.num_layers))
+    assert cache.reserved_tokens == 0
 
 
 def test_row_padding_aligns_key_rows():
@@ -555,7 +553,7 @@ def test_per_layer_group_size_history_matches_reference():
     torch.manual_seed(0)
     cache = KiviCache(num_layers=2, head_dim=8, num_kv_heads=2, device="cpu",
                       group_size=Gs, residual_length=R)
-    assert cache.G is None and cache._G == Gs
+    assert cache.G is None and cache.group_sizes == Gs
     model = FakeModel(2, 2, 8, "in_place")
     cache.add_tokens(model.forward(6))
     for _ in range(40):
@@ -563,7 +561,7 @@ def test_per_layer_group_size_history_matches_reference():
     cache.harvest_pending()
     for i, (k, v) in enumerate(_iter_kv_layers(cache.get_full_cache())):
         G = Gs[i]
-        n_hist = cache._quant_token_count[i]
+        n_hist = cache.quantized_tokens(i)
         assert n_hist > 0 and n_hist % G == 0
         assert R - G <= k.shape[2] - n_hist <= R - 1      # residual window for this G
         for c0 in range(0, n_hist, G):
@@ -587,8 +585,8 @@ def test_per_layer_group_size_reserve_is_exact_per_layer():
     cache.add_tokens(model.forward(1, cache.get_full_cache()))
     cache.harvest_pending()
     for i in range(2):
-        a = cache._arena[i]
-        assert a.cap == a.used == cache._quant_token_count[i], (i, a.cap, a.used)
+        a = cache.arena_info(i)
+        assert a["capacity"] == a["used"] == cache.quantized_tokens(i), (i, a)
 
 
 def test_per_layer_group_size_validation():

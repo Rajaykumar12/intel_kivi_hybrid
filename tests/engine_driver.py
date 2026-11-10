@@ -18,7 +18,7 @@ def make_pair(_C, *, layers, heads, head_dim, G, R, device, async_flush,
     py = KiviCache(num_layers=layers, head_dim=head_dim, num_kv_heads=heads,
                    device=device, group_size=G, residual_length=R,
                    async_flush=async_flush, zero_copy=zero_copy,
-                   metadata_dtype=meta)
+                   metadata_dtype=meta, engine="python")
     gs = G if isinstance(G, list) else [G]
     zc = {"auto": "auto", True: "on", False: "off"}[zero_copy]
     md = {"auto": "auto", torch.float16: "float16", torch.float32: "float32"}[meta]

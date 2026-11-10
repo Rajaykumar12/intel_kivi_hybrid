@@ -50,6 +50,13 @@ class KiviLayer(CacheLayerMixin):
             self.lazy_initialization(key_states, value_states)
         e, i = self.engine, self.layer_idx
         e._init_session(key_states, i)
+        if e._native is not None:
+            # kivi::Engine::update runs the same harvest → flush → append order.
+            e._native.update(i, key_states, value_states)
+            keys, values = e._native.residual(i)
+            setattr(keys, LAYER_TAG, self)
+            self.keys, self.values = keys, values
+            return keys, values
         # Same flush timing as KiviCache.add_tokens(), which runs after each
         # forward pass: (1) collect the flush submitted on the previous step
         # (it had a whole forward pass to run, so the wait is ~free); (2)
@@ -71,24 +78,20 @@ class KiviLayer(CacheLayerMixin):
 
     @property
     def num_history_tokens(self) -> int:
-        a = self.engine._arena[self.layer_idx]
-        return a.used if a is not None else 0
+        return self.engine.quantized_tokens(self.layer_idx)
 
     def history(self):
         """(packed_k, scales_k, zeros_k, packed_v, scales_v, zeros_v) views of
         the quantized prefix, or None. Tokens of a pending flush are not in it
         yet — they are still part of the residual returned by update()."""
-        a = self.engine._arena[self.layer_idx]
-        if a is None or a.used == 0:
-            return None
-        return a.used_keys() + a.used_values()
+        return self.engine.history(self.layer_idx)
 
     # -- Cache layer contract -------------------------------------------------
 
     def get_seq_length(self) -> int:
         e, i = self.engine, self.layer_idx
-        res = e.res_keys[i]
-        return e._quant_token_count[i] + (res.shape[2] if res is not None else 0)
+        res = e.residual(i)
+        return e.quantized_tokens(i) + (res[0].shape[2] if res is not None else 0)
 
     def get_mask_sizes(self, query_length: int):
         return self.get_seq_length() + query_length, 0
