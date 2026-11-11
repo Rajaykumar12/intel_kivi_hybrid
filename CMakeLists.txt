@@ -92,7 +92,7 @@ set_target_properties(kivi_core PROPERTIES BUILD_RPATH "${KIVI_RPATH}")
 # which registers the kivi:: ops the AOTInductor package calls, and holds the
 # engine registry the package's layer_attention calls resolve id 0 against.
 # Tokenizer: no torch, no SYCL, so it is its own static library.
-add_library(kivi_tokenizer STATIC src/runtime/tokenizer/tokenizer.cpp)
+add_library(kivi_tokenizer STATIC src/runtime/tokenizer/tokenizer.cpp src/runtime/chat.cpp)
 target_include_directories(kivi_tokenizer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
                            ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 set_target_properties(kivi_tokenizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -141,7 +141,23 @@ foreach(_g ${KIVI_RUN_GOLDEN})
   set(_dir "${CMAKE_CURRENT_SOURCE_DIR}/artifacts/${_model}")
   if(EXISTS "${_dir}/kivi_config.json")
     add_test(NAME kivi_run_golden_${_model} COMMAND kivi-run --model "${_dir}" --golden "${_g}")
+    # Chunked prefill = the path every later chat turn takes (T > 1 on top
+    # of an existing cache, bottom-right causal mask): must be just as exact.
+    add_test(NAME kivi_run_golden_${_model}_chunked
+             COMMAND kivi-run --model "${_dir}" --golden "${_g}" --prefill-chunk 4)
     message(STATUS "kivi: runtime golden test on ${_model}")
+  endif()
+endforeach()
+
+# Chat goldens (A.8): tools/runtime_golden.py --chat-turn ... -> <model>_chat.json
+file(GLOB KIVI_CHAT_GOLDEN "${CMAKE_CURRENT_BINARY_DIR}/golden/*_chat.json")
+foreach(_g ${KIVI_CHAT_GOLDEN})
+  get_filename_component(_name "${_g}" NAME_WE)
+  string(REGEX REPLACE "_chat$" "" _model "${_name}")
+  set(_dir "${CMAKE_CURRENT_SOURCE_DIR}/artifacts/${_model}")
+  if(EXISTS "${_dir}/generation.json")
+    add_test(NAME kivi_run_chat_${_model} COMMAND kivi-run --model "${_dir}" --golden "${_g}")
+    message(STATUS "kivi: chat golden test on ${_model}")
   endif()
 endforeach()
 
@@ -154,7 +170,12 @@ foreach(_g ${KIVI_TOKENIZER_GOLDEN})
   string(REPLACE "_tokenizer" "" _model "${_name}")
   set(_tj "${CMAKE_CURRENT_SOURCE_DIR}/artifacts/${_model}/tokenizer.json")
   if(EXISTS "${_tj}")
-    add_test(NAME tokenizer_${_model} COMMAND test_tokenizer "${_tj}" "${_g}")
+    set(_gen "${CMAKE_CURRENT_SOURCE_DIR}/artifacts/${_model}/generation.json")
+    if(EXISTS "${_gen}")
+      add_test(NAME tokenizer_${_model} COMMAND test_tokenizer "${_tj}" "${_g}" "${_gen}")
+    else()
+      add_test(NAME tokenizer_${_model} COMMAND test_tokenizer "${_tj}" "${_g}")
+    endif()
     message(STATUS "kivi: tokenizer conformance test on ${_model}")
   endif()
 endforeach()

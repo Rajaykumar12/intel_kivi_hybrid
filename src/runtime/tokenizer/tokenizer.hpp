@@ -38,7 +38,12 @@ public:
     Tokenizer(Tokenizer&&) noexcept;
     Tokenizer& operator=(Tokenizer&&) noexcept;
 
-    std::vector<int64_t> encode(const std::string& text, bool add_special_tokens = true) const;
+    // continuation: `text` directly follows earlier text (e.g. the next chat
+    // turn after a generated EOS), so nothing in it is at input offset 0 —
+    // Metaspace(prepend_scheme="first") then adds no leading "▁", exactly as
+    // when the whole conversation is tokenized at once.
+    std::vector<int64_t> encode(const std::string& text, bool add_special_tokens = true,
+                                bool continuation = false) const;
     std::string decode(const std::vector<int64_t>& ids, bool skip_special_tokens = false) const;
 
     int64_t vocab_size() const;

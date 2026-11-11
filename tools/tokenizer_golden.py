@@ -69,6 +69,39 @@ def corpus(max_wiki: int):
     return texts
 
 
+def chat_cases(tok, artifacts):
+    """Chat conformance (A.8): HF's rendering + ids for each conversation, and
+    for multi-turn ones the split kivi-run feeds incrementally: `turn_prefix`
+    (the conversation up to the last reply's EOS) + ChatTemplate::next_turn."""
+    path = os.path.join(artifacts, "generation.json")
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as fh:
+        pattern = json.load(fh).get("chat")
+    if not pattern:
+        return []
+    from kivi_sycl.export.chat import VERIFY_CONVERSATIONS, render_chat
+    out = []
+    for conv in VERIFY_CONVERSATIONS:
+        if conv[-1]["role"] != "user":
+            continue
+        rendered = tok.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
+        ids = tok(rendered, add_special_tokens=False).input_ids
+        assert ids == list(_ids(tok.apply_chat_template(conv, tokenize=True, add_generation_prompt=True)))
+        case = {"messages": conv, "rendered": rendered, "ids": ids}
+        if len(conv) >= 3 and conv[-2]["role"] == "assistant":
+            head = render_chat(pattern, conv[:-1], add_generation_prompt=False)
+            suffix, eos = pattern["assistant"][1], pattern["eos_token"]
+            assert head.endswith(suffix) and suffix.startswith(eos)
+            case["turn_prefix"] = head[: len(head) - len(suffix)] + eos
+        out.append(case)
+    return out
+
+
+def _ids(x):
+    return x["input_ids"] if hasattr(x, "keys") else x
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--artifacts", required=True)
@@ -94,10 +127,12 @@ def main():
                       "ids_plain": tok(t, add_special_tokens=False).input_ids,
                       "decoded": tok.decode(ids),
                       "decoded_skip": tok.decode(ids, skip_special_tokens=True)})
+    chats = chat_cases(tok, a.artifacts)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w", encoding="utf-8") as fh:
-        json.dump({"tokenizer": a.artifacts, "cases": cases}, fh, ensure_ascii=False)
-    print(f"wrote {a.out}: {len(cases)} cases, {sum(len(c['ids']) for c in cases)} tokens")
+        json.dump({"tokenizer": a.artifacts, "cases": cases, "chat": chats}, fh, ensure_ascii=False)
+    print(f"wrote {a.out}: {len(cases)} cases, {sum(len(c['ids']) for c in cases)} tokens, "
+          f"{len(chats)} chat cases")
 
 
 if __name__ == "__main__":

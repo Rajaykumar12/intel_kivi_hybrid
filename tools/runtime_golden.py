@@ -10,6 +10,18 @@ the reference the exported artifacts were verified against) and writes
 
 The tokenizer files travel with the artifacts, so the prompt ids come from
 the artifact directory. No EOS stop: exactly --steps tokens are generated.
+
+Chat golden (A.8): with --chat-turn (repeatable) and optional --system, the
+reference is HF generate() replying greedily turn by turn, re-rendering the
+whole conversation with the chat template each time — what a transformers
+user gets. `kivi-run --golden` replays the turns through its incremental
+chat loop (KV cache kept, only each turn's delta fed) and compares the reply
+texts. The conversation must stay within the FP residual window, where KIVI
+has quantized nothing and the two are exactly comparable (the quantized
+numerics are covered by the token golden above):
+
+    python tools/runtime_golden.py --artifacts artifacts/qwen25 --model Qwen/Qwen2.5-0.5B-Instruct \
+        --chat-turn "Name a colour." --chat-turn "Another?" --out build-native/golden/qwen25_chat.json
 """
 
 import argparse
@@ -27,7 +39,12 @@ def main():
     ap.add_argument("--prompt", default="Once upon a time, in a small village by the sea,")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--chat-turn", action="append", default=[], help="user turn (repeatable)")
+    ap.add_argument("--system", default=None)
+    ap.add_argument("--reply-tokens", type=int, default=40)
     a = ap.parse_args()
+    if a.chat_turn:
+        return chat_golden(a)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -57,6 +74,39 @@ def main():
                    "tokens": out}, fh)
     print(f"wrote {a.out}: {ids.shape[1]} prompt ids, {len(out)} tokens")
     print("text:", repr(tok.decode(out))[:160])
+
+
+def chat_golden(a):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    with open(f"{a.artifacts}/kivi_config.json") as fh:
+        cfg = json.load(fh)
+    tok = AutoTokenizer.from_pretrained(a.artifacts)
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float32).eval()
+    conv = [{"role": "system", "content": a.system}] if a.system is not None else []
+    replies, total = [], 0
+    for turn in a.chat_turn:
+        conv.append({"role": "user", "content": turn})
+        ids = tok.apply_chat_template(conv, tokenize=True, add_generation_prompt=True,
+                                      return_tensors="pt")
+        ids = ids["input_ids"] if hasattr(ids, "keys") else ids
+        with torch.no_grad():
+            out = model.generate(ids, max_new_tokens=a.reply_tokens, do_sample=False,
+                                 eos_token_id=cfg["eos_token_ids"], pad_token_id=cfg["eos_token_ids"][0])
+        new = out[0, ids.shape[1]:]
+        total = ids.shape[1] + len(new)
+        reply = tok.decode(new, skip_special_tokens=True)
+        replies.append(reply)
+        conv.append({"role": "assistant", "content": reply})
+    if total > cfg["residual_length"]:
+        raise SystemExit(f"conversation reached {total} tokens > residual_length "
+                         f"{cfg['residual_length']}: shorten it (see the docstring)")
+    with open(a.out, "w") as fh:
+        json.dump({"model": a.model, "chat": {"system": a.system, "turns": a.chat_turn,
+                                              "reply_tokens": a.reply_tokens},
+                   "replies": replies}, fh, ensure_ascii=False)
+    print(f"wrote {a.out}: {len(replies)} turns, {total} tokens")
+    for t, r in zip(a.chat_turn, replies):
+        print(f"  > {t}\n  {r!r}")
 
 
 if __name__ == "__main__":

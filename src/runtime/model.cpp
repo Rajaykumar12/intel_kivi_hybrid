@@ -122,6 +122,11 @@ Model::~Model() {
 
 void Model::reserve(int64_t total_tokens) { engine_->reserve(total_tokens); }
 
+void Model::reset() {
+    engine_->reset();
+    pos_ = 0;
+}
+
 at::Tensor Model::forward(const std::vector<int64_t>& ids, int64_t start_pos) {
     const auto T = static_cast<int64_t>(ids.size());
     if (T < 1) throw std::runtime_error("forward: no tokens");

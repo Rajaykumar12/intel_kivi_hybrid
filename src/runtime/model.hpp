@@ -56,6 +56,8 @@ public:
     void reserve(int64_t total_tokens);
     // Run tokens `ids` at positions start_pos.. ; returns logits [1, T, V].
     at::Tensor forward(const std::vector<int64_t>& ids, int64_t start_pos);
+    // Forget the conversation: empty KV cache, position 0.
+    void reset();
     // Tokens seen so far (the next position).
     int64_t position() const { return pos_; }
     std::shared_ptr<kivi::Engine> engine() const { return engine_; }

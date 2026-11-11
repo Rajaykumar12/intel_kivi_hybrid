@@ -671,11 +671,14 @@ Tokenizer Tokenizer::from_file(const std::string& path) {
     return Tokenizer(std::move(impl));
 }
 
-std::vector<int64_t> Tokenizer::encode(const std::string& text, bool add_special_tokens) const {
+std::vector<int64_t> Tokenizer::encode(const std::string& text, bool add_special_tokens,
+                                      bool continuation) const {
     const Impl& m = *impl_;
     std::vector<Segment> segs;
     std::vector<int64_t> order;
     m.split_added(text, segs, order);
+    if (continuation)
+        for (auto& sg : segs) sg.offset += 1;   // no piece starts the input
     std::vector<int64_t> ids;
     if (add_special_tokens) ids = m.prefix_ids;
     size_t next_seg = 0;

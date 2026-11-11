@@ -9,6 +9,7 @@
                                  (e.g. RoPE inv_freq buffers), fp32
     constants.json               package constant -> {file, tensor, dtype, shape}
     kivi_config.json             engine + model configuration
+    generation.json              chat template pattern + default sampling (chat.py)
     tokenizer.json, tokenizer_config.json, generation_config.json (if present)
 
 ``load_artifacts(out_dir)`` is the Python mirror of what the C++ runtime does:
@@ -25,6 +26,7 @@ import shutil
 import torch
 
 from ..config.model_config import detect_model_config
+from .chat import write_generation_json
 from .decoder import RUNTIME_ENGINE_ID, compile_package, export_program, exported_constants
 
 __all__ = ["write_artifacts", "write_effective_tokenizer", "load_artifacts", "ARTIFACT_VERSION"]
@@ -129,6 +131,7 @@ def write_artifacts(model_id_or_dir: str, out_dir: str, *, max_tokens: int = 204
         if os.path.exists(os.path.join(snapshot, f)):
             shutil.copyfile(os.path.join(snapshot, f), os.path.join(out_dir, f))
     write_effective_tokenizer(snapshot, out_dir)
+    write_generation_json(snapshot, out_dir)
     with open(os.path.join(out_dir, "constants.json"), "w") as fh:
         json.dump(manifest, fh, indent=1, sort_keys=True)
 
