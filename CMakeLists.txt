@@ -91,11 +91,16 @@ set_target_properties(kivi_core PROPERTIES BUILD_RPATH "${KIVI_RPATH}")
 # kivi-run: the Python-free runtime (Phase 5 Route A). Links libkivi_core,
 # which registers the kivi:: ops the AOTInductor package calls, and holds the
 # engine registry the package's layer_attention calls resolve id 0 against.
-# Tokenizer: plain C++ (no torch, no SYCL), so it is its own static library.
+# Tokenizer: no torch, no SYCL, so it is its own static library.
 add_library(kivi_tokenizer STATIC src/runtime/tokenizer/tokenizer.cpp)
 target_include_directories(kivi_tokenizer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
                            ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 set_target_properties(kivi_tokenizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Byte-level (Qwen / GPT-2) tokenizers: PCRE2 for the Split regex, ICU for NFC.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(KIVI_PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
+pkg_check_modules(KIVI_ICU REQUIRED IMPORTED_TARGET icu-uc)
+target_link_libraries(kivi_tokenizer PUBLIC PkgConfig::KIVI_PCRE2 PkgConfig::KIVI_ICU)
 
 add_executable(kivi-run
   src/runtime/main.cpp
@@ -122,21 +127,23 @@ set_target_properties(kivi_arena_tests PROPERTIES
   BUILD_RPATH "${KIVI_RPATH};$<TARGET_FILE_DIR:kivi_core>")
 add_test(NAME kivi_arena_tests COMMAND kivi_arena_tests)
 
-# Runtime golden test (Phase 5 A.4): kivi-run must reproduce Python's greedy
-# tokens. Artifacts (GBs) and the golden file are generated, not checked in:
-#   python -m kivi_sycl.export --model <id> --out artifacts/tinyllama
-#   python tools/runtime_golden.py --artifacts artifacts/tinyllama --model <id> \
-#       --out build-native/golden/tinyllama.json
-# The test is registered only when both exist (re-run cmake after creating them).
-set(KIVI_GOLDEN_ARTIFACTS "${CMAKE_CURRENT_SOURCE_DIR}/artifacts/tinyllama" CACHE PATH
-    "artifact directory for the kivi-run golden test")
-set(KIVI_GOLDEN_FILE "${CMAKE_CURRENT_BINARY_DIR}/golden/tinyllama.json" CACHE FILEPATH
-    "golden tokens (tools/runtime_golden.py) for the kivi-run golden test")
-if(EXISTS "${KIVI_GOLDEN_ARTIFACTS}/kivi_config.json" AND EXISTS "${KIVI_GOLDEN_FILE}")
-  add_test(NAME kivi_run_golden
-           COMMAND kivi-run --model "${KIVI_GOLDEN_ARTIFACTS}" --golden "${KIVI_GOLDEN_FILE}")
-  message(STATUS "kivi: runtime golden test on ${KIVI_GOLDEN_ARTIFACTS}")
-endif()
+# Runtime golden tests (Phase 5 A.4/A.7): kivi-run must reproduce Python's
+# greedy tokens. Artifacts (GBs) and golden files are generated, not checked in:
+#   python -m kivi_sycl.export --model <id> --out artifacts/<name>
+#   python tools/runtime_golden.py --artifacts artifacts/<name> --model <id> \
+#       --out build-native/golden/<name>_run.json
+# One test per golden file whose artifact directory exists (re-run cmake
+# after creating them).
+file(GLOB KIVI_RUN_GOLDEN "${CMAKE_CURRENT_BINARY_DIR}/golden/*_run.json")
+foreach(_g ${KIVI_RUN_GOLDEN})
+  get_filename_component(_name "${_g}" NAME_WE)
+  string(REGEX REPLACE "_run$" "" _model "${_name}")
+  set(_dir "${CMAKE_CURRENT_SOURCE_DIR}/artifacts/${_model}")
+  if(EXISTS "${_dir}/kivi_config.json")
+    add_test(NAME kivi_run_golden_${_model} COMMAND kivi-run --model "${_dir}" --golden "${_g}")
+    message(STATUS "kivi: runtime golden test on ${_model}")
+  endif()
+endforeach()
 
 # Tokenizer conformance (Phase 5 A.5): tools/tokenizer_golden.py corpus.
 add_executable(test_tokenizer tests/native/test_tokenizer.cpp)

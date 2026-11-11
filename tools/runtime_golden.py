@@ -5,8 +5,8 @@ the reference the exported artifacts were verified against) and writes
 {model, prompt, prompt_ids, tokens} for `kivi-run --golden`:
 
     python tools/runtime_golden.py --artifacts artifacts/tinyllama \
-        --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --steps 200 --out golden.json
-    kivi-run --model artifacts/tinyllama --golden golden.json
+        --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --steps 200 --out golden_run.json
+    kivi-run --model artifacts/tinyllama --golden golden_run.json
 
 The tokenizer files travel with the artifacts, so the prompt ids come from
 the artifact directory. No EOS stop: exactly --steps tokens are generated.

@@ -34,6 +34,12 @@ STRESS = [
     "CAPS lock MiXeD", "repeated repeated repeated", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "...!!!???---___===", "\"quoted\" 'single' `back`", "tab\tseparated\tvalues",
     "trailing spaces   ", "   leading spaces", "line1\r\nline2\rline3",
+    # Unicode whitespace: regex engines differ most on \s
+    "a\u0085b", "a\u2028b\u2029c", "x\u3000y", "\u00a0 a", "a\u2003b\u2009c", "\u180e mvs",
+    "\ufeffbom", "a \u000b b \u000c c", "  \n  \n\n   ",
+    # NFC: composed vs decomposed
+    "\u212b angstrom", "A\u030a ring", "\u1100\u1161 jamo", "\u0065\u0301\u0302 two marks",
+    "\u00c5\u0301", "\u1e9b\u0323",
 ]
 
 
@@ -72,6 +78,16 @@ def main():
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.artifacts)
     cases = []
+    # Decode-only: random id runs (byte tokens split mid-character, specials
+    # mixed in) exercise U+FFFD substitution and the decoder chain.
+    import random
+    rng = random.Random(0)
+    vocab = len(tok)
+    for n in (1, 2, 3, 5, 8, 16, 64) * 30:
+        ids = [rng.randrange(vocab) for _ in range(n)]
+        cases.append({"text": None, "ids": ids, "ids_plain": None,
+                      "decoded": tok.decode(ids),
+                      "decoded_skip": tok.decode(ids, skip_special_tokens=True)})
     for t in corpus(a.max_wiki):
         ids = tok(t).input_ids
         cases.append({"text": t, "ids": ids,

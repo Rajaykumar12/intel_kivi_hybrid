@@ -38,15 +38,20 @@ int main(int argc, char** argv) {
     size_t failed = 0, tokens = 0;
     const auto t0 = std::chrono::steady_clock::now();
     for (const auto& c : cases) {
-        const auto text = c.at("text").get<std::string>();
+        // text == null: a decode-only case (random ids).
+        const std::string text = c.at("text").is_null() ? "<decode-only " + show(c["ids"].get<std::vector<int64_t>>()) + ">"
+                                                        : c["text"].get<std::string>();
         const auto ids = c.at("ids").get<std::vector<int64_t>>();
-        const auto plain = c.at("ids_plain").get<std::vector<int64_t>>();
         tokens += ids.size();
         std::vector<std::string> errs;
-        auto got = tok.encode(text, true);
-        if (got != ids) errs.push_back("encode: got " + show(got) + " want " + show(ids));
-        auto got_plain = tok.encode(text, false);
-        if (got_plain != plain) errs.push_back("encode(plain): got " + show(got_plain) + " want " + show(plain));
+        if (!c["text"].is_null()) {
+            const auto plain = c.at("ids_plain").get<std::vector<int64_t>>();
+            auto got = tok.encode(text, true);
+            if (got != ids) errs.push_back("encode: got " + show(got) + " want " + show(ids));
+            auto got_plain = tok.encode(text, false);
+            if (got_plain != plain)
+                errs.push_back("encode(plain): got " + show(got_plain) + " want " + show(plain));
+        }
         auto dec = tok.decode(ids, false);
         if (dec != c.at("decoded").get<std::string>())
             errs.push_back("decode: got " + snippet(dec) + " want " + snippet(c["decoded"].get<std::string>()));

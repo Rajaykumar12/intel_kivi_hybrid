@@ -10,12 +10,13 @@
 //
 // Supported components (anything else is rejected at load time, never
 // silently approximated):
-//   normalizer     null, Sequence, Prepend, Replace(String)
-//   pre_tokenizer  null, Metaspace
+//   normalizer     null, Sequence, Prepend, Replace(String), NFC
+//   pre_tokenizer  null, Sequence, Metaspace, Split, ByteLevel
 //   model          BPE (byte_fallback, fuse_unk, ignore_merges)
 //   decoder        Sequence, Replace(String), ByteFallback, Fuse, Strip
 //   post_processor null, TemplateProcessing
-// Byte-level (GPT-2 / Qwen) components are added in A.7.
+//   + byte-level family (A.7): normalizer NFC, pre_tokenizer Split(Isolated)
+//     and ByteLevel, post_processor ByteLevel, decoder ByteLevel
 //
 // The exporter writes the pipeline transformers actually runs
 // (backend_tokenizer.save), which can differ from the tokenizer.json a model

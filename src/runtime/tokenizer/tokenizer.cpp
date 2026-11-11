@@ -8,6 +8,10 @@
 #include <queue>
 #include <stdexcept>
 
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+#include <unicode/normalizer2.h>
+#include <unicode/unistr.h>
 #include <nlohmann/json.hpp>
 
 namespace kivi::runtime {
@@ -81,6 +85,178 @@ struct Segment {
 
 using SegmentFn = std::function<void(std::vector<Segment>&)>;
 
+// ---- byte-level (GPT-2) alphabet -------------------------------------------
+// Each byte maps to one printable code point: '!'..'~', '¡'..'¬', '®'..'ÿ' map
+// to themselves, the other 68 bytes to U+0100.. in byte order.
+std::string utf8_encode(uint32_t cp) {
+    std::string o;
+    if (cp < 0x80) o += static_cast<char>(cp);
+    else if (cp < 0x800) { o += static_cast<char>(0xC0 | (cp >> 6)); o += static_cast<char>(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) {
+        o += static_cast<char>(0xE0 | (cp >> 12));
+        o += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        o += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        o += static_cast<char>(0xF0 | (cp >> 18));
+        o += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        o += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        o += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+    return o;
+}
+
+struct ByteAlphabet {
+    std::string to_char[256];          // byte -> UTF-8 of its code point
+    int16_t from_cp[512];              // code point -> byte, -1 if none
+    ByteAlphabet() {
+        std::fill(std::begin(from_cp), std::end(from_cp), int16_t{-1});
+        uint32_t extra = 256;
+        for (int b = 0; b < 256; ++b) {
+            const bool printable = (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE);
+            const uint32_t cp = printable ? static_cast<uint32_t>(b) : extra++;
+            to_char[b] = utf8_encode(cp);
+            from_cp[cp] = static_cast<int16_t>(b);
+        }
+    }
+};
+const ByteAlphabet& byte_alphabet() {
+    static const ByteAlphabet a;
+    return a;
+}
+
+// Decode one UTF-8 code point at s[i] (assumes valid UTF-8; returns the
+// lead byte for anything else). Advances i.
+uint32_t next_cp(const std::string& s, size_t& i) {
+    auto c = static_cast<unsigned char>(s[i]);
+    size_t n = utf8_len(c);
+    if (n == 1 || i + n > s.size()) { ++i; return c; }
+    uint32_t cp = n == 2 ? (c & 0x1F) : n == 3 ? (c & 0x0F) : (c & 0x07);
+    for (size_t k = 1; k < n; ++k) cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3F);
+    i += n;
+    return cp;
+}
+
+// Rust's String::from_utf8_lossy: one U+FFFD per maximal invalid subpart
+// (the Unicode-recommended substitution), which is what tokenizers' ByteLevel
+// decoder produces.
+std::string utf8_lossy(const std::string& b) {
+    static const std::string kRep = "\xEF\xBF\xBD";
+    std::string out;
+    out.reserve(b.size());
+    size_t i = 0;
+    const size_t n = b.size();
+    auto byte = [&](size_t k) { return static_cast<unsigned char>(b[k]); };
+    while (i < n) {
+        const unsigned char c = byte(i);
+        if (c < 0x80) { out += static_cast<char>(c); ++i; continue; }
+        size_t need;
+        unsigned char lo = 0x80, hi = 0xBF;              // range of the 2nd byte
+        if (c >= 0xC2 && c <= 0xDF) need = 1;
+        else if (c == 0xE0) { need = 2; lo = 0xA0; }
+        else if ((c >= 0xE1 && c <= 0xEC) || c == 0xEE || c == 0xEF) need = 2;
+        else if (c == 0xED) { need = 2; hi = 0x9F; }
+        else if (c == 0xF0) { need = 3; lo = 0x90; }
+        else if (c >= 0xF1 && c <= 0xF3) need = 3;
+        else if (c == 0xF4) { need = 3; hi = 0x8F; }
+        else { out += kRep; ++i; continue; }          // 80..C1, F5..FF
+        size_t k = 1;
+        bool ok = true;
+        for (; k <= need; ++k) {
+            if (i + k >= n) { ok = false; break; }
+            const unsigned char d = byte(i + k);
+            const bool in = k == 1 ? (d >= lo && d <= hi) : (d >= 0x80 && d <= 0xBF);
+            if (!in) { ok = false; break; }
+        }
+        if (ok) { out.append(b, i, need + 1); i += need + 1; }
+        else { out += kRep; i += k; }                  // the valid prefix, as one U+FFFD
+    }
+    return out;
+}
+
+// ---- regex (tokenizers' Split pre-tokenizer) --------------------------------
+// tokenizers uses Oniguruma; PCRE2 in UTF + UCP mode accepts the same
+// patterns (\p{L}, \p{N}, (?i:..), lookahead) with the same leftmost-first
+// semantics. MATCH_INVALID_UTF keeps arbitrary input bytes safe.
+class Regex {
+public:
+    explicit Regex(const std::string& pattern) {
+        int err = 0;
+        PCRE2_SIZE off = 0;
+        code_ = pcre2_compile(reinterpret_cast<PCRE2_SPTR>(pattern.data()), pattern.size(),
+                              PCRE2_UTF | PCRE2_UCP | PCRE2_MATCH_INVALID_UTF, &err, &off, nullptr);
+        if (!code_) {
+            PCRE2_UCHAR msg[256];
+            pcre2_get_error_message(err, msg, sizeof msg);
+            throw std::runtime_error("tokenizer.json: regex error at " + std::to_string(off) + ": " +
+                                     reinterpret_cast<const char*>(msg));
+        }
+        jit_ = pcre2_jit_compile(code_, PCRE2_JIT_COMPLETE) == 0;
+    }
+    ~Regex() { pcre2_code_free(code_); }
+    Regex(const Regex&) = delete;
+    Regex& operator=(const Regex&) = delete;
+
+    // All non-overlapping matches as [begin, end) byte ranges.
+    std::vector<std::pair<size_t, size_t>> find_all(const std::string& s) const {
+        std::vector<std::pair<size_t, size_t>> out;
+        pcre2_match_data* md = pcre2_match_data_create_from_pattern(code_, nullptr);
+        size_t start = 0;
+        while (start <= s.size()) {
+            const int rc = (jit_ ? pcre2_jit_match : pcre2_match)(
+                code_, reinterpret_cast<PCRE2_SPTR>(s.data()), s.size(), start, 0, md, nullptr);
+            if (rc == PCRE2_ERROR_NOMATCH) break;
+            if (rc < 0) {
+                pcre2_match_data_free(md);
+                throw std::runtime_error("tokenizer: regex match error " + std::to_string(rc));
+            }
+            const PCRE2_SIZE* ov = pcre2_get_ovector_pointer(md);
+            if (ov[1] > ov[0]) out.emplace_back(ov[0], ov[1]);
+            if (ov[1] == ov[0]) {                      // empty match: step one character
+                if (ov[1] >= s.size()) break;
+                start = ov[1] + utf8_len(static_cast<unsigned char>(s[ov[1]]));
+            } else {
+                start = ov[1];
+            }
+        }
+        pcre2_match_data_free(md);
+        return out;
+    }
+
+private:
+    pcre2_code* code_ = nullptr;
+    bool jit_ = false;
+};
+
+std::string nfc(const std::string& s) {
+    bool ascii = true;
+    for (unsigned char c : s) if (c >= 0x80) { ascii = false; break; }
+    if (ascii) return s;                               // ASCII is always NFC
+    UErrorCode st = U_ZERO_ERROR;
+    const icu::Normalizer2* n = icu::Normalizer2::getNFCInstance(st);
+    if (U_FAILURE(st)) throw std::runtime_error("tokenizer: ICU NFC unavailable");
+    icu::UnicodeString u = icu::UnicodeString::fromUTF8(s);
+    icu::UnicodeString r = n->normalize(u, st);
+    if (U_FAILURE(st)) throw std::runtime_error("tokenizer: ICU NFC failed");
+    std::string out;
+    r.toUTF8String(out);
+    return out;
+}
+
+// Split::Isolated: matches and the text between them each become a piece.
+void split_isolated(const Regex& re, std::vector<Segment>& segs) {
+    std::vector<Segment> out;
+    for (auto& s : segs) {
+        size_t last = 0;
+        for (auto [b, e] : re.find_all(s.text)) {
+            if (b > last) out.push_back({s.text.substr(last, b - last), s.offset + last});
+            out.push_back({s.text.substr(b, e - b), s.offset + b});
+            last = e;
+        }
+        if (last < s.text.size()) out.push_back({s.text.substr(last), s.offset + last});
+    }
+    segs.swap(out);
+}
+
 }  // namespace
 
 struct Tokenizer::Impl {
@@ -111,8 +287,11 @@ struct Tokenizer::Impl {
     // ---- loading -------------------------------------------------------------
     void load_model(const json& m) {
         if (m.at("type").get<std::string>() != "BPE") unsupported("model " + m["type"].dump());
-        if (!m.value("continuing_subword_prefix", json()).is_null() ||
-            !m.value("end_of_word_suffix", json()).is_null())
+        auto set = [&](const char* k) {
+            const auto& v = m.value(k, json());
+            return !v.is_null() && !v.get<std::string>().empty();
+        };
+        if (set("continuing_subword_prefix") || set("end_of_word_suffix"))
             unsupported("BPE continuing_subword_prefix / end_of_word_suffix");
         if (!m.value("dropout", json()).is_null()) unsupported("BPE dropout");
         byte_fallback = m.value("byte_fallback", false);
@@ -193,6 +372,12 @@ struct Tokenizer::Impl {
                 for (auto& s : segs) replace_all(s.text, from, to);
             });
         } else {
+            if (type == "NFC") {
+                normalizers.push_back([](std::vector<Segment>& segs) {
+                    for (auto& s : segs) s.text = nfc(s.text);
+                });
+                return;
+            }
             unsupported("normalizer " + type);
         }
     }
@@ -228,6 +413,40 @@ struct Tokenizer::Impl {
                 segs.swap(out);
             });
         } else {
+            if (type == "Split") {
+                const auto& pat = p.at("pattern");
+                const auto behavior = p.value("behavior", std::string());
+                if (behavior != "Isolated") unsupported("Split behavior " + behavior);
+                if (p.value("invert", false)) unsupported("Split invert");
+                std::shared_ptr<Regex> re;
+                if (pat.contains("Regex")) re = std::make_shared<Regex>(pat["Regex"].get<std::string>());
+                else if (pat.contains("String")) {
+                    // A literal: escape it for PCRE2 with \Q..\E.
+                    re = std::make_shared<Regex>("\\Q" + pat["String"].get<std::string>() + "\\E");
+                } else unsupported("Split pattern");
+                pre_tokenizers.push_back([re](std::vector<Segment>& segs) { split_isolated(*re, segs); });
+                return;
+            }
+            if (type == "ByteLevel") {
+                const bool prefix = p.value("add_prefix_space", false);
+                std::shared_ptr<Regex> re;
+                if (p.value("use_regex", true))   // GPT-2's own split
+                    re = std::make_shared<Regex>(
+                        "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+");
+                pre_tokenizers.push_back([prefix, re](std::vector<Segment>& segs) {
+                    if (prefix)
+                        for (auto& s : segs) if (s.text.empty() || s.text[0] != ' ') s.text = " " + s.text;
+                    if (re) split_isolated(*re, segs);
+                    const auto& a = byte_alphabet();
+                    for (auto& s : segs) {
+                        std::string m;
+                        m.reserve(s.text.size() * 2);
+                        for (unsigned char c : s.text) m += a.to_char[c];
+                        s.text.swap(m);
+                    }
+                });
+                return;
+            }
             unsupported("pre_tokenizer " + type);
         }
     }
@@ -235,6 +454,7 @@ struct Tokenizer::Impl {
     void load_post_processor(const json& p) {
         if (p.is_null()) return;
         const auto type = p.at("type").get<std::string>();
+        if (type == "ByteLevel") return;   // only adjusts offsets; ids unchanged
         if (type != "TemplateProcessing") unsupported("post_processor " + type);
         const auto& specials = p.at("special_tokens");
         bool seen_seq = false;
@@ -309,6 +529,27 @@ struct Tokenizer::Impl {
                 }
             });
         } else {
+            if (type == "ByteLevel") {
+                // Every char of a token maps back to a byte; a token with any
+                // char outside the alphabet is kept as its raw UTF-8. Then all
+                // bytes are decoded at once, invalid sequences -> U+FFFD.
+                decoders.push_back([](std::vector<std::string>& toks) {
+                    const auto& a = byte_alphabet();
+                    std::string bytes;
+                    for (auto& t : toks) {
+                        std::string tb;
+                        bool ok = true;
+                        for (size_t i = 0; i < t.size() && ok;) {
+                            const uint32_t cp = next_cp(t, i);
+                            if (cp < 512 && a.from_cp[cp] >= 0) tb += static_cast<char>(a.from_cp[cp]);
+                            else ok = false;
+                        }
+                        bytes += ok ? tb : t;
+                    }
+                    toks.assign(1, utf8_lossy(bytes));
+                });
+                return;
+            }
             unsupported("decoder " + type);
         }
     }
