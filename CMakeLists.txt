@@ -100,6 +100,7 @@ set_target_properties(kivi_tokenizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_executable(kivi-run
   src/runtime/main.cpp
   src/runtime/model.cpp
+  src/runtime/sampler.cpp
   src/runtime/safetensors.cpp
 )
 target_include_directories(kivi-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
