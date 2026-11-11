@@ -114,3 +114,19 @@ target_link_libraries(kivi_arena_tests PRIVATE kivi_core)
 set_target_properties(kivi_arena_tests PROPERTIES
   BUILD_RPATH "${KIVI_RPATH};$<TARGET_FILE_DIR:kivi_core>")
 add_test(NAME kivi_arena_tests COMMAND kivi_arena_tests)
+
+# Runtime golden test (Phase 5 A.4): kivi-run must reproduce Python's greedy
+# tokens. Artifacts (GBs) and the golden file are generated, not checked in:
+#   python -m kivi_sycl.export --model <id> --out artifacts/tinyllama
+#   python tools/runtime_golden.py --artifacts artifacts/tinyllama --model <id> \
+#       --out build-native/golden/tinyllama.json
+# The test is registered only when both exist (re-run cmake after creating them).
+set(KIVI_GOLDEN_ARTIFACTS "${CMAKE_CURRENT_SOURCE_DIR}/artifacts/tinyllama" CACHE PATH
+    "artifact directory for the kivi-run golden test")
+set(KIVI_GOLDEN_FILE "${CMAKE_CURRENT_BINARY_DIR}/golden/tinyllama.json" CACHE FILEPATH
+    "golden tokens (tools/runtime_golden.py) for the kivi-run golden test")
+if(EXISTS "${KIVI_GOLDEN_ARTIFACTS}/kivi_config.json" AND EXISTS "${KIVI_GOLDEN_FILE}")
+  add_test(NAME kivi_run_golden
+           COMMAND kivi-run --model "${KIVI_GOLDEN_ARTIFACTS}" --golden "${KIVI_GOLDEN_FILE}")
+  message(STATUS "kivi: runtime golden test on ${KIVI_GOLDEN_ARTIFACTS}")
+endif()
