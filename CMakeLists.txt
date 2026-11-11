@@ -91,6 +91,12 @@ set_target_properties(kivi_core PROPERTIES BUILD_RPATH "${KIVI_RPATH}")
 # kivi-run: the Python-free runtime (Phase 5 Route A). Links libkivi_core,
 # which registers the kivi:: ops the AOTInductor package calls, and holds the
 # engine registry the package's layer_attention calls resolve id 0 against.
+# Tokenizer: plain C++ (no torch, no SYCL), so it is its own static library.
+add_library(kivi_tokenizer STATIC src/runtime/tokenizer/tokenizer.cpp)
+target_include_directories(kivi_tokenizer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
+                           ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+set_target_properties(kivi_tokenizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_executable(kivi-run
   src/runtime/main.cpp
   src/runtime/model.cpp
@@ -98,7 +104,7 @@ add_executable(kivi-run
 )
 target_include_directories(kivi-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
                            ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-target_link_libraries(kivi-run PRIVATE kivi_core)
+target_link_libraries(kivi-run PRIVATE kivi_core kivi_tokenizer)
 set_target_properties(kivi-run PROPERTIES
   BUILD_RPATH "${KIVI_RPATH};$<TARGET_FILE_DIR:kivi_core>")
 
@@ -130,3 +136,17 @@ if(EXISTS "${KIVI_GOLDEN_ARTIFACTS}/kivi_config.json" AND EXISTS "${KIVI_GOLDEN_
            COMMAND kivi-run --model "${KIVI_GOLDEN_ARTIFACTS}" --golden "${KIVI_GOLDEN_FILE}")
   message(STATUS "kivi: runtime golden test on ${KIVI_GOLDEN_ARTIFACTS}")
 endif()
+
+# Tokenizer conformance (Phase 5 A.5): tools/tokenizer_golden.py corpus.
+add_executable(test_tokenizer tests/native/test_tokenizer.cpp)
+target_link_libraries(test_tokenizer PRIVATE kivi_tokenizer)
+file(GLOB KIVI_TOKENIZER_GOLDEN "${CMAKE_CURRENT_BINARY_DIR}/golden/*_tokenizer.json")
+foreach(_g ${KIVI_TOKENIZER_GOLDEN})
+  get_filename_component(_name "${_g}" NAME_WE)            # e.g. tinyllama_tokenizer
+  string(REPLACE "_tokenizer" "" _model "${_name}")
+  set(_tj "${CMAKE_CURRENT_SOURCE_DIR}/artifacts/${_model}/tokenizer.json")
+  if(EXISTS "${_tj}")
+    add_test(NAME tokenizer_${_model} COMMAND test_tokenizer "${_tj}" "${_g}")
+    message(STATUS "kivi: tokenizer conformance test on ${_model}")
+  endif()
+endforeach()

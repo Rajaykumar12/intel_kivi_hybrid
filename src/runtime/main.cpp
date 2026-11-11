@@ -1,15 +1,18 @@
 // kivi-run — Python-free KIVI inference (Phase 5 A.4: token ids in, token ids out).
 //
+//   kivi-run --model artifacts/tinyllama --prompt "Once upon a time" --max-new-tokens 64
 //   kivi-run --model artifacts/tinyllama --ids 1,9038,2501,263,931 --max-new-tokens 64
 //   kivi-run --model artifacts/tinyllama --golden golden.json     # exit 0 iff identical
 //
 // Greedy decoding: one prefill call over the prompt, then one call per token.
-// Generated ids go to stdout (space-separated); timings go to stderr.
+// With --prompt the generated text goes to stdout; with --ids / --golden the
+// generated ids do (space-separated). Timings go to stderr.
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -21,12 +24,15 @@
 
 #include "engine/engine.hpp"
 #include "model.hpp"
+#include "tokenizer/tokenizer.hpp"
 
 namespace {
 
 struct Options {
     std::string model_dir;
     std::vector<int64_t> ids;
+    std::string prompt;
+    bool have_prompt = false;
     std::string golden;
     int64_t max_new_tokens = 64;
     std::string device = "xpu";
@@ -38,8 +44,11 @@ struct Options {
 [[noreturn]] void usage(const char* msg = nullptr) {
     if (msg) std::fprintf(stderr, "kivi-run: %s\n\n", msg);
     std::fprintf(stderr,
-        "usage: kivi-run --model DIR (--ids 1,2,3 | --ids-file F | --golden F) [options]\n"
+        "usage: kivi-run --model DIR (--prompt TEXT | --prompt-file F | --ids 1,2,3 |\n"
+        "                --ids-file F | --golden F) [options]\n"
         "  --model DIR           artifact directory (python -m kivi_sycl.export)\n"
+        "  --prompt TEXT         prompt text (tokenized with DIR/tokenizer.json)\n"
+        "  --prompt-file F       prompt text from a file\n"
         "  --ids LIST            prompt token ids, comma-separated\n"
         "  --ids-file F          prompt token ids, whitespace/comma-separated\n"
         "  --golden F            JSON {prompt_ids, tokens}: generate len(tokens) greedy\n"
@@ -74,6 +83,14 @@ Options parse_args(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--model") o.model_dir = next();
+        else if (a == "--prompt") { o.prompt = next(); o.have_prompt = true; }
+        else if (a == "--prompt-file") {
+            std::ifstream in(next());
+            if (!in) usage("cannot open the --prompt-file");
+            std::stringstream b; b << in.rdbuf();
+            o.prompt = b.str();
+            o.have_prompt = true;
+        }
         else if (a == "--ids") o.ids = parse_ids(next());
         else if (a == "--ids-file") {
             std::ifstream in(next());
@@ -90,7 +107,8 @@ Options parse_args(int argc, char** argv) {
         else usage(("unknown argument " + a).c_str());
     }
     if (o.model_dir.empty()) usage("--model is required");
-    if (o.golden.empty() && o.ids.empty()) usage("give --ids, --ids-file or --golden");
+    const int inputs = !o.golden.empty() + !o.ids.empty() + o.have_prompt;
+    if (inputs != 1) usage("give exactly one of --prompt, --prompt-file, --ids, --ids-file, --golden");
     return o;
 }
 
@@ -122,6 +140,11 @@ int main(int argc, char** argv) {
         at::InferenceMode guard;
         kivi::runtime::Model model(opt.model_dir, opt.device);
         const auto& cfg = model.config();
+        std::optional<kivi::runtime::Tokenizer> tok;
+        if (opt.have_prompt) {
+            tok = kivi::runtime::Tokenizer::from_file(opt.model_dir + "/tokenizer.json");
+            opt.ids = tok->encode(opt.prompt);
+        }
         std::fprintf(stderr, "kivi-run: loaded %s (%s, %lld layers) in %.2fs, %d threads\n",
                      opt.model_dir.c_str(), cfg.model_type.c_str(),
                      static_cast<long long>(cfg.num_layers), model.load_seconds(),
@@ -146,8 +169,13 @@ int main(int argc, char** argv) {
         }
         const auto t2 = std::chrono::steady_clock::now();
 
-        for (size_t i = 0; i < out.size(); ++i) std::printf(i ? " %lld" : "%lld", static_cast<long long>(out[i]));
-        std::printf("\n");
+        if (tok) {
+            std::printf("%s\n", tok->decode(out, /*skip_special_tokens=*/true).c_str());
+        } else {
+            for (size_t i = 0; i < out.size(); ++i)
+                std::printf(i ? " %lld" : "%lld", static_cast<long long>(out[i]));
+            std::printf("\n");
+        }
         const double decode_s = secs(t1, t2);
         const auto decode_n = static_cast<double>(out.size() > 0 ? out.size() - 1 : 0);
         std::fprintf(stderr, "kivi-run: prefill %lld tok in %.3fs (%.1f tok/s); decode %zu tok, %.2f tok/s\n",

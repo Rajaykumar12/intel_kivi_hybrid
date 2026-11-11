@@ -27,7 +27,7 @@ import torch
 from ..config.model_config import detect_model_config
 from .decoder import RUNTIME_ENGINE_ID, compile_package, export_program, exported_constants
 
-__all__ = ["write_artifacts", "load_artifacts", "ARTIFACT_VERSION"]
+__all__ = ["write_artifacts", "write_effective_tokenizer", "load_artifacts", "ARTIFACT_VERSION"]
 
 ARTIFACT_VERSION = 1
 _DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
@@ -61,6 +61,27 @@ def _safetensors_index(snapshot: str) -> dict:
 
 def _dtype_name(dt: torch.dtype) -> str:
     return {v: k for k, v in _DTYPES.items()}[dt]
+
+
+def write_effective_tokenizer(snapshot: str, out_dir: str) -> None:
+    """Write the tokenizer pipeline transformers actually runs as
+    ``out_dir/tokenizer.json``.
+
+    transformers may rebuild parts of it from tokenizer_config.json rather
+    than use the file as shipped — e.g. 5.x Llama tokenizers replace the
+    file's Prepend/Replace normalizer with a Metaspace(prepend_scheme=
+    "first") pre-tokenizer, which encodes text after a special token
+    differently. The C++ tokenizer implements the file, so the file must be
+    the effective pipeline. Skipped when the snapshot has no tokenizer."""
+    if not any(os.path.exists(os.path.join(snapshot, f))
+               for f in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model")):
+        return            # model-only artifacts: kivi-run --ids still works
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(snapshot)
+    backend = getattr(tok, "backend_tokenizer", None)
+    if backend is None:
+        raise ValueError(f"{snapshot}: no fast (tokenizers) backend; kivi-run needs one")
+    backend.save(os.path.join(out_dir, "tokenizer.json"))
 
 
 def write_artifacts(model_id_or_dir: str, out_dir: str, *, max_tokens: int = 2048,
@@ -107,6 +128,7 @@ def write_artifacts(model_id_or_dir: str, out_dir: str, *, max_tokens: int = 204
     for f in _COPY_FILES:
         if os.path.exists(os.path.join(snapshot, f)):
             shutil.copyfile(os.path.join(snapshot, f), os.path.join(out_dir, f))
+    write_effective_tokenizer(snapshot, out_dir)
     with open(os.path.join(out_dir, "constants.json"), "w") as fh:
         json.dump(manifest, fh, indent=1, sort_keys=True)
 
