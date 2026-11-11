@@ -397,6 +397,11 @@ int run_chat(const Options& opt, Model& model, Sampler& sampler, const Tokenizer
 int main(int argc, char** argv) {
     const auto t_start = Clock::now();
     Options opt = parse_args(argc, argv);
+    // The KV engine uses Level Zero GPU devices only. Without a selector the
+    // SYCL runtime also enumerates every OpenCL platform the host's ICD
+    // registry lists (e.g. a oneAPI CPU runtime under /opt/intel), loading
+    // unrelated libraries and slowing start-up. A selector the user set wins.
+    if (opt.device == "xpu") setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:gpu", /*overwrite=*/0);
     std::vector<int64_t> expected;
     if (!opt.golden.empty()) {
         std::ifstream in(opt.golden);

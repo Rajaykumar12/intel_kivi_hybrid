@@ -10,6 +10,7 @@
 #
 #   bash scripts/build_native.sh            # configure + build + ctest
 #   KIVI_AOT_DEVICE=adl-p bash scripts/build_native.sh
+#   KIVI_SKIP_TESTS=1 bash scripts/build_native.sh   # build only
 # ==========================================================================
 set -e
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,7 +28,11 @@ icpx --version | head -1
 
 cmake -S . -B "$BUILD_DIR" -DCMAKE_CXX_COMPILER=icpx -DCMAKE_PREFIX_PATH="$TORCH_CMAKE" \
       -DCMAKE_BUILD_TYPE=Release
-cmake --build "$BUILD_DIR" -j"$(nproc)"
+# KIVI_BUILD_TARGET: e.g. "preinstall" (package_runtime.sh) — build inside
+# this script so a CMake re-configure always sees the right compiler.
+cmake --build "$BUILD_DIR" -j"$(nproc)" ${KIVI_BUILD_TARGET:+--target "$KIVI_BUILD_TARGET"}
+
+[ -n "${KIVI_SKIP_TESTS:-}" ] && exit 0
 
 # Run the tests without the oneAPI env: the binaries must load against the
 # SYCL runtime bundled with torch, exactly as a deployed runtime would.

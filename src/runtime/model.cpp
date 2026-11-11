@@ -8,6 +8,9 @@
 #include <ATen/ATen.h>
 #include <nlohmann/json.hpp>
 #include <torch/csrc/inductor/aoti_package/model_package_loader.h>
+#include <torch/version.h>
+
+#include <cstdio>
 
 #include "engine/engine.hpp"
 #include "engine/registry.hpp"
@@ -63,6 +66,14 @@ KiviConfig KiviConfig::load(const std::string& path) {
 Model::Model(const std::string& dir, const std::string& device) {
     const auto t0 = std::chrono::steady_clock::now();
     cfg_ = KiviConfig::load(dir + "/kivi_config.json");
+    // AOTInductor packages are tied to the torch release that compiled them.
+    // "2.13.0+xpu" (artifact) vs TORCH_VERSION "2.13.0" (headers): compare
+    // the release part.
+    const std::string want = cfg_.torch_version.substr(0, cfg_.torch_version.find('+'));
+    if (!want.empty() && want != TORCH_VERSION)
+        std::fprintf(stderr, "kivi-run: warning: %s was exported with torch %s, this runtime "
+                     "is built on %s; re-export if loading fails\n", dir.c_str(),
+                     cfg_.torch_version.c_str(), TORCH_VERSION);
 
     // Engine first: the package's kivi.layer_attention calls look it up by id.
     EngineConfig ec;

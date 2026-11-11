@@ -114,6 +114,19 @@ target_link_libraries(kivi-run PRIVATE kivi_core kivi_tokenizer)
 set_target_properties(kivi-run PROPERTIES
   BUILD_RPATH "${KIVI_RPATH};$<TARGET_FILE_DIR:kivi_core>")
 
+# Install layout for the relocatable runtime (scripts/package_runtime.sh):
+#   bin/kivi-run   RPATH $ORIGIN/../lib
+#   lib/           libkivi_core.so + every bundled dependency (RPATH $ORIGIN)
+# kivi-run gets a DT_RPATH (--disable-new-dtags), not a DT_RUNPATH: a DT_RPATH
+# on the executable is also searched for dependencies of libraries that have
+# no search path of their own (MKL, CCL and the compiler runtime libraries
+# shipped with the torch wheel), so all of them resolve inside lib/.
+set_target_properties(kivi-run PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
+target_link_options(kivi-run PRIVATE "LINKER:--disable-new-dtags")
+set_target_properties(kivi_core PROPERTIES INSTALL_RPATH "$ORIGIN")
+install(TARGETS kivi-run RUNTIME DESTINATION bin)
+install(TARGETS kivi_core LIBRARY DESTINATION lib)
+
 enable_testing()
 add_executable(kivi_native_tests tests/native/test_core.cpp)
 target_link_libraries(kivi_native_tests PRIVATE kivi_core)
