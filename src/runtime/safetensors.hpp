@@ -26,6 +26,12 @@ public:
     std::vector<std::string> names() const;
     // Zero-copy view of `name` in its stored dtype.
     at::Tensor tensor(const std::string& name) const;
+    // Drop `name`'s pages from this process's memory (madvise DONTNEED) once
+    // a converted copy exists. Only the pages wholly inside the tensor are
+    // released; the mapping is private and never written, so the pages are
+    // clean and any later access just re-reads them from the file — a view
+    // returned by tensor() stays valid, merely slower.
+    void release(const std::string& name) const;
     const std::string& path() const { return path_; }
 
 private:

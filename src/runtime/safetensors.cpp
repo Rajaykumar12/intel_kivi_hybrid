@@ -99,4 +99,15 @@ at::Tensor SafeTensorsFile::tensor(const std::string& name) const {
     return at::from_blob(p, e.shape, [keep](void*) {}, at::TensorOptions().dtype(e.dtype));
 }
 
+void SafeTensorsFile::release(const std::string& name) const {
+    auto it = entries_.find(name);
+    if (it == entries_.end()) return;
+    static const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    auto b = reinterpret_cast<uintptr_t>(map_->addr) + data_offset_ + it->second.begin;
+    auto e = reinterpret_cast<uintptr_t>(map_->addr) + data_offset_ + it->second.end;
+    b = (b + page - 1) & ~(page - 1);       // round inward: never touch neighbours' pages
+    e &= ~(page - 1);
+    if (e > b) madvise(reinterpret_cast<void*>(b), e - b, MADV_DONTNEED);
+}
+
 }  // namespace kivi::runtime

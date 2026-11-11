@@ -105,6 +105,11 @@ Model::Model(const std::string& dir, const std::string& device) {
         throw std::runtime_error(msg);
     }
     std::map<std::string, std::unique_ptr<SafeTensorsFile>> files;
+    // A source tensor read by several constants (tied weights) is released
+    // after its last conversion, so the later ones do not re-read the file.
+    std::map<std::string, int> uses;
+    for (auto& [fqn, m] : manifest.items())
+        ++uses[m.at("file").get<std::string>() + "/" + m.at("tensor").get<std::string>()];
     for (auto& [fqn, m] : manifest.items()) {
         const auto file = m.at("file").get<std::string>();
         auto& f = files[file];
@@ -114,8 +119,14 @@ Model::Model(const std::string& dir, const std::string& device) {
         if (t.sizes() != at::IntArrayRef(shape))
             throw std::runtime_error("constants.json: shape mismatch for " + fqn);
         // Same dtype: aliases the mapping (no copy). Otherwise e.g. bf16 ->
-        // fp32, which is exact.
-        constants_[fqn] = t.to(dtype_from_name(m.at("dtype").get<std::string>())).contiguous();
+        // fp32, which is exact; the bf16 source pages are then released at
+        // once, so peak memory is the fp32 weights plus one tensor rather
+        // than fp32 + the whole bf16 file (TinyLlama: 6.8 -> ~4.7 GB).
+        const auto tensor_name = m.at("tensor").get<std::string>();
+        at::Tensor c = t.to(dtype_from_name(m.at("dtype").get<std::string>())).contiguous();
+        if (--uses[file + "/" + tensor_name] == 0 && c.data_ptr() != t.data_ptr())
+            f->release(tensor_name);
+        constants_[fqn] = std::move(c);
     }
     package_->load_constants(constants_, /*use_inactive=*/false, /*check_full_update=*/true,
                              /*user_managed=*/true);
