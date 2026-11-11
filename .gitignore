@@ -21,4 +21,6 @@ __pycache__/
 # Backups
 *_old.py
 benchmark_old.py
-docs
+build-native/
+docs/
+artifacts/

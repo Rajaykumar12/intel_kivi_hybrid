@@ -26,7 +26,8 @@ if os.path.isdir(_SRC) and _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from kivi_sycl import _C as kivi_native  # noqa: E402
-from kivi_sycl.cache.manager import KiviCache, _iter_kv_layers  # noqa: E402
+from kivi_sycl.cache.manager import (KiviCache, _iter_kv_layers,  # noqa: E402
+                                     dequantize_keys_cpu, dequantize_values_cpu)
 
 B, H, D = 2, 3, 64
 G = 32
@@ -143,7 +144,7 @@ def test_cpu_dequant_matches_xpu_kernel(dtype):
     packed, scales, zeros = _quant_keys_xpu(x_k, dtype)
     kernel_out = torch.empty_like(x_k)
     kivi_native.dequantize_keys(packed, scales, zeros, kernel_out, G)
-    cpu_out = cache._dequant_keys_cpu(packed.cpu(), scales.cpu(), zeros.cpu())
+    cpu_out = dequantize_keys_cpu(packed.cpu(), scales.cpu(), zeros.cpu())
     # cpu_out is [B,H,L,D]; kernel output is [B,H,D,L]
     tol = 1e-6 if dtype == torch.float32 else 2e-3
     assert torch.allclose(cpu_out, kernel_out.cpu().transpose(2, 3),
@@ -154,7 +155,7 @@ def test_cpu_dequant_matches_xpu_kernel(dtype):
     packed, scales, zeros = _quant_values_xpu(x_v, dtype)
     kernel_out = torch.empty_like(x_v)
     kivi_native.dequantize_values(packed, scales, zeros, kernel_out, D, G)
-    cpu_out = cache._dequant_values_cpu(packed.cpu(), scales.cpu(), zeros.cpu())
+    cpu_out = dequantize_values_cpu(packed.cpu(), scales.cpu(), zeros.cpu())
     assert torch.allclose(cpu_out, kernel_out.cpu(), atol=tol, rtol=tol)
 
 
@@ -213,8 +214,8 @@ def test_manager_end_to_end_on_xpu(async_flush, metadata_dtype):
     for i, (k, v) in enumerate(_iter_kv_layers(cache.get_full_cache())):
         assert k.shape[2] == total
         assert k.dtype == v.dtype == torch.float32      # served in model dtype
-        assert cache._scales_k[i].dtype == meta
-        n_hist = cache._quant_token_count[i]
+        assert cache.history(i)[1].dtype == meta
+        n_hist = cache.quantized_tokens(i)
         assert n_hist > 0 and n_hist % G == 0
         # Residual exact
         assert torch.equal(k[:, :, n_hist:, :], truth_k[i][:, :, n_hist:, :])

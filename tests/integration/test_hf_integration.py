@@ -83,13 +83,13 @@ def test_hf_path_bit_identical_to_add_tokens_path(kind, async_flush):
     ids = torch.randint(0, 97, (1, PROMPT))
     old_logits, old = _old_path(model, ids, async_flush)
     new_logits, new = _new_path(model, ids, async_flush)
-    assert old._quant_token_count == new.kivi._quant_token_count
-    assert new.kivi._quant_token_count[0] >= 2 * G      # history actually used
+    assert all(old.quantized_tokens(i) == new.kivi.quantized_tokens(i) for i in range(old.num_layers))
+    assert new.kivi.quantized_tokens(0) >= 2 * G      # history actually used
     for step, (a, b) in enumerate(zip(old_logits, new_logits)):
         assert torch.equal(a, b), f"{kind}: logits differ at decode step {step}"
     # Same packed bytes in the store.
-    for name in ("_packed_k", "_scales_k", "_packed_v", "_zeros_v"):
-        assert torch.equal(getattr(old, name)[0], getattr(new.kivi, name)[0]), name
+    for j, (a, b) in enumerate(zip(old.history(0), new.kivi.history(0))):
+        assert torch.equal(a, b), j
 
 
 @pytest.mark.parametrize("kind", ["gpt2", "llama-gqa", "qwen2-gqa"])
@@ -125,7 +125,7 @@ def test_generate_api_and_stats():
     assert s["total_tokens"] == PROMPT + STEPS - 1     # last token never fed back
     assert s["quantized_tokens"] > 0 and s["compression"] > 1.0
     # The engine never builds a full-length FP serving view on this path.
-    assert cache.kivi._cache_view is None
+    assert not cache.kivi.has_serving_view
     assert cache.get_seq_length() == s["total_tokens"]
 
 

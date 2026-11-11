@@ -7,7 +7,7 @@ tensors returned by ``KiviLayer.update()`` — the FP residual only — and this
 function brings in the layer's packed 2-bit history.
 
 Two paths:
-- fused (decode steps): ``kivi_sycl._C.fused_decode_attention`` reads the
+- fused (decode steps): ``torch.ops.kivi.fused_decode_attention`` reads the
   2-bit codes and per-group scales directly — the dequantized history never
   exists. ~5x faster than the reference path per layer (Phase 2 §B.4).
 - reference (prefill, padded/sliding masks, or ``fused=False``): dequantize
@@ -21,7 +21,8 @@ from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from ..extension.loader import kivi_native
+from ..extension.loader import kivi_native  # noqa: F401  (registers torch.ops.kivi)
+from ..cache.manager import dequantize_keys_cpu, dequantize_values_cpu
 from .cache import LAYER_TAG
 
 __all__ = ["ATTN_NAME", "kivi_attention_forward", "register_kivi_attention",
@@ -36,9 +37,9 @@ def dequantized_history(layer):
     hist = layer.history()
     if hist is None:
         return None, None
-    e = layer.engine
-    k = e._dequant_keys_cpu(*hist[:3])
-    v = e._dequant_values_cpu(*hist[3:])
+    dtype = layer.engine._cache_dtype
+    k = dequantize_keys_cpu(*hist[:3], dtype)
+    v = dequantize_values_cpu(*hist[3:], dtype)
     return k, v
 
 
@@ -61,7 +62,7 @@ def _can_fuse(layer, query, attention_mask, dropout, kwargs) -> bool:
             and query.device.type == "cpu"
             and dropout == 0.0
             and layer.num_history_tokens > 0
-            and hasattr(kivi_native, "fused_decode_attention")
+            and hasattr(torch.ops.kivi, "fused_decode_attention")
             and not any(kwargs.get(k) is not None for k in _FUSED_UNSUPPORTED_KWARGS)
             and _mask_is_trivial(attention_mask))
 
@@ -78,7 +79,9 @@ def kivi_attention_forward(module, query, key, value, attention_mask,
     if _can_fuse(layer, query, attention_mask, dropout, kwargs):
         if scaling is None:
             scaling = query.shape[-1] ** -0.5
-        out = kivi_native.fused_decode_attention(
+        # Through the dispatcher (not the pybind function) so torch.compile /
+        # torch.export see a real op rather than an opaque Python call.
+        out = torch.ops.kivi.fused_decode_attention(
             query, key, value, *layer.history(), float(scaling),
             layer.engine._G[layer.layer_idx])
         layer.calls["fused"] += 1

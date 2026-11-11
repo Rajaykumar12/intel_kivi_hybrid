@@ -50,19 +50,16 @@ class KiviLayer(CacheLayerMixin):
             self.lazy_initialization(key_states, value_states)
         e, i = self.engine, self.layer_idx
         e._init_session(key_states, i)
-        # Same flush timing as KiviCache.add_tokens(), which runs after each
-        # forward pass: (1) collect the flush submitted on the previous step
-        # (it had a whole forward pass to run, so the wait is ~free); (2)
-        # submit a flush for the residual as it stood *before* this step's
-        # tokens; (3) append them. Flushed tokens stay in the residual, served
-        # in FP, until harvested — so this step attends to them in FP and the
-        # next step to their 2-bit form, exactly as on the add_tokens path.
-        e._harvest_layer(i)
-        e._maybe_flush(i)
-        if not e.async_flush:
-            e._harvest_layer(i)
-        e._append_residual(i, key_states.to(e._cache_dtype), value_states.to(e._cache_dtype))
-        keys, values = e.res_keys[i], e.res_values[i]
+        # kivi::Engine::update, with the same flush timing as add_tokens()
+        # (which runs after each forward pass): (1) collect the flush
+        # submitted on the previous step — it had a whole forward pass to
+        # run, so the wait is ~free; (2) flush the residual as it stood
+        # *before* this step's tokens; (3) append them. Flushed tokens stay in
+        # the residual, served in FP, until harvested — so this step attends
+        # to them in FP and the next to their 2-bit form, exactly as on the
+        # add_tokens path.
+        e._native.update(i, key_states, value_states)
+        keys, values = e._native.residual(i)
         setattr(keys, LAYER_TAG, self)
         self.keys, self.values = keys, values
         return keys, values
@@ -71,24 +68,20 @@ class KiviLayer(CacheLayerMixin):
 
     @property
     def num_history_tokens(self) -> int:
-        a = self.engine._arena[self.layer_idx]
-        return a.used if a is not None else 0
+        return self.engine.quantized_tokens(self.layer_idx)
 
     def history(self):
         """(packed_k, scales_k, zeros_k, packed_v, scales_v, zeros_v) views of
         the quantized prefix, or None. Tokens of a pending flush are not in it
         yet — they are still part of the residual returned by update()."""
-        a = self.engine._arena[self.layer_idx]
-        if a is None or a.used == 0:
-            return None
-        return a.used_keys() + a.used_values()
+        return self.engine.history(self.layer_idx)
 
     # -- Cache layer contract -------------------------------------------------
 
     def get_seq_length(self) -> int:
         e, i = self.engine, self.layer_idx
-        res = e.res_keys[i]
-        return e._quant_token_count[i] + (res.shape[2] if res is not None else 0)
+        res = e.residual(i)
+        return e.quantized_tokens(i) + (res[0].shape[2] if res is not None else 0)
 
     def get_mask_sizes(self, query_length: int):
         return self.get_seq_length() + query_length, 0

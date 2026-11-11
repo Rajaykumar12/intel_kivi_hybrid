@@ -9,6 +9,14 @@ out = model.generate(input_ids, past_key_values=cache, max_new_tokens=200)
 print(cache.get_stats()["compression"])
 ```
 
+Or with no Python at run time — export once, then run a self-contained C++ binary
+([Python-free runtime](#python-free-runtime-kivi-run)):
+
+```bash
+python -m kivi_sycl.export --model Qwen/Qwen2.5-0.5B-Instruct --out artifacts/qwen25
+kivi-run --model artifacts/qwen25 --chat
+```
+
 ## Results
 
 ### Decode speed with the native integration (2026-11-08)
@@ -201,41 +209,52 @@ Token stream: [t₀, t₁, ..., t_{n-R}, ..., tₙ]
 ## Architecture
 
 ```
-┌──────────────────────────────────────────┐
-│        Transformer Model (CPU)           │
-│   Any HuggingFace CausalLM (GPT-2,      │
-│   LLaMA, Mistral, Phi, Qwen, etc.)      │
-└──────────────────┬───────────────────────┘
-                   │ past_key_values (CPU tensors)
-                   ▼
-         ┌──────────────────┐
-         │    KiviCache     │
-         │  (kivi_sycl)     │
-         └────────┬─────────┘
-                  │
-    ┌─────────────┴──────────────────┐
-    │                                │
-    ▼                                ▼
-┌──────────────┐          ┌──────────────────┐
-│  Residual    │          │  Packed Store    │
-│  Buffer      │          │  (CPU-resident)  │
-│  (FP, CPU)   │          │                  │
-│              │          │ packed: uint8    │
-│ Last R tokens│          │ scales: fp32/16  │
-│ No device    │          │ zeros:  fp32/16  │
-│ transfers    │          │ dequant on read  │
-└──────────────┘          └────────┬─────────┘
-                                   │
-                         ┌─────────┴─────────┐
-                         │  SYCL Kernels     │
-                         │  (kivi_sycl._C)   │
-                         │                   │
-                         │ quantize_keys()   │
-                         │ quantize_values() │
-                         │ dequantize_keys() │
-                         │ dequantize_values()│
-                         └───────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│ Transformer model (CPU) — any HuggingFace CausalLM        │
+└───────────────┬──────────────────────────────────────────┘
+                │ enable_kivi(model)            KiviCache.add_tokens /
+                │ (transformers Cache +         get_full_cache (legacy loop)
+                │  "kivi" / "kivi_op" attention)        │
+                ▼                                       ▼
+┌──────────────────────────────────────────────────────────┐
+│ kivi_sycl (Python, thin)   hf/  cache/manager.py          │
+│   adapts transformers objects; holds no cache state       │
+└───────────────┬──────────────────────────────────────────┘
+                │ _C.Engine  /  torch.ops.kivi.*
+                ▼
+┌──────────────────────────────────────────────────────────┐
+│ libkivi_core (C++, no Python)              src/csrc/      │
+│   kivi::Engine   residual · flush/harvest · reserve ·     │
+│                  per-layer G · stats · attend()           │
+│   LayerArena     packed 2-bit store (USM host on XPU)     │
+│   ops            torch.ops.kivi.{quantize_keys,           │
+│                  quantize_values, fused_decode_attention, │
+│                  layer_attention}                         │
+│   SYCL kernels   quantize on the iGPU, zero-copy          │
+│   CPU kernel     fused decode attention (AVX2/FMA)        │
+└──────────────────────────────────────────────────────────┘
 ```
+
+Since Phase 5 all cache state and work lives in the C++ engine; the Python package only
+adapts it to transformers. The same `libkivi_core.so` builds without Python (CMake), and the
+Python-free runtime is built on it:
+
+```
+ offline, once (Python)                         run time (no Python)
+┌───────────────────────────────┐   artifact   ┌──────────────────────────────────────┐
+│ python -m kivi_sycl.export     │   directory  │ kivi-run (C++)            src/runtime/│
+│  op-mode model → torch.export  │ ──────────►  │  AOTInductor package loader          │
+│  → AOTInductor package (code)  │ model.pt2    │  weights: safetensors mmap → fp32    │
+│  + weights manifest, configs,  │ *.safetensors│  kivi::Engine registered as id 0     │
+│  effective tokenizer, verified │ *.json       │  tokenizer.json BPE · chat templates │
+│  chat template pieces          │              │  sampler · streaming · stats         │
+└───────────────────────────────┘              └──────────────────┬───────────────────┘
+                                                                   │ torch.ops.kivi.layer_attention
+                                                                   ▼
+                                                        libkivi_core (as above)
+```
+With `device="cpu"` the engine uses a reference quantize instead of the SYCL kernels, so KIVI
+also runs on machines without an Intel GPU (slowly).
 
 ### Supported Models
 
@@ -377,6 +396,122 @@ print(tok.decode(out[0]), cache.get_stats()["compression"])
 per sequence. It accepts the same options as `KiviCache` (`group_size`, `residual_length`,
 `metadata_dtype`, `zero_copy`, …) plus `fused` (default `True`; `False` selects the
 dequantize-then-SDPA reference path). Beam search and cache cropping are not supported yet.
+
+### Compiled decode (`torch.compile`, op mode)
+
+`enable_kivi_op` turns each attention layer's KIVI work into a single
+`torch.ops.kivi.layer_attention` call, so `torch.compile` captures a whole decode step with
+**no graph breaks** (the default path breaks twice per layer). Pass `position_ids` and the
+cache's `model_kwargs` on every call:
+
+```python
+from kivi_sycl.hf.compiled import enable_kivi_op
+
+cache = enable_kivi_op(model, max_tokens=ids.shape[1] + 200)
+step = torch.compile(model.forward, dynamic=False)
+out = model(ids, past_key_values=cache, position_ids=torch.arange(ids.shape[1])[None],
+            **cache.model_kwargs)
+pos = ids.shape[1]
+nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+for _ in range(200):
+    out = step(input_ids=nxt, past_key_values=cache, position_ids=torch.tensor([[pos]]),
+               **cache.model_kwargs)
+    nxt, pos = out.logits[:, -1].argmax(-1, keepdim=True), pos + 1
+```
+
+Measured (2026-11-10): compiled decode **1.20×** on Qwen2.5-0.5B @ 2k and **1.11×** on
+TinyLlama-1.1B @ 1.9k over eager, greedy tokens unchanged. Batch size 1, no padding masks.
+
+### Python-free runtime (`kivi-run`)
+
+`kivi-run` runs an exported model with no Python in the process (checked: `/proc/<pid>/maps`
+maps no `libpython`). Python is used once, offline, to export:
+
+```bash
+# 1. export (Python env): writes artifacts/qwen25/ — ~30 s, a few GB of RAM while compiling
+python -m kivi_sycl.export --model Qwen/Qwen2.5-0.5B-Instruct --out artifacts/qwen25 \
+    --max-tokens 2048 --group-size 32 --residual 128
+
+# 2. build the runtime (CMake; links LibTorch from the torch wheel, not Python)
+bash scripts/build_native.sh                 # build-native/kivi-run + ctest
+
+# 3. run
+build-native/kivi-run --model artifacts/qwen25 --chat               # stdin chat, /reset, /quit
+build-native/kivi-run --model artifacts/qwen25 --chat --prompt "Hi" --system "Be brief."
+build-native/kivi-run --model artifacts/qwen25 --prompt "Once upon a time" --max-new-tokens 64
+build-native/kivi-run --model artifacts/qwen25 --prompt "..." --temperature 0.8 --top-p 0.95 --seed 7
+build-native/kivi-run --model artifacts/qwen25 --ids 151644,872,198 --max-new-tokens 16 --stats
+```
+
+The artifact directory holds a code-only AOTInductor package (`model.pt2`, a few MB), the
+model's own safetensors weights plus a manifest mapping every package constant to them, the
+engine configuration (`kivi_config.json`), the tokenizer pipeline transformers actually runs,
+and `generation.json` (chat template pieces and the model's default sampling).
+
+| | TinyLlama-1.1B-Chat | Qwen2.5-0.5B-Instruct |
+|---|---|---|
+| export | 46 s, 2.1 GB dir | 26 s, 0.96 GB dir |
+| load (warm page cache) | 0.4–0.7 s | 0.7–1.1 s |
+| steady RSS after load | 4.7 GB | 2.4 GB |
+| greedy tokens vs Python (200) | identical | identical |
+
+Measured against the Python paths (2026-11-12, i5-1235U on AC; three fresh-process runs per
+path, interleaved, medians; every path computes logits for the last position only, as
+`generate()` does; `tools/bench_runtime.py`):
+
+| config | path | decode tok/s | prefill tok/s | first token¹ | peak RSS |
+|---|---|---|---|---|---|
+| TinyLlama-1.1B, 1.9k + 64 | Python FP | 5.92 | 101.3 | 22.4 s | 7.3 GB |
+| | Python HF + KIVI | 5.56 | 101.9 | 22.0 s | 7.4 GB |
+| | **kivi-run** | **6.68** | **106.7** | **21.5 s** | **5.0 GB** |
+| Qwen2.5-0.5B, 2k + 64 | Python FP | 12.09 | 250.9 | 10.8 s | 3.9 GB |
+| | Python HF + KIVI | 11.24 | 253.5 | 10.6 s | 3.9 GB |
+| | **kivi-run** | **13.02** | **276.7** | **7.8 s** | **2.6 GB** |
+| Qwen2.5-0.5B, 8k + 32 | Python FP | 8.47 | 194.3 | 44.8 s | 3.9 GB |
+| | Python HF + KIVI | 8.56 | 193.3 | 45.0 s | 3.9 GB |
+| | **kivi-run** | **10.01** | **204.1** | **40.6 s** | **3.1 GB** |
+
+¹ From process start, so it includes imports, model loading and the whole prefill.
+
+Decode is **1.16–1.20×** the Python KIVI path and 1.08–1.18× plain FP, peak RSS 20–33 % lower;
+greedy tokens were identical to FP in every run; KV compression is the same as in Python
+(6.99× / 7.02× / 9.25×: the 2-bit cache at 8k is 20.8 MiB against 192.7 MiB fp16).
+Exports compute logits for the last position only (`--all-logits` for every position, e.g.
+perplexity): full-sequence logits at an 8k prompt are a 5 GB fp32 tensor, and dropping them
+took kivi-run's 8k peak from 7.7 to 3.1 GB and its prefill from 163 to 204 tok/s.
+
+**What it implements, and how it is checked**
+- *Tokenizer:* a `tokenizer.json` reader + BPE in C++ (Llama/SentencePiece-style Metaspace with
+  byte fallback, and byte-level GPT-2/Qwen with a PCRE2 regex split and ICU NFC). The exporter
+  saves `backend_tokenizer` — the pipeline transformers runs, which can differ from the file a
+  model repo ships (transformers 5 swaps TinyLlama's normalizer for a Metaspace pre-tokenizer).
+  Conformance: ~2.4k cases per model (WikiText-2, Unicode stress, code, random-id decodes)
+  identical to transformers, encode and decode.
+- *Chat:* no Jinja in C++. The exporter derives each template's literal pieces (role
+  prefix/suffix, system block, default system prompt, generation prompt) by rendering sentinel
+  conversations, verifies the reconstruction byte-for-byte against the template, and refuses
+  templates it cannot reproduce (e.g. ones that `trim` content). Multi-turn chat keeps the KV
+  cache and feeds only each turn's new tokens; replies match HF `generate()` turn by turn.
+- *Sampling:* greedy, temperature, top-k, top-p, repetition penalty (HF order), seeded and
+  reproducible. `--chat` uses the model's `generation_config` defaults unless a flag is given.
+- *Memory:* weights are memory-mapped; tensors converted to fp32 release their bf16 pages at
+  once, so peak RSS equals the steady state.
+
+**Relocatable package.** `bash scripts/package_runtime.sh` produces
+`dist/kivi-runtime-<ver>-linux-x86_64/` (+ `.tar.zst`): `bin/kivi-run` with an
+`$ORIGIN/../lib` RPATH and `lib/` holding LibTorch, the SYCL runtime, oneMKL, ICU and PCRE2
+copied from the build environment (1.9 GB unpacked, 808 MB compressed — `libtorch_xpu` alone is
+874 MB), with `THIRD_PARTY_NOTICES.txt` and license texts. The target needs glibc ≥ 2.38 and,
+for `--device xpu`, the Intel GPU driver (Level Zero). `--check <artifacts> <golden>`
+extracts the tarball and runs it under `env -i` — no conda, Python or oneAPI — and verifies
+every mapped library comes from the package or the OS. Several bundled Intel runtime
+libraries are under Intel's EULA / Simplified Software License: check their redistribution
+terms before shipping the tarball.
+
+**Limits.** Batch size 1; the model runs in fp32 on the CPU (the KV engine uses the iGPU);
+the context limit is fixed at export (`--max-tokens`); an artifact runs only with a runtime
+built on the same torch release (kivi-run warns on a mismatch); tested on the Llama
+(TinyLlama) and Qwen2 families.
 
 ### Quick Start — One-liner Generation
 
@@ -535,22 +670,29 @@ For GPT-2 (short sequences), `R=64` is sufficient. For 7B+ models with long cont
 
 ## Project Layout
 
-The project uses a modular `src/`-layout: a pure-Python package (`src/kivi_sycl/`) and its native SYCL sources (`src/csrc/`) are kept fully separate, each broken down by single responsibility. See [`docs/architecture_and_state.md`](docs/architecture_and_state.md) for the full design rationale.
-
 ```
 src/
-├── kivi_sycl/            # Python package (src-layout)
-│   ├── __init__.py       # public API: KiviCache, generate
-│   ├── backend/ipex.py   # IPEX/XPU detection
-│   ├── config/           # HuggingFace model config auto-detection
-│   ├── cache/manager.py  # KiviCache — the KV cache state manager
-│   ├── generation/       # generate() loop + sampling strategies
-│   └── extension/        # single import seam for the compiled kivi_sycl._C
-└── csrc/                 # native C++/SYCL sources (not a Python package)
-    ├── include/kivi/     # shared headers
-    ├── kernels/           # SYCL quantize/dequantize kernels
-    ├── ops/               # Torch tensor validation + kernel dispatch
-    └── bindings/          # pybind11 module (kivi_sycl._C)
+├── kivi_sycl/              # Python package (thin front end)
+│   ├── __init__.py         # public API: KiviCache, enable_kivi, generate
+│   ├── cache/manager.py    # KiviCache — legacy loop API over the C++ engine
+│   ├── hf/                 # transformers integration: Cache, "kivi" attention, op mode
+│   ├── config/             # HuggingFace model config auto-detection
+│   ├── generation/         # generate() loop + sampling strategies
+│   ├── export/             # exporter: torch.export → AOTInductor, artifacts, chat templates
+│   └── extension/          # import seam for the compiled kivi_sycl._C
+└── csrc/                   # native C++/SYCL (builds into _C and libkivi_core.so)
+    ├── engine/             # kivi::Engine, LayerArena, CPU dequant, engine registry
+    ├── library/            # TORCH_LIBRARY(kivi): torch.ops.kivi.*
+    ├── cpu/                # fused decode attention (AVX2/FMA + generic)
+    ├── kernels/            # SYCL quantize/dequantize kernels
+    ├── ops/                # tensor validation + kernel dispatch
+    ├── include/kivi/       # shared headers (queue, USM, layout, events)
+    └── bindings/           # pybind11 module (kivi_sycl._C)
+src/runtime/                # kivi-run: artifacts + AOTI loader, tokenizer/, chat, sampler
+third_party/nlohmann/       # vendored nlohmann/json 3.11.3 (MIT)
+tools/                      # golden generators for the C++ tests (Python, offline)
+CMakeLists.txt              # Python-free libkivi_core.so, kivi-run, C++ tests
+tests/{unit,integration,native}/
 ```
 
 ## Files
@@ -563,6 +705,11 @@ src/
 | `examples/chat.py` | Interactive terminal chat (ollama-style), Qwen2.5-0.5B-Instruct by default, with live compression stats |
 | `examples/app.py` | Minimal one-liner demo |
 | `scripts/build_wheel.sh` | Build pre-built wheel for distribution |
+| `src/kivi_sycl/export/` | Exporter (`python -m kivi_sycl.export`): AOTInductor package, artifact directory, chat-template derivation |
+| `src/runtime/` | `kivi-run`, the Python-free C++ runtime (model loader, tokenizer, chat, sampler) |
+| `scripts/build_native.sh` | CMake build of `libkivi_core.so`, `kivi-run` and the C++ tests, then ctest |
+| `scripts/package_runtime.sh` | Relocatable `kivi-run` package + tarball, with a clean-environment check |
+| `tools/runtime_golden.py`, `tools/tokenizer_golden.py` | Python reference outputs (greedy tokens, chat replies, tokenizer corpus) the C++ tests compare against |
 | `setup.py` | Package config with auto-detected SYCL paths |
 | `pyproject.toml` | Modern Python packaging metadata |
 | `docs/commands.md` | Command reference — run, test, benchmark, rebuild, gotchas |
@@ -577,37 +724,36 @@ src/
 
 ## Testing
 
-Run the full test suite:
-
 ```bash
-python tests/integration/test_kivi.py
-python tests/integration/test_quantize_simple.py
-python tests/integration/test_attention_fix.py
+bash scripts/dev_test.sh            # pytest: unit (CPU) + integration (XPU)
+bash scripts/build_native.sh        # C++ build of libkivi_core.so + ctest (no Python)
+bash scripts/check_warnings.sh      # -Wall -Wextra audit of src/csrc
+python examples/verify_hf_equivalence.py   # 5 real models: legacy vs native path bit-identical
 ```
 
-### test_kivi.py — 15 checks
+- `tests/unit/` run on the CPU (the engine's reference quantize); integration tests need an
+  Intel GPU and skip cleanly without one.
+- `tests/native/` are C++ programs: the arena, the fused attention, the dispatcher ops, and an
+  assertion that no libpython is loaded.
+- Runtime goldens (ctest, registered when the files exist — artifacts are generated, not
+  checked in): `kivi_run_golden_<model>` (200 greedy tokens identical to Python eager op mode),
+  `..._chunked` (same, prefill in 4-token chunks — the path later chat turns take),
+  `kivi_run_chat_<model>` (3-turn chat replies identical to HF `generate()`),
+  `tokenizer_<model>` (tokenizer + chat-template conformance). Generate them with:
 
-| Test | What it verifies |
-|------|------------------|
-| Key round-trip | Per-channel quantize→dequantize error ≤ 0.5× scale |
-| Value round-trip | Per-token quantize→dequantize error within tolerance |
-| Known values | `[1,2,3,4]` → scale=1.0, zero=1.0, packed=228, lossless round-trip |
-| Multi-batch/head | Correct behavior with B=2, H=4 |
-| Constant input | No NaN/Inf for constant values, reconstructs exactly |
-
-### test_quantize_simple.py
-
-Deterministic bit-level verification with `[1,2,3,4]` across 4 channels:
-- Confirms `packed = 0|(1<<2)|(2<<4)|(3<<6) = 228 = 11100100₂`
-- Verifies scale=1.0, zero=1.0 across all channels
-- Full round-trip: `[1,2,3,4] → quantize → dequantize → [1,2,3,4]` with 0.0 error
-
-### test_attention_fix.py
-
-End-to-end pipeline: quantize KV → dequantize → compute attention → compare with FP32:
-- Key/value dequantization error ~1.0 (expected for 2-bit with random data)
-- Cosine similarity between KIVI and FP32 attention output: **0.898** (> 0.85 threshold)
-- No NaN/Inf in output
+  ```bash
+  python tools/runtime_golden.py --artifacts artifacts/qwen25 --model Qwen/Qwen2.5-0.5B-Instruct \
+      --out build-native/golden/qwen25_run.json
+  python tools/runtime_golden.py --artifacts artifacts/qwen25 --model Qwen/Qwen2.5-0.5B-Instruct \
+      --chat-turn "Capital of France? One word." --chat-turn "And of Japan?" \
+      --reply-tokens 12 --out build-native/golden/qwen25_chat.json
+  python tools/tokenizer_golden.py --artifacts artifacts/qwen25 \
+      --out build-native/golden/qwen25_tokenizer.json
+  bash scripts/build_native.sh       # re-configures and picks them up
+  ```
+- Equivalence chain kept in the suite: legacy loop ≡ HF reference path (bit-exact);
+  fused kernel ≈ reference (1e-4); op mode ≡ default fused path (bit-exact); compiled op mode
+  ≈ eager (same greedy tokens).
 
 ## References
 

@@ -1,6 +1,9 @@
 #pragma once
 
-#include <torch/extension.h>
+// LibTorch C++ API only — no pybind/Python, so this also builds into the
+// Python-free libkivi_core.so (CMakeLists.txt). The pybind module adds
+// <torch/extension.h> itself.
+#include <torch/torch.h>
 #include "kivi/event.hpp"
 
 // ==========================================================================
