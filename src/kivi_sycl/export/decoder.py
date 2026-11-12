@@ -59,10 +59,17 @@ def _num_layers(config):
 
 
 class KiviExportDecoder(torch.nn.Module):
-    """forward(input_ids [1,T], position_ids [1,T], state [1] int64) -> logits [1,T,V]."""
+    """forward(input_ids [1,T], position_ids [1,T], state [1] int64) -> logits.
 
-    def __init__(self, model, engine_id: int = RUNTIME_ENGINE_ID):
+    ``last_logits_only`` (default): logits [1, 1, V] for the last position
+    only (transformers' ``logits_to_keep=1``, what ``generate()`` uses) —
+    all a generation loop reads. Otherwise [1, T, V]: at an 8k prefill of a
+    151k-vocabulary model that is a 5 GB fp32 tensor plus ~270 GFLOP of
+    lm_head work for positions nobody samples from."""
+
+    def __init__(self, model, engine_id: int = RUNTIME_ENGINE_ID, last_logits_only: bool = True):
         super().__init__()
+        self.logits_to_keep = 1 if last_logits_only else 0
         ALL_ATTENTION_FUNCTIONS.register(OP_ATTN_NAME, kivi_op_attention)
         model.set_attn_implementation(OP_ATTN_NAME)
         self.model = model
@@ -73,17 +80,19 @@ class KiviExportDecoder(torch.nn.Module):
         stub = Cache(layers=[_PassThroughLayer() for _ in range(self.num_layers)])
         return self.model(input_ids=input_ids, position_ids=position_ids,
                           past_key_values=stub, use_cache=True,
+                          logits_to_keep=self.logits_to_keep,
                           kivi_engine_id=self.engine_id, kivi_state=state).logits
 
 
-def export_program(model, max_tokens: int, example_tokens: int = 8):
+def export_program(model, max_tokens: int, example_tokens: int = 8,
+                   last_logits_only: bool = True):
     """Export ONE ExportedProgram serving both prefill and decode for ``model``:
     input_ids [1, T] with T dynamic in [1, max_tokens]. T == 1 is a decode
     step; larger T a (chunked) prefill. A single program means a single
     compiled package and a single copy of the weights for the runtime.
     (Dim.DYNAMIC would let export assume T >= 2; the explicit min=1 keeps the
     decode case inside the traced range.)"""
-    dec = KiviExportDecoder(model).eval()
+    dec = KiviExportDecoder(model, last_logits_only=last_logits_only).eval()
     state = torch.zeros(1, dtype=torch.int64)
     n = max(2, min(example_tokens, max_tokens))
     T = torch.export.Dim("T", min=1, max=max_tokens)

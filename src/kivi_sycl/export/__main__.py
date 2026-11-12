@@ -17,6 +17,9 @@ def main():
     ap.add_argument("--group-size", type=str, default="32", help="G, or a comma list per layer")
     ap.add_argument("--residual", type=int, default=128, help="residual window R")
     ap.add_argument("--metadata-dtype", choices=["float16", "float32"], default="float16")
+    ap.add_argument("--all-logits", action="store_true",
+                    help="return logits for every input position ([1, T, V], e.g. for "
+                         "perplexity) instead of only the last one ([1, 1, V], the default)")
     args = ap.parse_args()
 
     # Inductor stages builds in TORCHINDUCTOR_CACHE_DIR, default /tmp — often a
@@ -30,7 +33,8 @@ def main():
     t0 = time.perf_counter()
     cfg = write_artifacts(args.model, args.out, max_tokens=args.max_tokens,
                           group_size=gs[0] if len(gs) == 1 else gs,
-                          residual_length=args.residual, metadata_dtype=args.metadata_dtype)
+                          residual_length=args.residual, metadata_dtype=args.metadata_dtype,
+                          last_logits_only=not args.all_logits)
     size = sum(os.path.getsize(os.path.join(args.out, f)) for f in os.listdir(args.out))
     print(f"exported {args.model} -> {args.out} in {time.perf_counter() - t0:.1f}s "
           f"({size / 2**20:.0f} MiB; {cfg['num_layers']} layers, {cfg['num_kv_heads']} KV heads, "

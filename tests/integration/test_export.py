@@ -133,3 +133,23 @@ def test_artifact_directory_roundtrip(tmp_path, tied):
     for a, b in zip(ref, got):
         torch.testing.assert_close(b, a, rtol=1e-4, atol=1e-5)
         assert a.argmax() == b.argmax()
+
+
+@pytest.mark.parametrize("last_only", [True, False])
+def test_logits_last_position_only(last_only):
+    """Default export returns logits for the last position only ([1, 1, V]);
+    last_logits_only=False returns every position. The last row is the same."""
+    model = _tiny("llama-gqa")
+    ids = torch.randint(0, 97, (1, PROMPT))
+    ep = export_program(model, max_tokens=64, last_logits_only=last_only)
+    cache = KiviCache.from_model(model, group_size=G, residual_length=R)
+    _C.register_engine(cache._native, RUNTIME_ENGINE_ID)
+    try:
+        with torch.no_grad():
+            lg = ep.module()(ids, torch.arange(PROMPT)[None], torch.zeros(1, dtype=torch.int64))
+    finally:
+        _C.unregister_engine(RUNTIME_ENGINE_ID)
+    assert lg.shape == ((1, 1, 97) if last_only else (1, PROMPT, 97))
+    with torch.no_grad():
+        ref = model(ids).logits[:, -1]        # model is in op mode now; first call == plain prefill
+    torch.testing.assert_close(lg[:, -1], ref, rtol=1e-4, atol=1e-4)

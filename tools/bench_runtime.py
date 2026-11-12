@@ -11,7 +11,9 @@ include imports and model loading):
     kivi-run      the C++ runtime on the exported artifact
 All greedy, no EOS stop, same prompt ids (examples/eval_longctx.py's filler
 text), same KIVI settings as the artifact (G, R, fp16 metadata), default
-thread count. Metrics:
+thread count, and logits for the last position only in every path
+(transformers' logits_to_keep=1, what generate() uses; the artifacts are
+exported that way by default). Metrics:
     prefill tok/s   prompt tokens / time of the prefill forward
     decode tok/s    (gen - 1) / time after the first token (prefill excluded,
                     like eval_longctx.py)
@@ -62,7 +64,9 @@ def worker(a):
     toks = []
     with torch.no_grad():
         t0 = time.monotonic()
-        out = model(ids, use_cache=True, **kw)
+        # logits_to_keep=1: last position only, as generate() does and as
+        # kivi-run's export does (logits for all 8k positions would be 5 GB).
+        out = model(ids, use_cache=True, logits_to_keep=1, **kw)
         nxt = out.logits[:, -1].argmax(-1, keepdim=True)
         t1 = time.monotonic()
         toks.append(int(nxt))

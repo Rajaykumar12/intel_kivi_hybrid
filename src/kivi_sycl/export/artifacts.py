@@ -88,7 +88,7 @@ def write_effective_tokenizer(snapshot: str, out_dir: str) -> None:
 
 def write_artifacts(model_id_or_dir: str, out_dir: str, *, max_tokens: int = 2048,
                     group_size=32, residual_length: int = 128,
-                    metadata_dtype: str = "float16") -> dict:
+                    metadata_dtype: str = "float16", last_logits_only: bool = True) -> dict:
     """Export ``model_id_or_dir`` into ``out_dir``; returns kivi_config."""
     from safetensors.torch import save_file
     from transformers import AutoModelForCausalLM
@@ -97,7 +97,7 @@ def write_artifacts(model_id_or_dir: str, out_dir: str, *, max_tokens: int = 204
     os.makedirs(out_dir, exist_ok=True)
     model = AutoModelForCausalLM.from_pretrained(snapshot, dtype=torch.float32).eval()
 
-    ep = export_program(model, max_tokens=max_tokens)
+    ep = export_program(model, max_tokens=max_tokens, last_logits_only=last_logits_only)
     package_path = compile_package(ep, os.path.join(out_dir, "model.pt2"))
     # Exactly the constants the compiled code reads — Inductor may fold some
     # exported buffers away (e.g. rotary_emb.original_inv_freq), and
@@ -148,6 +148,8 @@ def write_artifacts(model_id_or_dir: str, out_dir: str, *, max_tokens: int = 204
         "residual_length": residual_length, "group_size": gs,
         "metadata_dtype": metadata_dtype, "model_dtype": "float32",
         "max_tokens": max_tokens, "vocab_size": model.config.vocab_size,
+        # "last": logits [1, 1, V] for the last input position; "all": [1, T, V]
+        "logits": "last" if last_logits_only else "all",
         "bos_token_id": getattr(model.config, "bos_token_id", None),
         "eos_token_ids": eos if isinstance(eos, list) else ([eos] if eos is not None else []),
         "model_type": model.config.model_type,
