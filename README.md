@@ -455,28 +455,30 @@ and `generation.json` (chat template pieces and the model's default sampling).
 | steady RSS after load | 4.7 GB | 2.4 GB |
 | greedy tokens vs Python (200) | identical | identical |
 
-Measured against the Python paths (2026-11-12, i5-1235U on AC, idle; three fresh-process
-runs per path, medians; `tools/bench_runtime.py`):
+Measured against the Python paths (2026-11-12, i5-1235U on AC; three fresh-process runs per
+path, interleaved, medians; every path computes logits for the last position only, as
+`generate()` does; `tools/bench_runtime.py`):
 
 | config | path | decode tok/s | prefill tok/s | first token¹ | peak RSS |
 |---|---|---|---|---|---|
-| TinyLlama-1.1B, 1.9k + 64 | Python FP | 5.79 | 96.2 | 23.4 s | 7.3 GB |
-| | Python HF + KIVI | 5.60 | 96.8 | 22.9 s | 7.4 GB |
-| | **kivi-run** | **6.67** | **100.7** | **20.3 s** | **5.3 GB** |
-| Qwen2.5-0.5B, 2k + 64 | Python FP | 11.19 | 198.0 | 12.8 s | 4.3 GB |
-| | Python HF + KIVI | 11.00 | 195.1 | 13.0 s | 4.3 GB |
-| | **kivi-run** | **13.07** | **211.5** | **10.0 s** | **3.9 GB** |
-| Qwen2.5-0.5B, 8k + 32 | Python FP | 7.87 | 157.7 | 55.2 s | 8.1 GB |
-| | Python HF + KIVI | 7.94 | 157.3 | 54.9 s | 8.2 GB |
-| | **kivi-run** | **9.55** | **162.6** | **52.1 s** | **7.7 GB** |
+| TinyLlama-1.1B, 1.9k + 64 | Python FP | 5.92 | 101.3 | 22.4 s | 7.3 GB |
+| | Python HF + KIVI | 5.56 | 101.9 | 22.0 s | 7.4 GB |
+| | **kivi-run** | **6.68** | **106.7** | **21.5 s** | **5.0 GB** |
+| Qwen2.5-0.5B, 2k + 64 | Python FP | 12.09 | 250.9 | 10.8 s | 3.9 GB |
+| | Python HF + KIVI | 11.24 | 253.5 | 10.6 s | 3.9 GB |
+| | **kivi-run** | **13.02** | **276.7** | **7.8 s** | **2.6 GB** |
+| Qwen2.5-0.5B, 8k + 32 | Python FP | 8.47 | 194.3 | 44.8 s | 3.9 GB |
+| | Python HF + KIVI | 8.56 | 193.3 | 45.0 s | 3.9 GB |
+| | **kivi-run** | **10.01** | **204.1** | **40.6 s** | **3.1 GB** |
 
 ¹ From process start, so it includes imports, model loading and the whole prefill.
 
-Decode is **1.19–1.20×** the Python KIVI path and 1.15–1.21× plain FP; greedy tokens were
-identical to FP in every run; KV compression is the same as in Python (6.99× / 7.02× /
-9.25×: the 2-bit cache at 8k is 20.8 MiB against 192.7 MiB fp16). Peak RSS at long prompts is
-dominated, in every path, by logits computed for every prompt position (8k:
-[1, 8192, 151936] fp32 = 5 GB) — computing only the last position is the next optimization.
+Decode is **1.16–1.20×** the Python KIVI path and 1.08–1.18× plain FP, peak RSS 20–33 % lower;
+greedy tokens were identical to FP in every run; KV compression is the same as in Python
+(6.99× / 7.02× / 9.25×: the 2-bit cache at 8k is 20.8 MiB against 192.7 MiB fp16).
+Exports compute logits for the last position only (`--all-logits` for every position, e.g.
+perplexity): full-sequence logits at an 8k prompt are a 5 GB fp32 tensor, and dropping them
+took kivi-run's 8k peak from 7.7 to 3.1 GB and its prefill from 163 to 204 tok/s.
 
 **What it implements, and how it is checked**
 - *Tokenizer:* a `tokenizer.json` reader + BPE in C++ (Llama/SentencePiece-style Metaspace with
