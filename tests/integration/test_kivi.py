@@ -13,14 +13,6 @@ import torch
 import numpy as np
 import sys
 
-# Import Intel Extension for PyTorch to enable XPU support
-try:
-    import intel_extension_for_pytorch as ipex
-    HAS_IPEX = True
-except ImportError:
-    print("WARNING: Intel Extension for PyTorch not found. XPU support disabled.")
-    HAS_IPEX = False
-
 from kivi_sycl import _C as kivi_sycl
 
 DEVICE = "xpu"
@@ -287,17 +279,13 @@ if __name__ == "__main__":
     print("KIVI 2-BIT ASYMMETRIC QUANTIZATION — VALIDATION TESTS")
     print("=" * 60 + "\n")
 
-    if not HAS_IPEX:
-        print("ERROR: Intel Extension for PyTorch is not installed.")
-        sys.exit(1)
-
     if not torch.xpu.is_available():
         print("ERROR: XPU device not available.")
         print("Run 'sycl-ls' to check available devices.")
         sys.exit(1)
 
     print(f"✓ XPU Device: {torch.xpu.get_device_name(0)}")
-    print(f"✓ IPEX Version: {ipex.__version__}\n")
+    print(f"✓ torch {torch.__version__} (native XPU)\n")
 
     test_key_roundtrip()
     test_value_roundtrip()
