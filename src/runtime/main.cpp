@@ -224,6 +224,7 @@ struct Generation {
     bool ended_with_eos = false;
     double prefill_s = 0, decode_s = 0;
     int64_t prompt_tokens = 0;
+    Clock::time_point first_token_at;
 };
 
 // Feed `prompt` (new tokens, continuing at model.position()), then sample up
@@ -250,6 +251,7 @@ Generation generate(Model& model, Sampler& sampler, const std::vector<int64_t>& 
     }
     int64_t next = sampler.next(last_row(logits), history);
     const auto t1 = Clock::now();
+    g.first_token_at = t1;
     while (true) {
         g.tokens.push_back(next);
         history.push_back(next);
@@ -274,7 +276,14 @@ void print_timing(const Generation& g) {
                  g.tokens.size(), decode_n > 0 ? decode_n / g.decode_s : 0.0);
 }
 
-void print_stats(Model& model, const Sampler& sampler, double first_token_s) {
+// steady_clock is CLOCK_MONOTONIC (system-wide), so other processes (a
+// benchmark driver) can compare this timestamp with their own clock.
+double monotonic_s(Clock::time_point t) {
+    return std::chrono::duration<double>(t.time_since_epoch()).count();
+}
+
+void print_stats(Model& model, const Sampler& sampler, double first_token_s,
+                 Clock::time_point first_token_at) {
     const auto& cfg = model.config();
     int64_t kivi = 0, fp = 0;
     for (int64_t l = 0; l < cfg.num_layers; ++l) {
@@ -290,8 +299,9 @@ void print_stats(Model& model, const Sampler& sampler, double first_token_s) {
                  static_cast<long long>(s0.total_tokens), static_cast<long long>(s0.quantized_tokens),
                  static_cast<long long>(s0.residual_tokens), kivi / 1048576.0, fp / 1048576.0,
                  kivi > 0 ? static_cast<double>(fp) / kivi : 0.0);
-    std::fprintf(stderr, "kivi-run: first token %.2fs after start; RSS %.0f MiB (peak %.0f MiB); "
-                 "sampling %s\n", first_token_s, rss, hwm, sampler.greedy() ? "greedy" : "stochastic");
+    std::fprintf(stderr, "kivi-run: first token %.2fs after start (monotonic %.6f); RSS %.0f MiB "
+                 "(peak %.0f MiB); sampling %s\n", first_token_s, monotonic_s(first_token_at), rss, hwm,
+                 sampler.greedy() ? "greedy" : "stochastic");
 }
 
 int run_chat(const Options& opt, Model& model, Sampler& sampler, const Tokenizer& tok,
@@ -379,7 +389,8 @@ int run_chat(const Options& opt, Model& model, Sampler& sampler, const Tokenizer
         first = false;
         if (opt.stats) {
             print_timing(g);
-            print_stats(model, sampler, printed_first ? 0.0 : secs(t_start, Clock::now()) - g.decode_s);
+            print_stats(model, sampler, printed_first ? 0.0 : secs(t_start, g.first_token_at),
+                        g.first_token_at);
             printed_first = true;
         }
         if (!interactive && !scripted) break;
@@ -452,6 +463,28 @@ int main(int argc, char** argv) {
         if (opt.chat) return run_chat(opt, model, sampler, *tok, t_start);
 
         if (tok) opt.ids = tok->encode(opt.prompt);
+        const auto need = static_cast<int64_t>(opt.ids.size()) + opt.max_new_tokens;
+        if (static_cast<int64_t>(opt.ids.size()) >= cfg.max_tokens) {
+            std::fprintf(stderr, "kivi-run: error: the prompt (%zu tokens) does not fit the exported "
+                         "context of %lld tokens (re-export with a larger --max-tokens)\n",
+                         opt.ids.size(), static_cast<long long>(cfg.max_tokens));
+            return 1;
+        }
+        if (need > cfg.max_tokens) {
+            // The exported graph cannot run past max_tokens: fail before
+            // doing any work rather than part-way through the generation.
+            const int64_t fit = cfg.max_tokens - static_cast<int64_t>(opt.ids.size());
+            if (opt.ignore_eos || !expected.empty()) {
+                std::fprintf(stderr, "kivi-run: error: prompt %zu + %lld new tokens exceeds the exported "
+                             "context of %lld tokens (at most %lld new tokens fit)\n", opt.ids.size(),
+                             static_cast<long long>(opt.max_new_tokens),
+                             static_cast<long long>(cfg.max_tokens), static_cast<long long>(fit));
+                return 1;
+            }
+            std::fprintf(stderr, "kivi-run: note: capping --max-new-tokens to %lld (exported context %lld)\n",
+                         static_cast<long long>(fit), static_cast<long long>(cfg.max_tokens));
+            opt.max_new_tokens = fit;
+        }
         model.reserve(static_cast<int64_t>(opt.ids.size()) + opt.max_new_tokens);
         std::optional<TextStream> stream;
         if (tok && opt.stream) stream.emplace(*tok);
@@ -470,7 +503,7 @@ int main(int argc, char** argv) {
         }
         std::fflush(stdout);
         print_timing(g);
-        if (opt.stats) print_stats(model, sampler, secs(t_start, Clock::now()) - g.decode_s);
+        if (opt.stats) print_stats(model, sampler, secs(t_start, g.first_token_at), g.first_token_at);
 
         if (!expected.empty()) {
             const auto& out = g.tokens;

@@ -452,12 +452,31 @@ and `generation.json` (chat template pieces and the model's default sampling).
 |---|---|---|
 | export | 46 s, 2.1 GB dir | 26 s, 0.96 GB dir |
 | load (warm page cache) | 0.4–0.7 s | 0.7–1.1 s |
-| peak RSS | 4.7 GB | 2.4 GB |
-| decode, short prompt¹ | 7.2 tok/s | 14.1 tok/s |
+| steady RSS after load | 4.7 GB | 2.4 GB |
 | greedy tokens vs Python (200) | identical | identical |
 
-¹ Busy desktop, not the idle-machine protocol; the comparison with the Python paths is
-pending (`docs/optimization_roadmap/phase5_python_free_runtime.md` §4.6).
+Measured against the Python paths (2026-11-12, i5-1235U on AC, idle; three fresh-process
+runs per path, medians; `tools/bench_runtime.py`):
+
+| config | path | decode tok/s | prefill tok/s | first token¹ | peak RSS |
+|---|---|---|---|---|---|
+| TinyLlama-1.1B, 1.9k + 64 | Python FP | 5.79 | 96.2 | 23.4 s | 7.3 GB |
+| | Python HF + KIVI | 5.60 | 96.8 | 22.9 s | 7.4 GB |
+| | **kivi-run** | **6.67** | **100.7** | **20.3 s** | **5.3 GB** |
+| Qwen2.5-0.5B, 2k + 64 | Python FP | 11.19 | 198.0 | 12.8 s | 4.3 GB |
+| | Python HF + KIVI | 11.00 | 195.1 | 13.0 s | 4.3 GB |
+| | **kivi-run** | **13.07** | **211.5** | **10.0 s** | **3.9 GB** |
+| Qwen2.5-0.5B, 8k + 32 | Python FP | 7.87 | 157.7 | 55.2 s | 8.1 GB |
+| | Python HF + KIVI | 7.94 | 157.3 | 54.9 s | 8.2 GB |
+| | **kivi-run** | **9.55** | **162.6** | **52.1 s** | **7.7 GB** |
+
+¹ From process start, so it includes imports, model loading and the whole prefill.
+
+Decode is **1.19–1.20×** the Python KIVI path and 1.15–1.21× plain FP; greedy tokens were
+identical to FP in every run; KV compression is the same as in Python (6.99× / 7.02× /
+9.25×: the 2-bit cache at 8k is 20.8 MiB against 192.7 MiB fp16). Peak RSS at long prompts is
+dominated, in every path, by logits computed for every prompt position (8k:
+[1, 8192, 151936] fp32 = 5 GB) — computing only the last position is the next optimization.
 
 **What it implements, and how it is checked**
 - *Tokenizer:* a `tokenizer.json` reader + BPE in C++ (Llama/SentencePiece-style Metaspace with
